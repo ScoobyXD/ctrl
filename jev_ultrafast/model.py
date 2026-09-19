@@ -14,6 +14,18 @@ from .questions import NEXT_ACTION, TARGET
 ENDPOINT = "https://openrouter.ai/api/alpha/decisions"
 MODEL = "typesafe/jev-1.13"
 CLIENT = httpx.Client(http2=True, timeout=25)
+MAX_HISTORY = 500
+BLOCKED_REASONS = {
+    "unavailable_control": "The next required control is absent or disabled and waiting or navigation cannot help.",
+    "sign_in_required": "The task needs the user to sign in or complete an authentication challenge themselves.",
+    "unsupported_content": "Required content or interaction cannot be accessed with the offered browser operations.",
+    "cannot_progress": "Available operations cannot make further progress on the remaining requirements.",
+}
+INPUT_REASONS = {
+    "missing_text": "Necessary exact text to type is missing from the user-supplied strings.",
+    "missing_address": "The required website is absent from offered destinations and tabs; its exact URL is needed.",
+    "ambiguous_goal": "The next requested action or outcome needs clarification, including consequential interactions.",
+}
 # Preserve literal contents; never unescape, rewrite, or extract page text.
 QUOTED = re.compile(r'"([^"\r\n]+)"|“([^”\r\n]+)”|(?<!\w)\'([^\'\r\n]+)\'(?!\w)|‘([^’\r\n]+)’')
 
@@ -81,15 +93,22 @@ def validate_choice(answer, ids):
 
 
 def action_space(actions):
-    """One index per observed element; each operation has its own valid targets."""
+    """DOM indices and observed browser targets share operation-specific choices."""
     elements, indices, targets, controls = [], {}, {}, {}
     operations = {"click": "CLICK", "fill": "TYPE_TEXT", "select": "SELECT"}
+    identifiers = [action["id"] for action in actions]
+    if any(not isinstance(identifier, str) for identifier in identifiers) or len(set(identifiers)) != len(identifiers):
+        raise ValueError("Observed actions must have distinct string IDs.")
     for action in actions:
         kind = action["kind"]
+        if kind in {"open_url", "switch_tab"}:
+            operation = {"open_url": "OPEN_URL", "switch_tab": "SWITCH_TAB"}[kind]
+            targets.setdefault(operation, {})[action["id"]] = action
+            continue
         if kind not in operations:
-            if kind not in {"scroll", "wait"}:
+            if kind not in {"scroll", "wait", "back"}:
                 raise ValueError("Unsupported observed operation.")
-            controls[action["id"].upper()] = action
+            controls["BACK" if kind == "back" else action["id"].upper()] = action
             continue
         node = action["node"]
         if node not in indices:
@@ -113,6 +132,21 @@ def action_space(actions):
             element["options"].append({"index": target, "label": action["label"], "value": action["value"]})
         group[target] = action
     return elements, targets, controls
+
+
+def completed_history(history):
+    """Retain every completed step within the run budget, with compact labels."""
+    if len(history) > MAX_HISTORY:
+        raise ValueError("Completed action history exceeds the 500-action run limit.")
+    fields = ("step", "operation", "action", "kind", "url", "title", "target", "target_id", "text", "page_changed")
+    result = []
+    for entry in history:
+        compact = {key: entry[key] for key in fields if entry.get(key) is not None}
+        label = compact.get("action")
+        if isinstance(label, str) and len(label) > 240:
+            compact["action"] = label[:237] + "..."
+        result.append(compact)
+    return result
 
 
 def decision_space(actions, values):
@@ -142,26 +176,40 @@ def choose(state, goal, history, values=None):
         "CLICK": "Click an observed element, menu option, autocomplete suggestion, or calendar day.",
         "TYPE_TEXT": "Replace an editable field with one exact supplied string; choose a field/string pair.",
         "SELECT": "Select an observed dropdown value.",
+        "OPEN_URL": "Open an offered destination URL in a new normal Chrome tab, preserving existing tabs.",
+        "SWITCH_TAB": "Continue in one observed browser tab relevant to the next unfinished task requirement.",
     }
     operations = {key: labels[key] for key in targets}
     operations.update({key: value["label"] for key, value in controls.items()})
     operations.update(
         DONE="Every requirement is visibly satisfied.",
         BLOCKED="No supported operation can progress for a reason other than missing input text.",
-        NEEDS_INPUT="Progress requires typing text absent from supplied_values. Ask the user for it.",
+        NEEDS_INPUT="Progress requires missing exact text, a destination URL, or a more specific user instruction.",
     )
     questions = {"operation": {
         "type": "choice", "criteria": operations,
         "instructions": json.dumps({"goal": goal, "rules": NEXT_ACTION}, ensure_ascii=False),
     }}
+    for operation, reasons in (("BLOCKED", BLOCKED_REASONS), ("NEEDS_INPUT", INPUT_REASONS)):
+        questions[operation.lower() + "_reason"] = {
+            "type": "choice", "criteria": reasons,
+            "instructions": json.dumps({
+                "goal": goal, "operation": operation, "rules": NEXT_ACTION,
+                "question": f"If the next operation is {operation}, choose the reason supported by current evidence.",
+            }, ensure_ascii=False),
+        }
     for operation, candidates in targets.items():
+        if len(candidates) > 255:
+            raise ValueError(f"Too many {operation} targets (maximum 255). Narrow the available browser choices.")
         questions[operation.lower() + "_target"] = {
             "type": "choice",
             "criteria": {
                 index: json.dumps({
-                    "element": a["label"],
+                    "target": a["label"],
                     "current_value": a.get("current_value", a.get("value", "")),
-                    **{k: a[k] for k in ("role", "checked", "selected", "expanded", "payload_id", "text") if k in a},
+                    **{k: a[k] for k in (
+                        "role", "checked", "selected", "expanded", "payload_id", "text", "url", "title", "target_id"
+                    ) if k in a},
                 }, ensure_ascii=False)
                 for index, a in candidates.items()
             },
@@ -174,10 +222,13 @@ def choose(state, goal, history, values=None):
         "state": {
             "page": {k: state[k] for k in ("url", "title", "text")},
             "elements": elements,
-            "supplied_values": {f"v{number}": value for number, value in enumerate(values, 1)},
-            "recent_actions": [
-                {k: h.get(k) for k in ("action", "kind", "text", "page_changed")} for h in history[-10:]
+            "browser_actions": [
+                {key: action[key] for key in ("id", "kind", "label", "url", "title", "target_id") if key in action}
+                for action in state["actions"] if action["kind"] in {"open_url", "switch_tab", "back"}
             ],
+            "active_tab": state.get("target_id"),
+            "supplied_values": {f"v{number}": value for number, value in enumerate(values, 1)},
+            "recent_actions": completed_history(history),
         },
         "questions": questions,
     }
@@ -192,6 +243,7 @@ def choose(state, goal, history, values=None):
     operation_answer = validate_choice(answers.get("operation", {}), operations)
     operation = operation_answer["choice"]
     target = target_answer = payload_id = text = None
+    stop_reason = None
     probabilities = {}
     if operation in targets:
         # Only the target head corresponding to the chosen operation can cause input.
@@ -205,8 +257,12 @@ def choose(state, goal, history, values=None):
     else:
         choice = controls[operation]["id"] if operation in controls else operation
         probabilities[choice] = operation_answer["probabilities"][operation]
+        if operation in {"BLOCKED", "NEEDS_INPUT"}:
+            reasons = BLOCKED_REASONS if operation == "BLOCKED" else INPUT_REASONS
+            stop_reason = validate_choice(answers.get(operation.lower() + "_reason", {}), reasons)["choice"]
     return {
         "choice": choice, "operation": operation, "target": target, "payload_id": payload_id, "text": text,
+        "stop_reason": stop_reason,
         "confidence": operation_answer["confidence"], "probabilities": probabilities,
         "operation_probabilities": operation_answer["probabilities"],
         "target_probabilities": target_answer["probabilities"] if target_answer else {},

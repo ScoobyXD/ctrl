@@ -60,7 +60,7 @@ def test_constructor_uses_existing_target_and_supplied_values(monkeypatch):
     browser = Mock(return_value=Mock(observe=Mock(return_value=page())))
     monkeypatch.setattr(loop, "Browser", browser)
     agent = loop.Agent(None, 'Find "book"', target_id="existing-tab", values=["second"])
-    browser.assert_called_once_with(None, target_id="existing-tab")
+    browser.assert_called_once_with(None, target_id="existing-tab", navigation_urls=[])
     assert agent.state["values"] == ["second", "book"]
 
 
@@ -196,3 +196,67 @@ def test_done_requires_fresh_page(runner):
     with pytest.raises(StalePage):
         act(runner)
     assert runner.state["status"] != "done"
+
+
+def test_zero_action_blocked_run_exposes_reason_and_consumed_decision(runner):
+    runner.state["decision"] = {**decision("BLOCKED"), "stop_reason": "sign_in_required"}
+    result = act(runner)
+    assert result["status"] == "blocked"
+    assert result["history"] == []
+    assert "Sign in" in result["stop_reason"]
+    assert result["last_decision"]["operation"] == "BLOCKED"
+    assert result["decision"] is None
+    runner.browser.act.assert_not_called()
+
+
+def test_missing_address_can_be_supplied_without_losing_progress(runner):
+    runner.state["decision"] = {**decision("NEEDS_INPUT"), "stop_reason": "missing_address"}
+    act(runner)
+    assert "web address" in runner.state["input_request"]
+    runner.command("supply_values", {"values": ["https://example.org/"]})
+    runner.browser.set_navigation_urls.assert_called_once_with(["https://example.org/"])
+    assert runner.state["status"] == "ready"
+    assert runner.state["stop_reason"] is None
+    assert runner.state["last_decision"] is None
+
+
+def test_action_budget_stops_without_mutation_and_explains(runner):
+    runner.state["max_steps"] = 1
+    runner.state["history"] = [{"action": "prior action"}]
+    result = act(runner)
+    runner.browser.act.assert_not_called()
+    assert result["status"] == "blocked"
+    assert "1-action limit" in result["stop_reason"]
+
+
+def test_decision_budget_stops_tick_without_act_or_extra_request(runner, monkeypatch):
+    runner.state["max_steps"] = 1
+    runner.state["decisions"] = [decision(), decision()]
+    choose = Mock()
+    monkeypatch.setattr(loop, "choose", choose)
+    result = runner.command("tick")
+    choose.assert_not_called()
+    runner.browser.act.assert_not_called()
+    assert result["status"] == "blocked"
+    assert "model-decision limit" in result["stop_reason"]
+
+
+@pytest.mark.parametrize("limit", [0, 501, True, 1.5, "200"])
+def test_invalid_budget_rejected_before_browser_connect(monkeypatch, limit):
+    browser = Mock()
+    monkeypatch.setattr(loop, "Browser", browser)
+    with pytest.raises(ValueError, match="action limit"):
+        loop.Agent(None, "Browse", target_id="tab", max_steps=limit)
+    browser.assert_not_called()
+
+
+def test_browser_target_decision_executes_observed_url_not_model_text(runner):
+    action = {"id": "open_url:1", "kind": "open_url", "label": "Open example", "url": "https://example.org/"}
+    runner.state["page"]["actions"].append(action)
+    runner.state["decision"] = {
+        **decision(action["id"]), "operation": "OPEN_URL", "target": action["id"],
+        "text": "https://untrusted.invalid/",
+    }
+    act(runner)
+    runner.browser.act.assert_called_once_with(action, runner.state["page"], text=None)
+    assert runner.state["history"][-1]["operation"] == "OPEN_URL"

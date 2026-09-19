@@ -129,7 +129,10 @@ def test_missing_supplied_strings_offers_needs_input_without_typing(monkeypatch)
         assert "TYPE_TEXT" not in questions["operation"]["criteria"]
         assert "type_text_target" not in questions
         assert body["state"]["supplied_values"] == {}
-        return {"answers": {"operation": choice(questions["operation"]["criteria"], "NEEDS_INPUT")}}
+        return {"answers": {
+            "operation": choice(questions["operation"]["criteria"], "NEEDS_INPUT"),
+            "needs_input_reason": choice(questions["needs_input_reason"]["criteria"], "missing_text"),
+        }}
 
     monkeypatch.setattr(model, "post_json", post)
     assert model.choose(page(), "Find a book", [])["choice"] == "NEEDS_INPUT"
@@ -200,3 +203,149 @@ def test_other_model_response_cannot_execute(monkeypatch, returned_model):
     monkeypatch.setattr(model, "post_json", Mock(return_value={"model": returned_model, "answers": {}}))
     with pytest.raises(ValueError, match="different model"):
         model.choose(page(), "Task", [])
+
+
+def browser_page():
+    state = page()
+    state["target_id"] = "current-tab"
+    state["actions"].extend([
+        {"id": "open_url:0", "kind": "open_url", "label": "Open requested site", "url": "https://example.org/"},
+        {"id": "switch_tab:other-tab", "kind": "switch_tab", "label": "Switch to existing tab",
+         "target_id": "other-tab", "url": "https://example.net/", "title": "Another site"},
+        {"id": "back", "kind": "back", "label": "Go back", "entry_id": 7,
+         "url": "https://example.test/prior", "title": "Prior page"},
+    ])
+    return state
+
+
+def test_browser_targets_do_not_require_nodes_or_change_dom_indices():
+    state = browser_page()
+    elements, targets, controls = model.action_space(state["actions"])
+    assert len(elements) == 2
+    assert targets["CLICK"]["1"]["id"] == "e2"
+    assert targets["OPEN_URL"]["open_url:0"]["url"] == "https://example.org/"
+    assert targets["SWITCH_TAB"]["switch_tab:other-tab"]["target_id"] == "other-tab"
+    assert controls["BACK"]["id"] == "back"
+    assert all("node" not in action for action in targets["OPEN_URL"].values())
+
+
+@pytest.mark.parametrize("operation,selected", [
+    ("OPEN_URL", "open_url:0"), ("SWITCH_TAB", "switch_tab:other-tab"), ("BACK", "back"),
+])
+def test_one_request_uses_only_selected_browser_head(monkeypatch, operation, selected):
+    calls = []
+
+    def post(_url, _key, body):
+        calls.append(body)
+        questions = body["questions"]
+        assert body["state"]["active_tab"] == "current-tab"
+        assert len(body["state"]["browser_actions"]) == 3
+        assert set(json.loads(questions["switch_tab_target"]["criteria"]["switch_tab:other-tab"])) >= {
+            "title", "target_id", "url",
+        }
+        answers = {"operation": choice(questions["operation"]["criteria"], operation),
+                   "blocked_reason": {"choice": "invented"}, "needs_input_reason": {"choice": "invented"},
+                   "click_target": {"choice": "invented"}}
+        if operation != "BACK":
+            key = operation.lower() + "_target"
+            answers[key] = choice(questions[key]["criteria"], selected)
+        return {"answers": answers}
+
+    monkeypatch.setattr(model, "post_json", post)
+    result = model.choose(browser_page(), "Open the next requested site", [])
+    assert len(calls) == 1
+    assert result["operation"] == operation and result["choice"] == selected
+    assert result["stop_reason"] is None
+    assert result["target"] == (None if operation == "BACK" else selected)
+
+
+def test_navigation_cannot_consume_a_different_operation_target(monkeypatch):
+    def post(_url, _key, body):
+        questions = body["questions"]
+        return {"answers": {
+            "operation": choice(questions["operation"]["criteria"], "OPEN_URL"),
+            "open_url_target": choice(["switch_tab:other-tab"], "switch_tab:other-tab"),
+            "switch_tab_target": choice(questions["switch_tab_target"]["criteria"], "switch_tab:other-tab"),
+        }}
+
+    monkeypatch.setattr(model, "post_json", post)
+    with pytest.raises(ValueError, match="Invalid Jev"):
+        model.choose(browser_page(), "Go to another site", [])
+
+
+@pytest.mark.parametrize("operation,reason", [
+    ("BLOCKED", "sign_in_required"), ("BLOCKED", "unsupported_content"),
+    ("NEEDS_INPUT", "missing_address"), ("NEEDS_INPUT", "ambiguous_goal"),
+])
+def test_only_matching_terminal_reason_head_is_consumed(monkeypatch, operation, reason):
+    def post(_url, _key, body):
+        questions = body["questions"]
+        key = operation.lower() + "_reason"
+        answers = {
+            "operation": choice(questions["operation"]["criteria"], operation),
+            "blocked_reason": {"choice": "invented"}, "needs_input_reason": {"choice": "invented"},
+            "click_target": {"choice": "invented"},
+        }
+        answers[key] = choice(questions[key]["criteria"], reason)
+        return {"answers": answers}
+
+    monkeypatch.setattr(model, "post_json", post)
+    result = model.choose(page(), "Task", [])
+    assert result["operation"] == operation and result["stop_reason"] == reason
+
+
+def test_incompatible_stop_reason_is_rejected(monkeypatch):
+    def post(_url, _key, body):
+        questions = body["questions"]
+        return {"answers": {
+            "operation": choice(questions["operation"]["criteria"], "BLOCKED"),
+            "blocked_reason": choice(["missing_text"], "missing_text"),
+        }}
+
+    monkeypatch.setattr(model, "post_json", post)
+    with pytest.raises(ValueError, match="Invalid Jev"):
+        model.choose(page(), "Task", [])
+
+
+def test_all_completed_history_retained_across_site_changes(monkeypatch):
+    history = [
+        {"step": n + 1, "operation": "CLICK", "kind": "click", "action": f"Read item {n}",
+         "url": f"https://example.test/item/{n}", "title": f"Item {n}", "target": "2", "page_changed": True}
+        for n in range(200)
+    ]
+    history[0]["text"] = "  exact earlier supplied string  "
+
+    def post(_url, _key, body):
+        assert body["state"]["recent_actions"] == history
+        return {"answers": {"operation": choice(body["questions"]["operation"]["criteria"], "DONE")}}
+
+    monkeypatch.setattr(model, "post_json", post)
+    assert model.choose(page(), "Finish all sites", history)["operation"] == "DONE"
+
+
+def test_history_bound_fails_before_paid_request(monkeypatch):
+    post = Mock()
+    monkeypatch.setattr(model, "post_json", post)
+    with pytest.raises(ValueError, match="500-action"):
+        model.choose(page(), "Task", [{} for _ in range(501)])
+    post.assert_not_called()
+
+
+def test_duplicate_action_ids_cannot_confuse_browser_and_dom_targets():
+    state = browser_page()
+    state["actions"][-1]["id"] = "e1"
+    with pytest.raises(ValueError, match="distinct string IDs"):
+        model.action_space(state["actions"])
+
+
+def test_excess_browser_choices_are_not_silently_discarded(monkeypatch):
+    state = page()
+    state["actions"].extend([
+        {"id": f"open_url:{n}", "kind": "open_url", "label": "Open", "url": f"https://example.org/{n}"}
+        for n in range(256)
+    ])
+    post = Mock()
+    monkeypatch.setattr(model, "post_json", post)
+    with pytest.raises(ValueError, match="OPEN_URL targets"):
+        model.choose(state, "Open site", [])
+    post.assert_not_called()

@@ -6,20 +6,34 @@ from pathlib import Path
 
 from .browser import ActionPaused, Browser, StalePage
 from .model import action_space, choose, decision_space, supplied_values
+from .navigation import navigation_urls
 from .questions import MAX_STEPS
+
+STOP_REASONS = {
+    "unavailable_control": "Jev could not find a supported control to continue from this page.",
+    "sign_in_required": "Sign in to this site in Chrome, then start the task again.",
+    "unsupported_content": "The required content is not accessible to the current page reader.",
+    "cannot_progress": "Jev found no supported action that advances the remaining task.",
+    "missing_text": "Add the exact text the task needs under Text to enter, then resume.",
+    "missing_address": "Add the site's full web address under Text to enter, then resume.",
+    "ambiguous_goal": "Specify the remaining action more precisely, then start the updated task.",
+}
 
 
 class Agent:
     def __init__(
-        self, url, goals, *, target_id=None, values=None, cancel_event=None, record_dir=None, screenshots=False
+        self, url, goals, *, target_id=None, values=None, max_steps=MAX_STEPS, cancel_event=None,
+        record_dir=None, screenshots=False
     ):
         task = goals.strip() if isinstance(goals, str) else "\n".join(goals).strip()
         if not task:
             raise ValueError("Supply a task")
+        if type(max_steps) is not int or not 1 <= max_steps <= 500:
+            raise ValueError("Set an action limit from 1 to 500.")
         plan = [task]
         self.values = supplied_values(task, values)
         self.cancel_event = cancel_event
-        self.browser = Browser(url, target_id=target_id)
+        self.browser = Browser(url, target_id=target_id, navigation_urls=navigation_urls(task, self.values))
         self.browser.cancel_event = cancel_event
         self.record_dir = Path(record_dir) if record_dir else None
         self.screenshots = screenshots or bool(record_dir)
@@ -35,6 +49,9 @@ class Agent:
             decision=None,
             history=[],
             status="ready",
+            stop_reason=None,
+            last_decision=None,
+            max_steps=max_steps,
             plan=plan,
             plan_index=0,
             decisions=[],
@@ -89,7 +106,7 @@ class Agent:
         if name == "tick":
             try:
                 self.command("predict", {})
-                if state["status"] == "paused":
+                if state["status"] in {"done", "blocked", "needs_input", "paused", "error"}:
                     return self.snapshot()
                 return self.command("act", {"fingerprint": state["page"]["fingerprint"]})
             except StalePage:
@@ -110,9 +127,11 @@ class Agent:
             if not state["browser"].fresh(state["page"]):
                 state["page"] = state["browser"].observe(screenshot=self.screenshots)
             state["decision"] = None
-            if len(state["decisions"]) >= MAX_STEPS * 2:
+            if len(state["decisions"]) >= state.get("max_steps", MAX_STEPS) * 2:
                 state["status"] = "blocked"
-                raise ValueError("Reached the run's model-call budget")
+                state["stop_reason"] = "Reached the model-decision limit before completing the task."
+                self._elapsed()
+                return self.snapshot()
             state["decision"] = choose(state["page"], state["goal"], state["history"], self.values)
             state["decisions"].append(
                 {
@@ -131,6 +150,7 @@ class Agent:
                 raise ValueError("Observe and choose before acting")
             # Consume once, before any mutation or model call. A retry cannot double-click.
             state["decision"] = None
+            state["last_decision"] = decision
             selected = decision["choice"]
             if selected in {"DONE", "BLOCKED", "NEEDS_INPUT"}:
                 if decision["operation"] != selected:
@@ -139,8 +159,15 @@ class Agent:
                     state["status"] = "ready"
                     raise StalePage("Page changed since the decision. Choose again.")
                 state["status"] = {"DONE": "done", "BLOCKED": "blocked", "NEEDS_INPUT": "needs_input"}[selected]
+                reason = decision.get("stop_reason")
+                state["stop_reason"] = (
+                    "Jev marked the task complete. Check the final page and action history."
+                    if selected == "DONE" else STOP_REASONS.get(reason, STOP_REASONS[
+                        "missing_text" if selected == "NEEDS_INPUT" else "cannot_progress"
+                    ])
+                )
                 if selected == "NEEDS_INPUT":
-                    state["input_request"] = "Add the exact text required by the task to Supplied strings."
+                    state["input_request"] = state["stop_reason"]
                 state["plan_index"] = int(selected == "DONE")
                 state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
                 return self.snapshot()
@@ -150,9 +177,13 @@ class Agent:
             candidate = targets.get(operation, {}).get(decision.get("target")) or controls.get(operation)
             if candidate is None or candidate["id"] != selected:
                 raise ValueError("Decision does not match an offered operation and target.")
-            if len(state["history"]) >= MAX_STEPS:
+            if len(state["history"]) >= state.get("max_steps", MAX_STEPS):
                 state["status"] = "blocked"
-                raise ValueError(f"Stopped at the {MAX_STEPS}-action run budget")
+                state["stop_reason"] = (
+                    f"Reached the {state.get('max_steps', MAX_STEPS)}-action limit before completing the task."
+                )
+                self._elapsed()
+                return self.snapshot()
             text = None
             if action["kind"] == "fill":
                 if candidate.get("payload_id") != decision.get("payload_id"):
@@ -184,6 +215,7 @@ class Agent:
                     "target": decision["target"],
                     "page_changed": None,
                     "url": page["url"],
+                    "title": page.get("title", ""),
                     "usage": decision["usage"],
                     "executed_ms": round((time.perf_counter() - state["started_at"]) * 1000),
                     "elapsed_ms": state["elapsed_ms"],
@@ -194,6 +226,7 @@ class Agent:
             state["history"][-1].update(
                 page_changed=state["page"]["fingerprint"] != page["fingerprint"],
                 url=state["page"]["url"],
+                title=state["page"].get("title", ""),
                 elapsed_ms=state["elapsed_ms"],
             )
             if state["record"]:
@@ -206,6 +239,10 @@ class Agent:
                 if len(repeated) == 3 and all(h["page_changed"] is False and h["kind"] != "wait" for h in repeated)
                 else "ready"
             )
+            if state["status"] == "blocked":
+                state["stop_reason"] = (
+                    "Three consecutive actions produced no visible change. Inspect the page before restarting."
+                )
             self._pause_requested()
         elif name == "supply_values":
             if state["status"] in {"done", "blocked", "error"}:
@@ -214,9 +251,12 @@ class Agent:
             if not isinstance(additions, (list, tuple)):
                 raise ValueError("Supplied values must be a list of strings.")
             self.values = supplied_values(state["goal"], [*self.values, *additions])
+            self.browser.set_navigation_urls(navigation_urls(state["goal"], self.values))
             state["values"] = list(self.values)
             state["decision"] = None
             state.pop("input_request", None)
+            state["stop_reason"] = None
+            state["last_decision"] = None
             state["status"] = "ready"
             self._pause_requested()
         else:

@@ -13,6 +13,7 @@ from ctrl.browser_connection import cdp, connect, selectable_tab, status
 # Atomically read visible content and controls, preserving actual DOM node identity.
 READ_STATE = Path(__file__).with_name("snapshot.js").read_text(encoding="utf-8").rstrip().rstrip(";")
 MARKER = f"(() => {{ const state={READ_STATE}; return state?.marker ?? null; }})()"
+NAVIGATION_READY = "({ready:document.readyState,url:location.href})"
 
 
 class StalePage(ValueError):
@@ -24,7 +25,7 @@ class ActionPaused(RuntimeError):
 
 
 class Browser:
-    def __init__(self, url=None, *, target_id=None):
+    def __init__(self, url=None, *, target_id=None, navigation_urls=None):
         if bool(url) == bool(target_id):
             raise ValueError("Select an existing tab or supply a URL for a new tab.")
         if not status()["connected"] and not connect(wait=2)["connected"]:
@@ -33,6 +34,8 @@ class Browser:
         self.session = None
         self._consumed = set()
         self.cancel_event = None
+        self._pending_navigation = None
+        self.set_navigation_urls(navigation_urls)
         if target_id:
             info = cdp("Target.getTargetInfo", targetId=target_id)["targetInfo"]
             if not selectable_tab(info):
@@ -59,6 +62,9 @@ class Browser:
     def call(self, method, **params):
         return cdp(method, session_id=self.session, **params)
 
+    def set_navigation_urls(self, urls):
+        self.navigation_urls = validate_navigation_urls(urls)
+
     def evaluate(self, expression):
         response = self.call("Runtime.evaluate", expression=expression, returnByValue=True)
         if response.get("exceptionDetails"):
@@ -66,6 +72,7 @@ class Browser:
         return response.get("result", {}).get("value")
 
     def observe(self, screenshot=True):
+        self.wait_for_navigation()
         if getattr(self, "after_input", None):
             action, self.after_input = self.after_input, None
             # This is read-only and happens after execution was logged, even if navigation interrupts it.
@@ -103,6 +110,10 @@ class Browser:
         for attempt in range(10):
             try:
                 page = browser_operation({"operation": "observe", "session": self.session, "screenshot": screenshot})
+                page["target_id"] = self.target
+                page["browser_context"] = self.navigation_context()
+                page["actions"].extend(self.navigation_actions(page["browser_context"]))
+                page["fingerprint"] = fingerprint(page)
                 page["observation_id"] = uuid.uuid4().hex
                 return page
             except StalePage:
@@ -112,6 +123,27 @@ class Browser:
         raise StalePage("Page did not settle")
 
     def fresh(self, page, action=None):
+        if page.get("target_id", self.target) != self.target:
+            return False
+        kind = action.get("kind") if action else None
+        if kind in {"open_url", "switch_tab", "back"}:
+            if self.evaluate(MARKER) != page["marker"]:
+                return False
+            if kind == "open_url":
+                return action["url"] in self.navigation_urls
+            if kind == "switch_tab":
+                try:
+                    info = cdp("Target.getTargetInfo", targetId=action["target_id"])["targetInfo"]
+                except RuntimeError:
+                    return False
+                return selectable_tab(info) and tab_identity(info) == {
+                    "target_id": action["target_id"],
+                    "url": action["url"],
+                    "title": action["title"],
+                }
+            return self.navigation_history() == page["browser_context"]["history"]
+        if action is None and "browser_context" in page and self.navigation_context() != page["browser_context"]:
+            return False
         if action is not None and action["kind"] in {"click", "select"}:
             node = action["node"]
             if type(node) is not int:
@@ -122,6 +154,112 @@ class Browser:
             )
             return current == [page["page_key"], page["guards"].get(str(node))]
         return self.evaluate(MARKER) == page["marker"]
+
+    def navigation_history(self):
+        history = self.call("Page.getNavigationHistory")
+        entries = history.get("entries", [])
+        index = history.get("currentIndex", -1)
+
+        def entry_at(position):
+            if not 0 <= position < len(entries):
+                return None
+            entry = entries[position]
+            return {key: entry.get(key) for key in ("id", "url", "title")}
+
+        return {"current_index": index, "current": entry_at(index), "previous": entry_at(index - 1)}
+
+    def navigation_context(self):
+        targets = cdp("Target.getTargets").get("targetInfos", [])
+        tabs = sorted(
+            [tab_identity(target) for target in targets if selectable_tab(target)],
+            key=lambda tab: (tab["target_id"] != self.target, tab["target_id"]),
+        )
+        return {
+            "tabs": tabs[:50],
+            "omitted_tabs": max(0, len(tabs) - 50),
+            "history": self.navigation_history(),
+            "navigation_urls": list(self.navigation_urls),
+        }
+
+    def navigation_actions(self, context):
+        actions = [
+            {"id": f"open_url:{index}", "kind": "open_url", "label": f"Open {url} in a new tab", "url": url}
+            for index, url in enumerate(context["navigation_urls"], 1)
+        ]
+        for tab in context["tabs"]:
+            if tab["target_id"] == self.target:
+                continue
+            actions.append(
+                {
+                    "id": f"switch_tab:{tab['target_id']}",
+                    "kind": "switch_tab",
+                    "label": f"Switch to {tab['title'] or tab['url']} — {tab['url']}",
+                    **tab,
+                }
+            )
+        previous = context["history"]["previous"]
+        if previous and type(previous["id"]) is int and selectable_tab({"type": "page", "url": previous["url"]}):
+            actions.append(
+                {
+                    "id": "back",
+                    "kind": "back",
+                    "label": f"Go back to {previous['title'] or previous['url']}",
+                    "entry_id": previous["id"],
+                    "url": previous["url"],
+                    "title": previous["title"],
+                }
+            )
+        return actions
+
+    def wait_for_navigation(self):
+        pending = self._pending_navigation
+        if pending is None:
+            return
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            try:
+                current = self.evaluate(NAVIGATION_READY)
+            except StalePage:
+                current = None
+            if current and current.get("ready") in {"interactive", "complete"}:
+                url = current.get("url", "")
+                reached = url == pending["url"] or url != pending["source_url"] or pending["target_changed"]
+                if reached and urlparse(url).scheme in {"http", "https"}:
+                    self._pending_navigation = None
+                    return
+            time.sleep(0.05)
+        raise RuntimeError("The destination is still loading. Navigation was not repeated; inspect the selected tab.")
+
+    def navigate(self, action, page):
+        """Execute one observed browser action; preserve every tab and never replay."""
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            raise ActionPaused("Paused before browser navigation.")
+        kind = action["kind"]
+        try:
+            if kind == "back":
+                self.call("Page.navigateToHistoryEntry", entryId=action["entry_id"])
+            else:
+                target = action.get("target_id")
+                if kind == "open_url":
+                    target = cdp("Target.createTarget", url=action["url"], background=False)["targetId"]
+                new_session = cdp("Target.attachToTarget", targetId=target, flatten=True)["sessionId"]
+                previous_session = self.session
+                self.target, self.session = target, new_session
+                try:
+                    cdp("Target.detachFromTarget", sessionId=previous_session)
+                except RuntimeError:
+                    pass  # The previous target is preserved even when detach is not confirmed.
+                if kind == "switch_tab":
+                    cdp("Target.activateTarget", targetId=target)
+        except Exception as exc:
+            raise RuntimeError("Browser navigation was not confirmed. Inspect the tabs before a new task.") from exc
+        self.after_input = None
+        self._pending_navigation = {
+            "url": action["url"],
+            "source_url": page["url"],
+            "target_changed": kind != "back",
+        }
+        return {"executed": action["id"]}
 
     def act(self, action, page, text=None):
         if action not in page["actions"]:
@@ -141,14 +279,18 @@ class Browser:
         if action["kind"] == "wait":
             time.sleep(0.1)
         try:
-            result = browser_operation(
-                {
-                    "operation": "act",
-                    "session": self.session,
-                    "action": action,
-                    "text": text,
-                    "cancel_event": self.cancel_event,
-                }
+            result = (
+                self.navigate(action, page)
+                if action["kind"] in {"open_url", "switch_tab", "back"}
+                else browser_operation(
+                    {
+                        "operation": "act",
+                        "session": self.session,
+                        "action": action,
+                        "text": text,
+                        "cancel_event": self.cancel_event,
+                    }
+                )
             )
         except ActionPaused:
             # ActionPaused can only be raised before the first mutation, so a new
@@ -156,7 +298,7 @@ class Browser:
             if observation:
                 self._consumed.discard(observation)
             raise
-        self.after_input = action if action["kind"] != "wait" else None
+        self.after_input = action if action["kind"] in {"click", "fill", "select", "scroll"} else None
         return result
 
     def close(self):
@@ -171,7 +313,35 @@ class Browser:
 
 def fingerprint(state):
     content = {k: state[k] for k in ("url", "text", "actions", "scroll")}
+    content.update({key: state[key] for key in ("target_id", "browser_context") if key in state})
     return hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest()
+
+
+def tab_identity(target):
+    return {"target_id": target["targetId"], "url": target.get("url", ""), "title": target.get("title", "")}
+
+
+def validate_navigation_urls(urls):
+    if urls is None:
+        return []
+    if not isinstance(urls, (list, tuple)) or len(urls) > 16:
+        raise ValueError("Supply at most 16 exact navigation URLs.")
+    result = []
+    for url in urls:
+        if not isinstance(url, str) or len(url) > 2000 or any(character.isspace() for character in url):
+            raise ValueError("Navigation URLs must be exact http:// or https:// destinations.")
+        parsed = urlparse(url)
+        if (
+            not parsed.hostname
+            or parsed.username
+            or parsed.password
+            or "\\" in url
+            or not selectable_tab({"type": "page", "url": url})
+        ):
+            raise ValueError("Navigation URLs must be ordinary web destinations outside the CTRL console.")
+        if url not in result:
+            result.append(url)
+    return result
 
 
 def browser_operation(request):

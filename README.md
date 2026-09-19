@@ -8,9 +8,9 @@ On this laptop, double-click **Start CTRL.cmd**, or run `Start-CTRL.ps1`. The la
 
 1. Startup loads the OpenRouter key directly from AWS Secrets Manager into Python memory and verifies Jev. **Check access** retries that check if needed.
 2. On first connection, open `chrome://inspect/#remote-debugging`, enable **Allow remote debugging for this browser instance**, and accept Chrome's connection prompt. [CTRL] connects automatically when the setting becomes available; **Connect Chrome** retries a failed connection. Keep Chrome open.
-3. Select an existing web tab. Enter the outcome you want, quoting any exact text the agent should type, or enter those values under **Text to enter**.
+3. Select a starting web tab. Enter the outcome you want, quoting any exact text the agent should type, or enter those values under **Text to enter**. Jev can switch to observed tabs, open requested addresses in new normal Chrome tabs, and go back. Explicit URLs/domains work on any site; Gmail, Reddit, and X/Twitter also have address shortcuts. These are destinations, not prepared action sequences.
 4. Click **Run agent**. **Single step** executes one observe/decide/action cycle. **Choose only** previews a decision; **Execute** applies it if it is still fresh.
-5. **Pause** stops further agent steps. The current action may finish. **Clear session** detaches the agent and leaves the page open.
+5. **Max actions** defaults to 200 and can be set from 1 to 500. A multi-part task can require several actions per item. A stopped run shows its reason beside the task controls. **Pause** stops further agent steps. The current action may finish. **Clear session** detaches the agent and leaves the page open.
 
 Example: on a Wikipedia tab, enter `Search Wikipedia for "Ada Lovelace", open the article, and stop when it is visible.` This is a user goal, not a prepared website workflow.
 
@@ -38,21 +38,23 @@ Nonsecret settings can be supplied through `CTRL_AWS_PROFILE`, `CTRL_AWS_REGION`
 
 Each observation reads visible page text and supported controls. One Jev request asks for an operation and its operation-specific targets. Code validates only the selected target, checks its freshness, executes it once, and observes again.
 
-- Click observed controls and links; fill fields with exact supplied strings; select observed native options; scroll; wait; finish; or request missing input.
+- Click observed controls and links; fill fields with exact supplied strings; select observed native options; scroll; open a requested address; switch to an observed tab; go back; wait; finish; or request missing input.
 - Jev is the only model: `typesafe/jev-1.13` through OpenRouter's `/api/alpha/decisions`. No planning model or text-generation helper is present.
 - Text entry is selection, not prose generation. Quoted task strings and supplied values are copied verbatim. If needed text is missing, the run stops at `needs_input`; add values and resume.
 - Supports ordinary visible DOM controls. Password/file inputs, browser-internal pages, canvas-only controls, and controls inside inaccessible frames or shadow roots are not supported. There is no screenshot/vision fallback.
-- At most 60 executed actions and 120 model decisions per run. At most 32 supplied strings; more than 255 field/string pairs produces an explicit error asking for fewer strings.
-- The agent stays attached to the chosen tab. It does not automatically follow newly opened tabs. Choose a new target explicitly when needed.
+- Up to the selected action limit (default 200, maximum 500) and twice that many model decisions per run. At most 32 supplied strings; more than 255 field/string pairs produces an explicit error asking for fewer strings.
+- New tabs are preserved, and browser navigation selected by Jev brings the destination tab forward. Links that open a separate tab become available as observed SWITCH_TAB targets. There is no automatic tab closing.
+- Jev selects actions and stop reasons; it does not write email summaries or arbitrary prose. Asking to "interact" with a feed allows browsing, opening, and scrolling; posting, messaging, voting, following, deleting, or archiving require a specific request.
 - A model's `done` status is its judgment, not independent proof. Inspect the final page and action history.
 
-The browser-control transport is local, but task text, supplied values, visible page text, and recent actions are sent to Jev through OpenRouter. Only the selected page is observed for model input. The API credential remains in the Python process.
+The browser-control transport is local, but task text, supplied values, visible page text, and recent actions are sent to Jev through OpenRouter. The active page is observed for model input; eligible open-tab titles/URLs and the executed action history are also included so Jev can choose where to continue. The API credential remains in the Python process.
 
 ## Development
 
 ```powershell
 uv sync --locked
 npm.cmd ci
+npm.cmd test
 npm.cmd run typecheck
 npm.cmd run build
 uv run ruff check .

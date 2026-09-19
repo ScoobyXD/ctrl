@@ -48,10 +48,12 @@
               <p class="field-hint">Uses a tab in your normal Chrome session.</p>
 
               <div class="goal-heading"><label class="field-label" for="goal">What should happen?</label><span class="tiny-label" id="goal-count">0 CHARACTERS</span></div>
-              <textarea id="goal" rows="7" placeholder="Describe the outcome you want in this tab. Put any exact text to type in quotation marks." spellcheck="true"></textarea>
-              <div class="task-note"><svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><circle cx="10" cy="10" r="7"/><path d="M10 9v5m0-8v.5"/></svg><p id="task-hint">Jev chooses actions. Provide the exact text it should enter.</p></div>
+              <textarea id="goal" rows="7" placeholder="Describe the outcome you want in Chrome. Put any exact text to type in quotation marks." spellcheck="true"></textarea>
+              <div class="task-note"><svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><circle cx="10" cy="10" r="7"/><path d="M10 9v5m0-8v.5"/></svg><p id="task-hint">Jev can open sites and switch tabs. Provide the exact text it should enter.</p></div>
 
               <details class="supplied-values" id="values-section"><summary><span>Text to enter</span><span class="optional-label">OPTIONAL</span><svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="m6 8 4 4 4-4"/></svg></summary><div><label class="sr-only" for="values">Exact text values, one per line</label><textarea id="values" rows="3" placeholder="One exact value per line" spellcheck="false"></textarea><p class="field-hint">Add values here or quote them in your command. Values stay in this local session.</p></div></details>
+
+              <div class="budget-field"><div><label class="field-label" for="max-steps">Max actions</label><p class="field-hint" id="max-steps-hint">Run stops at this limit. Choose 1–500.</p></div><input id="max-steps" type="number" min="1" max="500" step="1" value="200" inputmode="numeric" aria-describedby="max-steps-hint" /></div>
 
               <div class="execution-buttons"><button type="button" id="run-button" class="button button-primary"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 4 10 6-10 6Z" fill="currentColor"/></svg><span>Run agent</span></button><button type="button" id="pause-button" class="button button-outline" disabled><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M6 5v10m8-10v10" stroke="currentColor" stroke-width="3"/></svg>Pause</button></div>
               <div class="manual-buttons"><button type="button" id="step-button" class="button button-subtle">Single step <span>↗</span></button><button type="button" id="predict-button" class="button button-subtle">Choose only <span>↗</span></button></div>
@@ -68,7 +70,7 @@
             </section>
 
             <section class="panel decision-panel" aria-labelledby="decision-heading">
-              <div class="panel-heading"><h2 id="decision-heading"><span class="section-index">03</span> Next action</h2><span class="model-badge" id="model-name">JEV</span></div>
+              <div class="panel-heading"><h2 id="decision-heading"><span class="section-index">03</span><span id="decision-label">Next action</span></h2><span class="model-badge" id="model-name">JEV</span></div>
               <div id="decision-content" class="decision-content"><div class="decision-empty"><span class="decision-empty-icon">↗</span><p>The next decision will appear here.<small>Use Choose only to preview before executing.</small></p></div></div>
               <div id="decision-footer" class="decision-footer" hidden><p id="decision-explanation">Execute this decision against the observed page.</p><button type="button" class="button button-small button-primary" id="act-button">Execute action <span>↗</span></button></div>
             </section>

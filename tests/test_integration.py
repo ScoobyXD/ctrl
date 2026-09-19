@@ -127,3 +127,23 @@ def test_unexpected_sdk_error_does_not_reveal_response_or_credentials(control, m
     assert "No browser action was automatically retried" in snapshot["error"]
     assert snapshot["credentials"]["status"] == "error"
     assert snapshot["busy"] is False
+
+
+def test_stale_manual_preview_refreshes_without_replaying(control):
+    from unittest.mock import Mock
+
+    from jev_ultrafast.browser import StalePage
+
+    control.agent = StubAgent()
+    control.agent.screenshots = False
+    fresh = {"fingerprint": "page-2", "actions": []}
+    control.agent.browser.observe = Mock(return_value=fresh)
+    control.agent.command = Mock(side_effect=StalePage("Tab changed"))
+    control.capture()
+    control.work("act", {"fingerprint": "page-1"})
+    state = control.state()
+    assert state["status"] == "ready"
+    assert state["decision"] is None
+    assert state["page"]["fingerprint"] == "page-2"
+    assert state["error"] is None
+    control.agent.command.assert_called_once_with("act", {"fingerprint": "page-1"})

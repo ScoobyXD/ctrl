@@ -79,3 +79,13 @@ def test_second_command_cannot_double_execute():
 def test_start_validates_user_values():
     with pytest.raises(ValueError):
         Controller.validate_start({'goal': 'search', 'target_id': 'tab', 'values': ['']})
+
+
+@pytest.mark.parametrize("limit", [0, 501, True, None, "200"])
+def test_start_rejects_invalid_action_budget(limit):
+    with pytest.raises(ValueError, match="action limit"):
+        Controller.validate_start({"goal": "browse", "target_id": "tab", "max_steps": limit})
+
+
+def test_start_accepts_longer_explicit_budget():
+    Controller.validate_start({"goal": "browse", "target_id": "tab", "max_steps": 500})

@@ -14,6 +14,7 @@ jobs:
           cache: npm
       - run: uv sync --locked --python 3.12
       - run: npm ci
+      - run: npm test
       - run: npm run typecheck
       - run: npm run build
       - run: uv run ruff check .

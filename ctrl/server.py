@@ -11,6 +11,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from jev_ultrafast.browser import StalePage
+from jev_ultrafast.questions import MAX_STEPS
+
 from . import browser_connection
 from .credentials import CredentialError
 from .diagnostics import MODEL, check_openrouter
@@ -50,7 +53,7 @@ class Controller:
                 "browser": browser,
                 "tabs": list(self.tabs),
                 "model": MODEL,
-                "max_steps": 60,
+                "max_steps": self.view.get("max_steps", MAX_STEPS),
             }
 
     def capture(self):
@@ -68,6 +71,9 @@ class Controller:
         with self.lock:
             self.view = snapshot
             self.view["selected_tab"] = getattr(self.agent.browser, "target", None)
+            context = (snapshot.get("page") or {}).get("browser_context")
+            if context is not None and "tabs" in context:
+                self.tabs = list(context["tabs"])
 
     def refresh_tabs(self):
         tabs = browser_connection.list_tabs()
@@ -111,6 +117,8 @@ class Controller:
     @staticmethod
     def validate_start(body):
         goal, target, values = body.get("goal"), body.get("target_id"), body.get("values", [])
+        if type(body.get("max_steps", MAX_STEPS)) is not int or not 1 <= body.get("max_steps", MAX_STEPS) <= 500:
+            raise ValueError("Set an action limit from 1 to 500.")
         if not isinstance(goal, str) or not goal.strip() or len(goal) > 8000:
             raise ValueError("Enter a task of 1–8,000 characters.")
         if not isinstance(target, str) or not target or len(target) > 200:
@@ -154,7 +162,8 @@ class Controller:
                         }
                     self.agent = Agent(
                         None, body["goal"], target_id=body["target_id"],
-                        values=body.get("values", []), cancel_event=self.cancel,
+                        values=body.get("values", []), max_steps=body.get("max_steps", MAX_STEPS),
+                        cancel_event=self.cancel,
                     )
                     self.capture()
                 elif name in {"step", "predict", "act", "supply_values"}:
@@ -172,6 +181,17 @@ class Controller:
                         # Yield to the UI between decisions; do not schedule another browser mutation after Pause.
                         if self.cancel.wait(0.03):
                             break
+        except StalePage:
+            # Refresh evidence only. Never replay the consumed preview or browser action.
+            if self.agent:
+                self.agent.state["decision"] = None
+                try:
+                    self.agent.state["page"] = self.agent.browser.observe(screenshot=self.agent.screenshots)
+                    self.agent.state["status"] = "ready"
+                except (ValueError, RuntimeError, TimeoutError):
+                    self.agent.state["status"] = "error"
+                    self.error = "The page is still changing. Wait for it to settle, then start the task again."
+                self.capture()
         except CredentialError as error:
             self.capture()
             with self.lock:
