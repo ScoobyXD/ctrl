@@ -7,11 +7,10 @@ Local browser agent, powered only by Jev through OpenRouter. Uses your normal ru
 On this laptop, double-click **Start CTRL.cmd** or the **CTRL** desktop shortcut to choose **Ultra-fast / Jev only** or the separately installed **Hybrid experiment**. The chooser submits no task. **CTRL Debugger** opens the Jev baseline directly. From PowerShell:
 
 ```powershell
-Set-Location -LiteralPath 'C:\Users\Jonat\ctrl'
-.\Start-CTRL.ps1
+& 'C:\Users\Jonat\ctrl\Start CTRL.cmd'
 ```
 
-This opens a native Windows debugger and an independent emergency control panel. Python runs locally at `127.0.0.1:8766`; the debugger is a desktop window, with no embedded browser. It reuses a running [CTRL] server and never resumes a previous task automatically. The older web dashboard is optional: `Start-CTRL.ps1 -WebDashboard`.
+This opens the mode chooser. **Open Ultra-fast** starts the native Windows debugger and an independent emergency control panel. Python runs locally at `127.0.0.1:8766`; the debugger is a desktop window, with no embedded browser. It reuses a running [CTRL] server and never resumes a previous task automatically. The older web dashboard is optional: `Start-CTRL.ps1 -WebDashboard`.
 
 The hybrid lives in its own TipTour worktree at `C:\Users\Jonat\ctrl-experiments\tiptour-windows\windows-browser`, with a separate environment, native interface, runtime state, and port 8767. It uses an OpenRouter reasoning planner plus Jev; no planner is added to this baseline. Its private repository is [ctrl-tiptour-experiment](https://github.com/ScoobyXD/ctrl-tiptour-experiment). The original TipTour app requires macOS; the Windows adaptation is explicitly experimental. Stop the current app before connecting Chrome from the other mode. A process-lifetime lease prevents simultaneous browser ownership, including while approval or disconnect cleanup is pending.
 

@@ -7,6 +7,7 @@ using System.Drawing.Imaging;
 using System.IO;
 using System.Globalization;
 using System.Net.Http;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -75,8 +76,10 @@ public sealed class CtrlDebugForm : Form {
     static readonly Color Background = Color.FromArgb(17, 20, 16), Panel = Color.FromArgb(27, 32, 24), Ink = Color.FromArgb(229, 237, 220), Muted = Color.FromArgb(154, 174, 138), Lime = Color.FromArgb(211, 250, 118);
     readonly ICtrlDebugApi api;
     readonly Action stopApplication;
+    readonly Action<int> foregroundHandoff;
     readonly bool testing;
-    readonly System.Windows.Forms.Timer timer;
+    readonly System.Windows.Forms.Timer timer, activationTimer;
+    EventWaitHandle activationSignal;
     readonly TextBox goal, values, pageText;
     readonly ComboBox targets;
     readonly NumericUpDown maxActions;
@@ -91,8 +94,9 @@ public sealed class CtrlDebugForm : Form {
     bool initialized, rendering, online, pending, polling, stopped, targetDraft;
     int epoch, traceVersion;
     string signature = "", selectedTraceId = "", traceStamp = "";
-    public CtrlDebugForm(ICtrlDebugApi client, Action stopper, bool test) {
+    public CtrlDebugForm(ICtrlDebugApi client, Action stopper, bool test, Action<int> handoff = null) {
         api = client; stopApplication = stopper; testing = test;
+        foregroundHandoff = handoff ?? (test ? new Action<int>(delegate(int processId) { }) : GrantForeground);
         Text = "[CTRL] Native Debugger";
         ClientSize = new Size(1420, 910); MinimumSize = new Size(1050, 740);
         StartPosition = FormStartPosition.CenterScreen; BackColor = Background; ForeColor = Ink;
@@ -190,13 +194,13 @@ public sealed class CtrlDebugForm : Form {
         };
         connect.Click += async delegate { await Command(async delegate { Apply(await api.Post("/api/connect", new Dictionary<string, object>())); }); };
         credentials.Click += async delegate { await Command(async delegate { Apply(await api.Post("/api/credentials", new Dictionary<string, object>())); }); };
-        run.Click += async delegate { await Command(async delegate { await RunTask("run", false); }); };
-        step.Click += async delegate { await Command(async delegate { await RunTask("step", false); }); };
+        run.Click += async delegate { if (run.Enabled) GrantChromeForInput(); await Command(async delegate { await RunTask("run", false); }); };
+        step.Click += async delegate { if (step.Enabled) GrantChromeForInput(); await Command(async delegate { await RunTask("step", false); }); };
         choose.Click += async delegate { await Command(async delegate { await RunTask("predict", false); }); };
-        restart.Click += async delegate { await Command(async delegate { await RunTask("run", true); }); };
+        restart.Click += async delegate { if (restart.Enabled) GrantChromeForInput(); await Command(async delegate { await RunTask("run", true); }); };
         pause.Click += async delegate { await Interrupt("/api/pause"); };
         cancel.Click += async delegate { await Interrupt("/api/cancel"); };
-        execute.Click += async delegate { await Command(async delegate { if (Dirty()) throw new InvalidOperationException("The command changed. Choose a fresh action."); object fingerprint = CtrlDebugJson.Get(CtrlDebugJson.Get(state, "decision"), "fingerprint") ?? CtrlDebugJson.Get(CtrlDebugJson.Get(state, "page"), "fingerprint"); if (fingerprint == null) throw new InvalidOperationException("Choose a fresh action first."); Apply(await api.Post("/api/act", new Dictionary<string, object> { { "fingerprint", fingerprint } })); }); };
+        execute.Click += async delegate { if (execute.Enabled) GrantChromeForInput(); await Command(async delegate { if (Dirty()) throw new InvalidOperationException("The command changed. Choose a fresh action."); object fingerprint = CtrlDebugJson.Get(CtrlDebugJson.Get(state, "decision"), "fingerprint") ?? CtrlDebugJson.Get(CtrlDebugJson.Get(state, "page"), "fingerprint"); if (fingerprint == null) throw new InvalidOperationException("Choose a fresh action first."); Apply(await api.Post("/api/act", new Dictionary<string, object> { { "fingerprint", fingerprint } })); }); };
         stop.Click += delegate { StopApp(); };
         timeline.SelectedIndexChanged += async delegate {
             if (rendering || timeline.SelectedItems.Count == 0) return;
@@ -204,11 +208,28 @@ public sealed class CtrlDebugForm : Form {
         };
         followLatest.CheckedChanged += async delegate { if (followLatest.Checked && !rendering) await LoadTrace(CtrlDebugJson.Text(state, "latest_trace_id"), true); };
         timer = new System.Windows.Forms.Timer { Interval = 700 }; timer.Tick += async delegate { await Poll(); };
+        activationTimer = new System.Windows.Forms.Timer { Interval = 200 };
+        activationTimer.Tick += delegate { RestoreRequestedWindow(); };
         Shown += async delegate { if (!testing) { timer.Start(); await Poll(); } };
         FormClosing += delegate { timer.Stop(); epoch++; };
         UpdateButtons();
     }
 
+    public void WatchActivation(EventWaitHandle signal) { activationSignal = signal; activationTimer.Start(); }
+    void RestoreRequestedWindow() {
+        if (activationSignal == null || !activationSignal.WaitOne(0) || IsDisposed) return;
+        if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
+        if (!Visible) Show();
+        if (!testing) { BringToFront(); Activate(); }
+    }
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern bool AllowSetForegroundWindow(uint processId);
+    static void GrantForeground(int processId) { AllowSetForegroundWindow((uint)processId); }
+    void GrantChromeForInput() {
+        object browser = CtrlDebugJson.Get(state, "browser");
+        int processId;
+        if (CtrlDebugJson.Flag(browser, "connected") && Int32.TryParse(CtrlDebugJson.Text(browser, "process_id"), out processId) && processId > 0) foregroundHandoff(processId);
+    }
     static Label MakeLabel(string text) { return new Label { Text = text, Dock = DockStyle.Fill, AutoEllipsis = true, TextAlign = ContentAlignment.MiddleLeft, ForeColor = Ink }; }
     static TextBox MakeTextBox(bool readOnly) { return new TextBox { Dock = DockStyle.Fill, ReadOnly = readOnly, BackColor = Panel, ForeColor = Ink, BorderStyle = BorderStyle.FixedSingle }; }
     static CtrlDebugButton MakeButton(string text, int width) { return new CtrlDebugButton { Text = text, Width = width, Height = 34, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(43, 54, 34), ForeColor = Ink, Margin = new Padding(0, 2, 7, 0) }; }
@@ -374,10 +395,23 @@ public sealed class CtrlDebugForm : Form {
         root.Expand(); controls.Expand(); tree.EndUpdate();
     }
     protected override bool ShowWithoutActivation { get { return testing; } }
-    protected override void Dispose(bool disposing) { if (disposing) { timer.Stop(); timer.Dispose(); hints.Dispose(); IDisposable disposable = api as IDisposable; if (disposable != null) disposable.Dispose(); } base.Dispose(disposing); }
+    protected override void Dispose(bool disposing) { if (disposing) { timer.Stop(); timer.Dispose(); activationTimer.Stop(); activationTimer.Dispose(); hints.Dispose(); IDisposable disposable = api as IDisposable; if (disposable != null) disposable.Dispose(); } base.Dispose(disposing); }
 
     public void Verify(CtrlDebugFakeApi fake, string preview) {
         ShowInTaskbar = false; StartPosition = FormStartPosition.Manual; Location = new Point(-32000, -32000); Show(); Application.DoEvents();
+        string testSignalName = "Local\\CTRL-Debugger-Test-" + Guid.NewGuid().ToString("N");
+        using (EventWaitHandle receiver = new EventWaitHandle(false, EventResetMode.AutoReset, testSignalName)) {
+            using (EventWaitHandle sender = EventWaitHandle.OpenExisting(testSignalName)) {
+                WatchActivation(receiver); WindowState = FormWindowState.Minimized; RestoreRequestedWindow();
+                if (WindowState != FormWindowState.Minimized) throw new InvalidOperationException("Debugger restored without a launch request.");
+                sender.Set(); RestoreRequestedWindow();
+                if (WindowState != FormWindowState.Normal || !Visible || fake.Posts.Count != 0 || fake.ForegroundCalls.Count != 0) throw new InvalidOperationException("Repeated launch did not restore only the debugger.");
+                WindowState = FormWindowState.Minimized; RestoreRequestedWindow();
+                if (WindowState != FormWindowState.Minimized) throw new InvalidOperationException("A consumed debugger launch request repeated.");
+                WindowState = FormWindowState.Normal;
+            }
+            activationTimer.Stop(); activationSignal = null;
+        }
         Apply(fake.State); RenderTrace(fake.Trace);
         if (fake.Posts.Count != 0) throw new InvalidOperationException("Opening the debugger submitted a task.");
         if (!browserStatus.Text.Contains("waiting for approval") || !credentialStatus.Text.Contains("Synthetic sign-in expired")) throw new InvalidOperationException("Connection status was not visible.");
@@ -387,13 +421,28 @@ public sealed class CtrlDebugForm : Form {
         if (options.Rows.Count != 6 || Convert.ToString(options.Rows[0].Cells[2].Value) != "80.0%" || Convert.ToString(options.Rows[2].Cells[5].Value) != "Not evaluated" || Convert.ToString(options.Rows[5].Cells[5].Value) != "Rejected") throw new InvalidOperationException("Probability or tri-state audit rendering failed.");
         if (Convert.ToString(options.Rows[4].Cells[3].Value) != "Yes" || Convert.ToString(options.Rows[4].Cells[4].Value) != "") throw new InvalidOperationException("An unused answered head was presented as an action.");
         goal.Text = "Open https://example.test and inspect the search controls"; targets.SelectedIndex = 0; maxActions.Value = 300;
-        RunTask("run", false).GetAwaiter().GetResult();
+        run.TestClick();
         if (fake.Posts.Count != 1 || fake.Posts[0].Key != "/api/start" || CtrlDebugJson.Text(fake.Posts[0].Value, "target_id") != "" || Convert.ToInt32(fake.Posts[0].Value["max_steps"]) != 300) throw new InvalidOperationException("New task input or optional target routing failed.");
         Interrupt("/api/cancel").GetAwaiter().GetResult(); if (fake.Posts[1].Key != "/api/cancel") throw new InvalidOperationException("Cancel routing failed.");
-        RunTask("run", true).GetAwaiter().GetResult();
+        restart.TestClick();
         if (fake.Posts[fake.Posts.Count - 2].Key != "/api/cancel" || fake.Posts[fake.Posts.Count - 1].Key != "/api/start") throw new InvalidOperationException("Explicit restart did not cancel then start once.");
         Interrupt("/api/pause").GetAwaiter().GetResult();
         if (fake.Posts[fake.Posts.Count - 1].Key != "/api/pause" || timeline.Items.Count != 1) throw new InvalidOperationException("Pause routing or retained trace history failed.");
+        if (fake.ForegroundCalls.Count != 2) throw new InvalidOperationException("Only Run and Restart should have requested Chrome foreground permission.");
+        step.TestClick();
+        if (fake.ForegroundCalls.Count != 3 || fake.Posts[fake.Posts.Count - 1].Key != "/api/step") throw new InvalidOperationException("Single step did not request the exact Chrome handoff.");
+        choose.TestClick();
+        if (fake.ForegroundCalls.Count != 3 || fake.Posts[fake.Posts.Count - 1].Key != "/api/predict") throw new InvalidOperationException("Choose only requested foreground permission.");
+        fake.State["decision"] = new Dictionary<string, object> { { "fingerprint", "synthetic-preview" } }; Apply(fake.State);
+        execute.TestClick();
+        if (fake.ForegroundCalls.Count != 4 || fake.Posts[fake.Posts.Count - 1].Key != "/api/act") throw new InvalidOperationException("Execute did not request the exact Chrome handoff.");
+        run.TestClick();
+        if (fake.ForegroundCalls.Count != 5 || fake.Posts[fake.Posts.Count - 1].Key != "/api/run") throw new InvalidOperationException("Resume did not request the exact Chrome handoff.");
+        foreach (int processId in fake.ForegroundCalls) if (processId != 4242) throw new InvalidOperationException("Foreground permission targeted an unverified PID.");
+        Dictionary<string, object> fakeBrowser = CtrlDebugJson.Map(CtrlDebugJson.Get(fake.State, "browser"));
+        foreach (object invalidPid in new object[] { null, 0, -1, 4294967295L, "invalid" }) { fakeBrowser["process_id"] = invalidPid; GrantChromeForInput(); }
+        fakeBrowser["process_id"] = 4242; fakeBrowser["connected"] = false; GrantChromeForInput();
+        if (fake.ForegroundCalls.Count != 5) throw new InvalidOperationException("Unavailable Chrome or an invalid PID received foreground permission.");
         Apply(fake.Fixture()); RenderTrace(fake.Trace); goal.Text = "Search this page for \"release notes\", then inspect the matching result.";
         int beforeStop = fake.Posts.Count; stop.TestClick();
         if (!stopped || run.Enabled || fake.StopCalls != 1 || fake.Posts.Count != beforeStop || !refresh.Enabled || refresh.Text != "Reconnect app") throw new InvalidOperationException("Stop did not use the independent stub or left Run enabled.");
@@ -419,6 +468,7 @@ public sealed class CtrlDebugFakeApi : ICtrlDebugApi {
     public readonly Dictionary<string, object> Trace;
     public readonly List<KeyValuePair<string, Dictionary<string, object>>> Posts = new List<KeyValuePair<string, Dictionary<string, object>>>();
     public int StopCalls;
+    public readonly List<int> ForegroundCalls = new List<int>();
     public CtrlDebugFakeApi() {
         Trace = CtrlDebugJson.Parse(@"{""id"":""fixture-1"",""sequence"":1,""model"":""typesafe/jev-1.13"",""latency_ms"":184,""observation"":{""title"":""Synthetic documentation page"",""url"":""https://example.test/docs"",""text"":""Documentation\nSearch release notes\nVersion history\nThis is synthetic data used only for the offline UI test."",""actions"":[{""id"":""e1"",""kind"":""fill"",""label"":""Search documentation""},{""id"":""e2"",""kind"":""click"",""label"":""Release notes""},{""id"":""e3"",""kind"":""click"",""label"":""Version history""}]},""questions"":[{""id"":""operation"",""label"":""Next operation"",""applies"":true,""options"":[{""id"":""CLICK"",""label"":""Click an observed control"",""probability"":0.8,""selected"":true,""used"":true,""allowed"":true,""validation_note"":""Selected branch passed runtime validation""},{""id"":""FILL"",""label"":""Enter a supplied value"",""probability"":0.2,""selected"":false,""used"":false,""allowed"":null,""validation_note"":""Not selected""}]},{""id"":""click_target"",""label"":""Click target"",""applies"":true,""options"":[{""id"":""e3"",""label"":""Version history"",""probability"":0.09,""selected"":false,""used"":false,""allowed"":null},{""id"":""e2"",""label"":""Release notes"",""probability"":0.91,""selected"":true,""used"":true,""allowed"":true,""validation_note"":""Observed identity and freshness validated""}]},{""id"":""fill_target"",""label"":""Unused fill target"",""applies"":false,""options"":[{""id"":""e1"",""label"":""Search documentation"",""probability"":1.0,""selected"":true,""used"":false,""allowed"":null,""validation_note"":""Answered in parallel; unused by CLICK""}]},{""id"":""rejected_example"",""label"":""Synthetic rejected branch"",""applies"":false,""options"":[{""id"":""stale"",""label"":""Example stale target"",""probability"":null,""selected"":false,""used"":false,""allowed"":false,""validation_note"":""Synthetic rejection fixture""}]}],""selected"":{""operation"":""CLICK"",""action_id"":""e2"",""target_id"":""e2"",""target_label"":""Release notes""},""validation"":{""status"":""passed"",""message"":""Fresh observed target""},""execution"":{""status"":""executed"",""message"":""Click recorded""}}");
         State = Fixture();
@@ -436,7 +486,7 @@ public sealed class CtrlDebugFakeApi : ICtrlDebugApi {
         if (path == "/api/start") { State["goal"] = body["goal"]; State["max_steps"] = body["max_steps"]; State["selected_tab"] = body["target_id"]; State["status"] = "ready"; }
         if (path == "/api/cancel") State["status"] = "cancelled";
         if (path == "/api/pause") State["status"] = "paused";
-        if (path == "/api/connect") State["browser"] = new Dictionary<string, object> { { "status", "connected" }, { "message", "Synthetic Chrome connection ready." } };
+        if (path == "/api/connect") State["browser"] = new Dictionary<string, object> { { "status", "connected" }, { "connected", true }, { "process_id", 4242 }, { "message", "Synthetic Chrome connection ready." } };
         if (path == "/api/credentials") State["credentials"] = new Dictionary<string, object> { { "status", "ready" }, { "message", "Synthetic Jev access check passed." } };
         State["busy"] = false; State["running"] = false; return Task.FromResult(State);
     }
@@ -448,19 +498,21 @@ public static class CtrlDebugApp {
         string hash;
         using (SHA256 sha = SHA256.Create()) hash = BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(Path.GetFullPath(root).ToLowerInvariant()))).Replace("-", "").Substring(0, 16);
         string mutexName = "Local\\CTRL-Debugger-" + hash;
-        bool created; using (Mutex mutex = new Mutex(true, mutexName, out created)) {
-            if (!created) return;
+        bool created;
+        using (EventWaitHandle showRequest = new EventWaitHandle(false, EventResetMode.AutoReset, mutexName + "-Show"))
+        using (Mutex mutex = new Mutex(true, mutexName, out created)) {
+            if (!created) { showRequest.Set(); return; }
             try {
                 using (CtrlDebugForm form = new CtrlDebugForm(new CtrlDebugApi(), delegate {
                     string powershell = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "WindowsPowerShell\\v1.0\\powershell.exe");
                     Process.Start(new ProcessStartInfo(powershell, "-NoProfile -ExecutionPolicy Bypass -File \"" + Path.Combine(root, "Stop-CTRL.ps1") + "\" -Force") { UseShellExecute = false, CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden, WorkingDirectory = root });
-                }, false)) Application.Run(form);
+                }, false)) { form.WatchActivation(showRequest); Application.Run(form); }
             } finally { mutex.ReleaseMutex(); }
         }
     }
     public static string Verify(string preview) {
         Application.EnableVisualStyles(); CtrlDebugFakeApi fake = new CtrlDebugFakeApi();
-        using (CtrlDebugForm form = new CtrlDebugForm(fake, delegate { fake.StopCalls++; }, true)) form.Verify(fake, preview);
-        return CtrlDebugJson.Dump(new Dictionary<string, object> { { "ok", true }, { "synthetic_only", true }, { "all_options_rendered", true }, { "tri_state_validation", true }, { "unused_answers_distinct", true }, { "empty_target_accepted", true }, { "cancel_then_restart", true }, { "no_auto_submit", true }, { "connection_controls", true }, { "stop_visible_at_minimum_size", true }, { "stop_stub_calls", fake.StopCalls }, { "preview_path", Path.GetFullPath(preview) } });
+        using (CtrlDebugForm form = new CtrlDebugForm(fake, delegate { fake.StopCalls++; }, true, delegate(int processId) { fake.ForegroundCalls.Add(processId); })) form.Verify(fake, preview);
+        return CtrlDebugJson.Dump(new Dictionary<string, object> { { "ok", true }, { "repeat_launch_restores", true }, { "foreground_stub_calls", fake.ForegroundCalls.Count }, { "synthetic_only", true }, { "all_options_rendered", true }, { "tri_state_validation", true }, { "unused_answers_distinct", true }, { "empty_target_accepted", true }, { "cancel_then_restart", true }, { "no_auto_submit", true }, { "connection_controls", true }, { "stop_visible_at_minimum_size", true }, { "stop_stub_calls", fake.StopCalls }, { "preview_path", Path.GetFullPath(preview) } });
     }
 }

@@ -21,6 +21,8 @@ public sealed class CtrlExperimentChooser : Form {
     readonly bool testing;
     readonly Label notice;
     readonly CtrlChoiceButton baselineLaunch, hybridLaunch, baselineFolder, hybridFolder;
+    readonly System.Windows.Forms.Timer activationTimer;
+    EventWaitHandle activationSignal;
     int launchRequests, folderRequests;
 
     public CtrlExperimentChooser(string baseline, string hybrid, Action<string> launcher, Action<string> folderOpener, Func<string, bool> readiness, bool test) {
@@ -53,8 +55,21 @@ public sealed class CtrlExperimentChooser : Form {
         hybridLaunch.Click += delegate { Launch(hybridRoot, "Hybrid experiment"); };
         baselineFolder.Click += delegate { Open(baselineRoot); };
         hybridFolder.Click += delegate { Open(hybridRoot); };
+        activationTimer = new System.Windows.Forms.Timer { Interval = 200 };
+        activationTimer.Tick += delegate { RestoreRequestedWindow(); };
     }
 
+    public void WatchActivation(EventWaitHandle signal) { activationSignal = signal; activationTimer.Start(); }
+    void RestoreRequestedWindow() {
+        if (activationSignal == null || !activationSignal.WaitOne(0) || IsDisposed) return;
+        if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
+        if (!Visible) Show();
+        if (!testing) { BringToFront(); Activate(); }
+    }
+    protected override void Dispose(bool disposing) {
+        if (disposing) { activationTimer.Stop(); activationTimer.Dispose(); }
+        base.Dispose(disposing);
+    }
     static Label Label(string value, Color color) { return new Label { Text = value, Dock = DockStyle.Fill, ForeColor = color, TextAlign = ContentAlignment.MiddleLeft, AutoEllipsis = true }; }
     static CtrlChoiceButton Button(string value, Color color) { return new CtrlChoiceButton { Text = value, Dock = DockStyle.Fill, FlatStyle = FlatStyle.Flat, BackColor = color, ForeColor = Background, Font = new Font("Segoe UI", 11, FontStyle.Bold), Margin = new Padding(0, 4, 0, 4) }; }
     Control ModeCard(bool hybrid, out CtrlChoiceButton start, out CtrlChoiceButton folder) {
@@ -98,6 +113,20 @@ public sealed class CtrlExperimentChooser : Form {
     public void Verify(string preview, List<string> launches, List<string> folders) {
         if (launches.Count != 0 || folders.Count != 0) throw new InvalidOperationException("Chooser performed an action before selection.");
         ShowInTaskbar = false; StartPosition = FormStartPosition.Manual; Location = new Point(-32000, -32000); Show(); Application.DoEvents();
+        string testSignalName = "Local\\CTRL-Chooser-Test-" + Guid.NewGuid().ToString("N");
+        using (EventWaitHandle receiver = new EventWaitHandle(false, EventResetMode.AutoReset, testSignalName)) {
+            using (EventWaitHandle sender = EventWaitHandle.OpenExisting(testSignalName)) {
+                WatchActivation(receiver); WindowState = FormWindowState.Minimized;
+                RestoreRequestedWindow();
+                if (WindowState != FormWindowState.Minimized) throw new InvalidOperationException("Chooser restored without a launch request.");
+                sender.Set(); RestoreRequestedWindow();
+                if (WindowState != FormWindowState.Normal || !Visible || launches.Count != 0 || folders.Count != 0) throw new InvalidOperationException("Repeated launch did not restore only the existing chooser.");
+                WindowState = FormWindowState.Minimized; RestoreRequestedWindow();
+                if (WindowState != FormWindowState.Minimized) throw new InvalidOperationException("A consumed launch request repeated.");
+                WindowState = FormWindowState.Normal;
+            }
+            activationTimer.Stop(); activationSignal = null;
+        }
         baselineLaunch.TestClick(); hybridLaunch.TestClick(); baselineFolder.TestClick(); hybridFolder.TestClick();
         if (launchRequests != 2 || folderRequests != 2 || launches.Count != 2 || folders.Count != 2 || launches[0] != baselineRoot || launches[1] != hybridRoot || folders[0] != baselineRoot || folders[1] != hybridRoot) throw new InvalidOperationException("Mode choices did not route independently to their own roots.");
         notice.Text = "Synthetic self-test: both launch buttons and both folder buttons routed to test stubs only.";
@@ -120,8 +149,9 @@ public static class CtrlExperimentChooserApp {
         string hash;
         using (SHA256 sha = SHA256.Create()) hash = BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(Path.GetFullPath(baselineRoot).ToLowerInvariant()))).Replace("-", "").Substring(0, 16);
         bool created;
+        using (EventWaitHandle showRequest = new EventWaitHandle(false, EventResetMode.AutoReset, "Local\\CTRL-ExperimentChooser-Show-" + hash))
         using (Mutex mutex = new Mutex(true, "Local\\CTRL-ExperimentChooser-" + hash, out created)) {
-            if (!created) return;
+            if (!created) { showRequest.Set(); return; }
             try {
                 using (CtrlExperimentChooser form = new CtrlExperimentChooser(baselineRoot, hybridRoot,
                     delegate(string root) {
@@ -129,7 +159,9 @@ public static class CtrlExperimentChooserApp {
                         Process.Start(new ProcessStartInfo(powershell, "-NoProfile -ExecutionPolicy Bypass -File \"" + Path.Combine(root, "Start-CTRL.ps1") + "\"") { UseShellExecute = false, CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden, WorkingDirectory = root });
                     },
                     delegate(string root) { Process.Start(new ProcessStartInfo("explorer.exe", "\"" + root + "\"") { UseShellExecute = true }); },
-                    delegate(string root) { return File.Exists(Path.Combine(root, "Start-CTRL.ps1")); }, false)) Application.Run(form);
+                    delegate(string root) { return File.Exists(Path.Combine(root, "Start-CTRL.ps1")); }, false)) {
+                    form.WatchActivation(showRequest); Application.Run(form);
+                }
             } finally { mutex.ReleaseMutex(); }
         }
     }
@@ -138,6 +170,6 @@ public static class CtrlExperimentChooserApp {
         List<string> launches = new List<string>(), folders = new List<string>();
         using (CtrlExperimentChooser form = new CtrlExperimentChooser(@"C:\Synthetic\ctrl", @"C:\Synthetic\hybrid", delegate(string root) { launches.Add(root); }, delegate(string root) { folders.Add(root); }, delegate(string root) { return true; }, true)) form.Verify(preview, launches, folders);
         using (CtrlExperimentChooser missing = new CtrlExperimentChooser(@"C:\Synthetic\missing", @"C:\Synthetic\missing-hybrid", delegate(string root) { throw new InvalidOperationException("Missing launcher started."); }, delegate(string root) { }, delegate(string root) { return false; }, true)) { }
-        return "{\"ok\":true,\"synthetic_only\":true,\"no_auto_launch\":true,\"distinct_roots\":true,\"launch_stub_calls\":" + launches.Count + ",\"folder_stub_calls\":" + folders.Count + ",\"minimum_layout\":true}";
+        return "{\"ok\":true,\"synthetic_only\":true,\"no_auto_launch\":true,\"repeat_launch_restores\":true,\"distinct_roots\":true,\"launch_stub_calls\":" + launches.Count + ",\"folder_stub_calls\":" + folders.Count + ",\"minimum_layout\":true}";
     }
 }
