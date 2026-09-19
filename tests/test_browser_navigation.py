@@ -475,6 +475,9 @@ def test_document_redirect_between_metadata_and_reader_is_guarded(browser, monke
         ("[::1]", "8877", "[::1]:8877", 1),
         ("[::1]", "8878", "[::1]:8877", 0),
         ("[::1]", "8766", "[::1]:8766", 0),
+        ("[::ffff:7f00:1]", "8877", "[::ffff:7f00:1]:8877", 1),
+        ("[::ffff:7f00:1]", "8878", "[::ffff:7f00:1]:8877", 0),
+        ("[::ffff:7f00:1]", "8766", "[::ffff:7f00:1]:8766", 0),
     ],
 )
 def test_injected_scope_guard_runs_before_any_reader_code(host, port, base, reads, monkeypatch):
@@ -525,3 +528,67 @@ def test_selected_local_tab_keeps_its_own_port(monkeypatch):
     instance = module.Browser(target_id="source")
     assert instance.allowed_hosts == ["localhost:8877"]
     assert not instance.in_scope("http://localhost:8878/")
+
+
+def bootstrap_browser(monkeypatch):
+    chrome = Chrome()
+    monkeypatch.setattr(module, "cdp", chrome.cdp)
+    monkeypatch.setattr(module, "status", lambda: {"connected": True})
+    return module.Browser(navigation_urls=["https://example.org/"]), chrome
+
+
+def test_targetless_bootstrap_reads_no_tab_and_attaches_only_after_selected_open(monkeypatch):
+    instance, chrome = bootstrap_browser(monkeypatch)
+    assert chrome.calls == []
+    page = instance.observe(screenshot=True)
+    assert page["bootstrap"] and page["target_id"] is None
+    assert instance.fresh(page)
+    assert {method for method, _, _ in chrome.calls} == {"Target.getTargets"}
+    action = selected(page, "open_url")
+    instance.act(action, page)
+    assert sum(method == "Target.createTarget" for method, _, _ in chrome.calls) == 1
+    assert not any(method == "Target.detachFromTarget" for method, _, _ in chrome.calls)
+    assert instance.observe(screenshot=False)["url"] == "https://example.org/"
+    with pytest.raises(RuntimeError, match="already used"):
+        instance.act(action, page)
+
+
+def test_targetless_switch_attaches_without_null_detach_or_create(monkeypatch):
+    instance, chrome = bootstrap_browser(monkeypatch)
+    page = instance.observe(screenshot=False)
+    instance.act(selected(page, "switch_tab"), page)
+    assert instance.target == "other"
+    assert not any(method in {"Target.createTarget", "Target.detachFromTarget"} for method, _, _ in chrome.calls)
+
+
+def test_closed_targetless_browser_cannot_open_a_tab(monkeypatch):
+    instance, chrome = bootstrap_browser(monkeypatch)
+    page = instance.observe(screenshot=False)
+    instance.close()
+    chrome.calls.clear()
+    with pytest.raises(RuntimeError, match="closed"):
+        instance.act(selected(page, "open_url"), page)
+    with pytest.raises(RuntimeError, match="closed"):
+        instance.observe(screenshot=False)
+    assert chrome.calls == []
+
+
+def test_paused_targetless_browser_dispatches_nothing(monkeypatch):
+    instance, chrome = bootstrap_browser(monkeypatch)
+    page = instance.observe(screenshot=False)
+    instance.cancel_event = threading.Event()
+    instance.cancel_event.set()
+    chrome.calls.clear()
+    with pytest.raises(module.ActionPaused):
+        instance.act(selected(page, "open_url"), page)
+    assert not any(method in {"Target.createTarget", "Target.attachToTarget"} for method, _, _ in chrome.calls)
+
+
+def test_targetless_bootstrap_requires_valid_destinations_before_connection(monkeypatch):
+    def forbidden():
+        raise AssertionError("Invalid input must not connect to Chrome")
+
+    monkeypatch.setattr(module, "status", forbidden)
+    for destinations in (None, [], ["javascript:alert(1)"], ["http://127.0.0.1:8766/"]):
+        with pytest.raises(ValueError):
+            module.Browser(navigation_urls=destinations)

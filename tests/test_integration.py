@@ -24,6 +24,12 @@ class StubAgent:
     def snapshot(self):
         return dict(self.state)
 
+    def trace_state(self):
+        return {"trace_summaries": [], "latest_trace_id": None}
+
+    def finish_trace(self, *_args):
+        pass
+
     def close(self):
         self.closed = True
 

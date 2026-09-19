@@ -11,7 +11,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from jev_ultrafast.browser import StalePage
+from jev_ultrafast.browser import StalePage, validate_navigation_urls
+from jev_ultrafast.model import supplied_values
+from jev_ultrafast.navigation import navigation_urls
 from jev_ultrafast.questions import MAX_STEPS
 
 from . import browser_connection
@@ -19,13 +21,14 @@ from .credentials import CredentialError
 from .diagnostics import MODEL, check_openrouter
 
 STATIC = Path(__file__).with_name("static")
-TERMINAL = {"done", "blocked", "needs_input", "error", "paused"}
+TERMINAL = {"done", "blocked", "needs_input", "error", "paused", "cancelled"}
 
 
 class Controller:
     def __init__(self):
         self.lock = threading.RLock()
         self.cancel = threading.Event()
+        self.task_cancel = threading.Event()
         self.shutdown = threading.Event()
         self.closed = False
         self.agent = None
@@ -45,8 +48,11 @@ class Controller:
             except RuntimeError:
                 pass
         with self.lock:
+            agent = self.agent
             return {
                 **self.view,
+                "status": "cancelling" if self.task_cancel.is_set() and self.busy else self.view["status"],
+                **(agent.trace_state() if agent else {"trace_summaries": [], "latest_trace_id": None}),
                 "busy": self.busy,
                 "running": self.running,
                 "error": self.error,
@@ -82,12 +88,14 @@ class Controller:
         snapshot = self.agent.snapshot()
         # The inspector needs decision evidence, not the full model request or every historical response.
         snapshot.pop("decisions", None)
-        decision = snapshot.get("decision")
-        if decision:
-            snapshot["decision"] = {
-                key: value for key, value in decision.items() if key not in {"request", "raw_answers"}
-            }
-            snapshot["decision"]["fingerprint"] = snapshot["page"]["fingerprint"]
+        for field in ("decision", "last_decision"):
+            decision = snapshot.get(field)
+            if decision:
+                snapshot[field] = {
+                    key: value for key, value in decision.items() if key not in {"request", "raw_answers", "audit"}
+                }
+                if field == "decision":
+                    snapshot[field]["fingerprint"] = snapshot["page"]["fingerprint"]
         with self.lock:
             self.view = snapshot
             self.view["selected_tab"] = getattr(self.agent.browser, "target", None)
@@ -103,10 +111,13 @@ class Controller:
 
     def pause(self):
         # This must not wait for the worker lock or the in-flight model response.
-        self.cancel.set()
         with self.lock:
+            self.cancel.set()
             self.running = False
+            if self.task_cancel.is_set():
+                return self.state(discover_tabs=False)
             if not self.busy and self.agent and self.agent.state["status"] not in TERMINAL:
+                self.agent.finish_trace("paused", "Paused; preview discarded")
                 self.agent.state["status"] = "paused"
                 self.agent.state["decision"] = None
                 self.capture()
@@ -114,9 +125,31 @@ class Controller:
                 self.view["status"] = "pausing" if self.busy else "paused"
         return self.state(discover_tabs=False)
 
+    def cancel_task(self):
+        """Latch task cancellation immediately; the worker cannot resume it."""
+        with self.lock:
+            self.cancel.set()
+            self.task_cancel.set()
+            self.running = False
+            if self.busy:
+                self.view["status"] = "cancelling"
+            elif self.agent:
+                self.agent.cancel_run()
+                self.capture()
+            else:
+                self.view["status"] = "cancelled"
+        return self.state(discover_tabs=False)
+
+    def trace(self, identifier):
+        with self.lock:
+            agent = self.agent
+            return agent.trace_store().get(identifier) if agent else None
+
     def submit(self, name, body):
         if name == "pause":
             return self.pause()
+        if name == "cancel":
+            return self.cancel_task()
         if name not in {"connect", "credentials", "start", "run", "step", "predict", "act", "reset", "supply_values"}:
             raise ValueError("Unknown command")
         if name == "start":
@@ -128,9 +161,14 @@ class Controller:
                 raise RuntimeError("An operation is already in progress. Pause it or wait for it to finish.")
             if name in {"run", "step", "predict", "act", "supply_values"} and self.agent is None:
                 raise ValueError("Choose a Chrome tab and enter a task first.")
+            if name in {"run", "step", "predict", "act", "supply_values"} and self.task_cancel.is_set():
+                raise ValueError("This task was cancelled. Start a new task to run again.")
             self.busy = True
             self.error = None
-            self.cancel.clear()
+            if name in {"start", "reset"}:
+                self.task_cancel.clear()
+            if not self.task_cancel.is_set():
+                self.cancel.clear()
             self.running = name == "run" or (name == "start" and body.get("run") is True)
             self.worker = threading.Thread(target=self.work, args=(name, body), daemon=True, name="ctrl-agent")
             self.worker.start()
@@ -143,12 +181,15 @@ class Controller:
             raise ValueError("Set an action limit from 1 to 500.")
         if not isinstance(goal, str) or not goal.strip() or len(goal) > 8000:
             raise ValueError("Enter a task of 1–8,000 characters.")
-        if not isinstance(target, str) or not target or len(target) > 200:
-            raise ValueError("Choose an existing Chrome tab.")
         if not isinstance(values, list) or len(values) > 32:
             raise ValueError("Supply at most 32 exact text values.")
         if any(not isinstance(value, str) or not value.strip() or len(value) > 2000 for value in values):
             raise ValueError("Each supplied value must contain 1–2,000 characters.")
+        if target is not None and (not isinstance(target, str) or len(target) > 200):
+            raise ValueError("Choose an existing Chrome tab.")
+        destinations = validate_navigation_urls(navigation_urls(goal, supplied_values(goal, values)))
+        if not target and not destinations:
+            raise ValueError("Choose a Chrome tab or include the destination website in your task.")
 
     def work(self, name, body):
         try:
@@ -183,7 +224,7 @@ class Controller:
                             "history": [], "decision": None, "values": body.get("values", []),
                         }
                     self.agent = Agent(
-                        None, body["goal"], target_id=body["target_id"],
+                        None, body["goal"], target_id=body.get("target_id"),
                         values=body.get("values", []), max_steps=body.get("max_steps", MAX_STEPS),
                         cancel_event=self.cancel,
                     )
@@ -243,7 +284,14 @@ class Controller:
                     self.view["status"] = "error"
         finally:
             with self.lock:
-                if self.cancel.is_set() and self.agent and self.agent.state["status"] not in TERMINAL:
+                if self.task_cancel.is_set():
+                    if self.agent:
+                        self.agent.cancel_run()
+                        self.capture()
+                    else:
+                        self.view["status"] = "cancelled"
+                elif self.cancel.is_set() and self.agent and self.agent.state["status"] not in TERMINAL:
+                    self.agent.finish_trace("paused", "Paused; pending preview discarded")
                     self.agent.state["status"] = "paused"
                     self.agent.state["decision"] = None
                     self.capture()
@@ -332,6 +380,9 @@ def make_server(port=8766, controller=None):
                     return self.send(200, control.state())
                 if path == "/api/tabs":
                     return self.send(200, control.refresh_tabs())
+                if path.startswith("/api/traces/"):
+                    trace = control.trace(path.removeprefix("/api/traces/"))
+                    return self.send(200, trace) if trace is not None else self.send(404, {"error": "Trace not found"})
                 if path == "/health":
                     return self.send(200, {"app": "[CTRL]", "status": "ok", "model": MODEL})
                 relative = "index.html" if path == "/" else path.removeprefix("/static/").lstrip("/")
@@ -389,8 +440,23 @@ def main():
     if not 1024 <= args.port <= 65535:
         parser.error("Use a port between 1024 and 65535")
     os.environ["CTRL_PORT"] = str(args.port)
+    from .launch import stop_generation
+
+    root = Path(__file__).resolve().parents[1]
+    generation = os.environ.get("CTRL_START_GENERATION")
+    if generation is not None and generation != stop_generation(root):
+        return
     server = make_server(args.port)
     atexit.register(server.control.close)
+    if generation is not None:
+        def watch_stop():
+            while not server.control.shutdown.wait(0.1):
+                if generation != stop_generation(root):
+                    server.control.stop()
+                    server.shutdown()
+                    return
+
+        threading.Thread(target=watch_stop, daemon=True, name="ctrl-stop-latch").start()
     threading.Thread(target=server.control.startup, daemon=True, name="ctrl-startup").start()
     print(f"[CTRL] is running at http://127.0.0.1:{args.port}", flush=True)
     print("Chrome tabs stay open. The OpenRouter credential stays in Python memory.", flush=True)
@@ -401,6 +467,13 @@ def main():
     finally:
         server.control.close()
         server.server_close()
+        pid_file = root / ".ctrl" / "server.pid"
+        try:
+            saved_pid = pid_file.read_text(encoding="utf-8").strip()
+            if saved_pid in {str(os.getpid()), str(os.getppid())}:
+                pid_file.unlink()
+        except FileNotFoundError:
+            pass
 
 
 if __name__ == "__main__":

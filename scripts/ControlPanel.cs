@@ -108,14 +108,18 @@ public sealed class CtrlPanelForm : Form {
     void RestartAgent() {
         if (online || Alive(startProcess) || Alive(stopProcess)) return;
         restart.Enabled = false; turningOff = false; status.Text = "Starting the app at your request...";
-        try { startProcess = launch("Start-CTRL.ps1", new string[] { "-NoBrowser", "-NoPanel" }); }
+        try {
+            string generationPath = Path.Combine(root, ".ctrl", "stop-generation");
+            string generation = testing || !File.Exists(generationPath) ? "initial" : File.ReadAllText(generationPath).Trim();
+            if (generation != "initial" && !Regex.IsMatch(generation, "^[a-f0-9]{32}$")) throw new InvalidOperationException();
+            startProcess = launch("Start-CTRL.ps1", new string[] { "-NoBrowser", "-NoPanel", "-StopGeneration", generation });
+        }
         catch { status.Text = "Could not start the app. Use Start-CTRL.ps1."; }
     }
     void OpenDashboard() {
         if (!online) return;
-        string chrome = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Google\\Chrome\\Application\\chrome.exe");
-        if (!File.Exists(chrome)) chrome = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Google\\Chrome\\Application\\chrome.exe");
-        if (File.Exists(chrome)) Process.Start(new ProcessStartInfo(chrome, "http://127.0.0.1:8766") { UseShellExecute = true });
+        try { launch("scripts\\Debug-CTRL.ps1", new string[0]); }
+        catch { status.Text = "Could not open the debugger. Use Start-CTRL.ps1."; }
     }
     async Task PauseAgent() {
         if (String.IsNullOrEmpty(token)) return;
@@ -197,7 +201,7 @@ public sealed class CtrlPanelForm : Form {
         // Self-test never inspects or changes a real server's lifecycle.
         restart.Enabled = true;
         restart.TestClick();
-        if (requests.Count != 3 || requests[2] != "Start-CTRL.ps1 -NoBrowser -NoPanel") throw new InvalidOperationException("Manual restart routing failed.");
+        if (requests.Count != 3 || requests[2] != "Start-CTRL.ps1 -NoBrowser -NoPanel -StopGeneration initial") throw new InvalidOperationException("Manual restart routing failed.");
         Offline(); PerformLayout();
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(preview)));
         using (Bitmap bitmap = new Bitmap(Width, Height)) { DrawToBitmap(bitmap, new Rectangle(0, 0, Width, Height)); bitmap.Save(preview, ImageFormat.Png); }
@@ -208,7 +212,7 @@ public sealed class CtrlPanelForm : Form {
 public static class CtrlPanelApp {
     static Process Launch(string root, string script, string[] arguments) {
         string powershell = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "WindowsPowerShell\\v1.0\\powershell.exe");
-        string command = "-NoProfile -ExecutionPolicy Bypass -File \"" + Path.Combine(root, script) + "\" " + String.Join(" ", arguments);
+        string command = "-NoProfile -ExecutionPolicy Bypass -STA -File \"" + Path.Combine(root, script) + "\" " + String.Join(" ", arguments);
         return Process.Start(new ProcessStartInfo(powershell, command) { UseShellExecute = false, CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden, WorkingDirectory = root });
     }
     public static void Run(string root) {

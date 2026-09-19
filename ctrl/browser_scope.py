@@ -9,7 +9,9 @@ def is_loopback_host(host):
     if host == "localhost" or host.endswith(".localhost"):
         return True
     try:
-        return ipaddress.ip_address(host).is_loopback
+        address = ipaddress.ip_address(host)
+        mapped = getattr(address, "ipv4_mapped", None)
+        return address.is_loopback or bool(mapped and mapped.is_loopback)
     except ValueError:
         return False
 
@@ -21,7 +23,13 @@ def normalized_host(url):
             return ""
         host = (parsed.hostname or "").lower().rstrip(".").encode("idna").decode("ascii")
         try:
-            return ipaddress.ip_address(host).compressed
+            address = ipaddress.ip_address(host)
+            mapped = getattr(address, "ipv4_mapped", None)
+            # Chrome's URL.hostname uses hex for mapped IPv6; some Python
+            # versions stringify these addresses with a dotted IPv4 suffix.
+            if mapped:
+                return f"::ffff:{int(mapped) >> 16:x}:{int(mapped) & 0xffff:x}"
+            return address.compressed
         except ValueError:
             return host if is_loopback_host(host) else host.removeprefix("www.")
     except (ValueError, UnicodeError, AttributeError):

@@ -1,6 +1,10 @@
 param([switch]$Force)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'scripts\Ctrl-Process.ps1')
+# Invalidate any startup that began before this Stop, even before a PID exists.
+$ctrlStateDirectory = Join-Path $PSScriptRoot '.ctrl'
+[System.IO.Directory]::CreateDirectory($ctrlStateDirectory) | Out-Null
+[System.IO.File]::WriteAllText((Join-Path $ctrlStateDirectory 'stop-generation'), [guid]::NewGuid().ToString('N'))
 $ctrlPidFile = Join-Path $PSScriptRoot '.ctrl\server.pid'
 if (-not (Test-Path -LiteralPath $ctrlPidFile)) { Write-Host '[CTRL] is already off.'; return }
 $ctrlProcessId = 0

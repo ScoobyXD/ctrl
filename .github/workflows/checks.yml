@@ -19,4 +19,5 @@ jobs:
       - run: npm run build
       - run: uv run ruff check .
       - run: uv run pytest -q
+      - run: powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File scripts/Debug-CTRL.ps1 -VerifyOnly
       - run: uv build

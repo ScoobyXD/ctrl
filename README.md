@@ -4,13 +4,25 @@ Local browser agent, powered only by Jev through OpenRouter. Uses your normal ru
 
 ## Start
 
-On this laptop, double-click **Start CTRL.cmd**, or run `Start-CTRL.ps1`. The launcher starts a hidden local Python process and opens http://127.0.0.1:8766 in your normal Chrome. It reuses a running [CTRL] server.
+On this laptop, double-click **Start CTRL.cmd** or the **CTRL Debugger** desktop shortcut. From PowerShell:
+
+```powershell
+Set-Location -LiteralPath 'C:\Users\Jonat\ctrl'
+.\Start-CTRL.ps1
+```
+
+This opens a native Windows debugger and an independent emergency control panel. Python runs locally at `127.0.0.1:8766`; the debugger is a desktop window, with no embedded browser. It reuses a running [CTRL] server and never resumes a previous task automatically. The older web dashboard is optional: `Start-CTRL.ps1 -WebDashboard`.
 
 1. Startup loads the OpenRouter key directly from AWS Secrets Manager into Python memory and verifies Jev. **Check access** retries that check if needed.
 2. On first connection, open `chrome://inspect/#remote-debugging`, enable **Allow remote debugging for this browser instance**, and accept Chrome's connection prompt. [CTRL] connects automatically when the setting becomes available; **Connect Chrome** retries a failed connection. Keep Chrome open.
-3. Select a starting web tab. Enter the outcome you want, quoting any exact text the agent should type, or enter those values under **Text to enter**. Jev can switch to observed tabs, open requested addresses in new normal Chrome tabs, and go back. Explicit URLs/domains work on any site; Gmail, Reddit, and X/Twitter also have address shortcuts. These are destinations, not prepared action sequences.
-4. Click **Run agent**. **Single step** executes one observe/decide/action cycle. **Choose only** previews a decision; **Execute** applies it if it is still fresh.
-5. **Max actions** defaults to 200 and can be set from 1 to 500. A multi-part task can require several actions per item. A stopped run shows its reason beside the task controls. **Pause** stops further agent steps. The current action may finish. **Clear session** detaches the agent and leaves the page open.
+3. Enter the outcome you want. Leave **Start tab** on Automatic for a command containing a destination, or select an existing web tab for work on that page. Quote exact text or put it in **Exact text to enter**. Explicit URLs/domains work; Gmail, Reddit, X/Twitter, YouTube, AWS console, Wikipedia, GitHub, and several Google apps also have address shortcuts. These are destinations, not prepared action sequences.
+4. Click **Run task**. **Single step** executes one cycle. **Choose only** previews a decision; **Execute choice** applies it if the page and your inputs are still fresh.
+5. **Pause** stops further steps and permits a fresh choice on resume. **Cancel task** discards the pending choice and preserves the trace. **Restart task** cancels, waits for the worker to stop, then starts the current command once. An in-flight browser action may finish before cancellation takes effect.
+6. **STOP APP**, the independent red Stop panel, the **STOP CTRL Agent** desktop shortcut, or **Ctrl+Alt+Shift+S** turns the local agent off. Restarting the app is explicit. Closing the compact emergency panel also stops it; closing the debugger alone leaves the emergency panel available.
+
+The debugger's bottom section shows observed page text, available controls, a decision tree, and the trace timeline. The right table displays every offered choice with Jev's returned probability. **Answered** means that head selected it; **Used** means it belongs to the selected operation. **Allowed** remains unevaluated until runtime checks pass or reject it. Speculative answers from unused heads are visible but never executed. Missing/invalid probabilities display as unavailable. These are recorded decisions and observations, not an invented reasoning transcript. Traces stay in memory for the current task and disappear when you start a new task or stop the app.
+
+**Max actions** defaults to 200 and supports 1–500. The app also limits model calls and stops repeated navigation cycles and repeated actions with no visible progress.
 
 Example: on a Wikipedia tab, enter `Search Wikipedia for "Ada Lovelace", open the article, and stop when it is visible.` This is a user goal, not a prepared website workflow.
 
@@ -43,11 +55,11 @@ Each observation reads visible page text and supported controls. One Jev request
 - Text entry is selection, not prose generation. Quoted task strings and supplied values are copied verbatim. If needed text is missing, the run stops at `needs_input`; add values and resume.
 - Supports ordinary visible DOM controls. Password/file inputs, browser-internal pages, canvas-only controls, and controls inside inaccessible frames or shadow roots are not supported. There is no screenshot/vision fallback.
 - Up to the selected action limit (default 200, maximum 500) and twice that many model decisions per run. At most 32 supplied strings; more than 255 field/string pairs produces an explicit error asking for fewer strings.
-- New tabs are preserved, and browser navigation selected by Jev brings the destination tab forward. Links that open a separate tab become available as observed SWITCH_TAB targets. There is no automatic tab closing.
+- New tabs are preserved and created in the background. The selected tab is brought forward when executing an actual page action so Chrome delivers input to it. Merely selecting a tab does not pull focus. Links that open a separate task-site tab become available as observed SWITCH_TAB targets. There is no automatic tab closing.
 - Jev selects actions and stop reasons; it does not write email summaries or arbitrary prose. Asking to "interact" with a feed allows browsing, opening, and scrolling; posting, messaging, voting, following, deleting, or archiving require a specific request.
 - A model's `done` status is its judgment, not independent proof. Inspect the final page and action history.
 
-The browser-control transport is local, but task text, supplied values, visible page text, and recent actions are sent to Jev through OpenRouter. The active page is observed for model input; eligible open-tab titles/URLs and the executed action history are also included so Jev can choose where to continue. The API credential remains in the Python process.
+The browser-control transport is local, but task text, supplied values, visible page text, and recent actions are sent to Jev through OpenRouter. Observations and tab choices are restricted to the requested sites, or the selected starting site's host when no destinations were given. An unrelated starting page becomes a neutral destination chooser without reading its body. Localhost destinations also retain their exact port. The API credential remains in Python memory.
 
 ## Development
 
@@ -65,5 +77,9 @@ uv build
 Tests use simulated model/browser responses and do not call paid APIs. For an explicit live connection check with your real credential: `uv run python -m ctrl.diagnostics`. For the running app: `uv run python scripts/check_app.py --credentials --connect`.
 
 The TypeScript interface lives in `web/`; `browser/snapshot.ts` compiles to the page reader. Python `ctrl/` owns the local API, AWS credentials, and Chrome connection. `jev_ultrafast/` retains the adapted upstream loop and executor. See [UPSTREAM.md](UPSTREAM.md) for source attribution and the intentional Jev-only changes.
+
+The native Windows interface is `scripts/DebugConsole.cs`, launched by `scripts/Debug-CTRL.ps1`. Its offline self-test uses synthetic traces: `powershell -STA -File scripts/Debug-CTRL.ps1 -VerifyOnly`. `scripts/ControlPanel.cs` is the separate emergency panel. See [docs/debugger-api.md](docs/debugger-api.md) for the decision-audit contract.
+
+Synthetic browser verification is available without opening private accounts. Start `python scripts/browser_lab.py serve`, connect Chrome normally, then explicitly run `python scripts/browser_lab.py smoke --run --scenario catalog` (or `inbox-small` / `inbox-100`). The driver supplies ordinary goals to the same app; independent fixture evidence checks filters and rendered message bodies. Rendering coverage does not prove comprehension, and these live runs are distinct from the offline unit tests.
 
 The API binds only to 127.0.0.1 and checks Host, Origin, and an in-memory session token on API reads/writes. Browser actions are serialized; stale or consumed decisions cannot execute again. An ambiguous browser mutation error stops the run rather than automatically replaying it.

@@ -172,7 +172,8 @@ def test_pause_during_hit_test_prevents_first_mouse_event(monkeypatch):
 
     def cdp(method, **_kwargs):
         calls.append(method)
-        cancel.set()
+        if method == "Runtime.evaluate":
+            cancel.set()
         return {"result": {"value": {"x": 20, "y": 30}}}
 
     monkeypatch.setattr(module, "cdp", cdp)
@@ -189,7 +190,7 @@ def test_pause_during_hit_test_prevents_first_mouse_event(monkeypatch):
                 },
             }
         )
-    assert calls == ["Runtime.evaluate"]
+    assert calls == ["Page.bringToFront", "Runtime.evaluate"]
 
 
 def test_pause_after_mouse_pressed_does_not_leave_button_down(monkeypatch):
@@ -231,7 +232,8 @@ def test_paused_before_input_can_resume_from_unchanged_observation(monkeypatch):
                 pause_first_read = False
                 cancel.set()
             return {"result": {"value": {"x": 20, "y": 30}}}
-        inputs.append(kwargs["type"])
+        if method == "Input.dispatchMouseEvent":
+            inputs.append(kwargs["type"])
         return {}
 
     monkeypatch.setattr(module, "cdp", cdp)

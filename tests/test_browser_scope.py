@@ -13,6 +13,7 @@ from ctrl.browser_scope import host_allowed, normalized_host, scope_host
     ("http://127.10.20.30:8877/", "127.10.20.30:8877"),
     ("http://[0:0:0:0:0:0:0:1]:8877/", "[::1]:8877"),
     ("http://test.localhost:8877/", "test.localhost:8877"),
+    ("http://[::ffff:127.0.0.1]:8877/", "[::ffff:7f00:1]:8877"),
     ("https://www.example.org:8877/", "example.org"),
 ])
 def test_scope_keys_include_effective_port_only_for_local_apps(url, key):
@@ -38,6 +39,8 @@ def test_default_ports_and_loopback_ipv6_are_exact():
     assert not host_allowed("http://[::1]:8878/", ["[::1]:8877"])
     assert not host_allowed("http://localhost:8877/", ["localhost"])
     assert not host_allowed("http://other.localhost:8877/", ["localhost:8877"])
+    assert host_allowed("http://[::ffff:127.0.0.1]:8877/", ["[::ffff:7f00:1]:8877"])
+    assert not host_allowed("http://[::ffff:127.0.0.1]:8878/", ["[::ffff:7f00:1]:8877"])
 
 
 def test_public_host_children_and_plain_normalized_host_are_unchanged():

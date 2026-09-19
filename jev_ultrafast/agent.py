@@ -8,6 +8,7 @@ from .browser import ActionPaused, Browser, StalePage, fingerprint
 from .model import action_space, choose, decision_space, supplied_values
 from .navigation import navigation_urls
 from .questions import MAX_STEPS
+from .trace import TraceStore
 
 STOP_REASONS = {
     "unavailable_control": "Jev could not find a supported control to continue from this page.",
@@ -68,6 +69,8 @@ class Agent:
         plan = [task]
         self.values = supplied_values(task, values)
         self.cancel_event = cancel_event
+        self._traces = TraceStore()
+        self._trace_id = None
         self.browser = Browser(url, target_id=target_id, navigation_urls=navigation_urls(task, self.values))
         self.browser.cancel_event = cancel_event
         self.record_dir = Path(record_dir) if record_dir else None
@@ -103,10 +106,32 @@ class Agent:
         return {
             **{k: v for k, v in self.state.items() if k != "browser"},
             "elements": action_space(self.state["page"]["actions"])[0],
+            **self.trace_state(),
         }
+
+    def trace_store(self):
+        if not hasattr(self, "_traces"):
+            self._traces = TraceStore()
+            self._trace_id = None
+        return self._traces
+
+    def trace_state(self):
+        summaries = self.trace_store().summaries()
+        return {"trace_summaries": summaries, "latest_trace_id": summaries[-1]["id"] if summaries else None}
+
+    def finish_trace(self, execution, message, validation=None):
+        self.trace_store().finish(self._trace_id, execution, message, validation)
+
+    def cancel_run(self):
+        self.state["decision"] = None
+        self.state["status"] = "cancelled"
+        self.state["stop_reason"] = "Task cancelled. Start a new task to run again."
+        self.finish_trace("cancelled", "Task cancelled; this preview will not execute")
+        self._elapsed()
 
     def _pause_requested(self):
         if self.cancel_event is not None and self.cancel_event.is_set():
+            self.finish_trace("paused", "Paused before another browser action")
             self.state["decision"] = None
             self.state["status"] = "paused"
             self._elapsed()
@@ -121,23 +146,33 @@ class Agent:
         try:
             return self._command(name, body)
         except ActionPaused:
+            self.finish_trace("paused", "Paused before browser input")
             self.state["decision"] = None
             self.state["status"] = "paused"
             self._elapsed()
             return self.snapshot()
         except StalePage:
+            self.finish_trace("rejected", "Page changed; decision discarded without replay", "stale")
             raise
         except Exception as error:
+            if hasattr(error, "audit"):
+                self.finish_trace("rejected", "Invalid or unavailable Jev response; no action executed", "rejected")
+            else:
+                self.finish_trace("error", "Decision or action failed; no automatic retry", "error")
             self.state["decision"] = None
-            if self.state["status"] not in {"done", "blocked", "needs_input", "paused"}:
+            if self.state["status"] not in {"done", "blocked", "needs_input", "paused", "cancelled"}:
                 self.state["status"] = "error"
-            self.state["error"] = str(error)
+            self.state["error"] = str(error) if isinstance(error, (ValueError, RuntimeError, TimeoutError)) else (
+                "Operation failed; no browser action was automatically retried."
+            )
             self._elapsed()
             raise
 
     def _command(self, name, body=None):
         body = body or {}
         state = self.state
+        if state["status"] == "cancelled":
+            raise ValueError("This task was cancelled. Start a new task to run again.")
         if name == "tick":
             try:
                 self.command("predict", {})
@@ -161,6 +196,7 @@ class Agent:
                 state["started_at"] = time.perf_counter()
             if not state["browser"].fresh(state["page"]):
                 state["page"] = state["browser"].observe(screenshot=self.screenshots)
+            self.finish_trace("cancelled", "Preview replaced by a new decision")
             state["decision"] = None
             if state["page"].get("scope_blocked"):
                 state["status"] = "blocked"
@@ -174,7 +210,15 @@ class Agent:
                 return self.snapshot()
             if self._pause_requested():
                 return self.snapshot()
-            state["decision"] = choose(state["page"], state["goal"], state["history"], self.values)
+            self._trace_id = self.trace_store().begin(state["page"], action_space(state["page"]["actions"])[0])
+            try:
+                selected_decision = choose(state["page"], state["goal"], state["history"], self.values)
+            except Exception as error:
+                self.trace_store().audit(self._trace_id, getattr(error, "audit", {}))
+                raise
+            self.trace_store().audit(self._trace_id, selected_decision.get("audit", {}))
+            state["decision"] = {key: value for key, value in selected_decision.items() if key != "audit"}
+            state["decision"]["fingerprint"] = state["page"]["fingerprint"]
             state["decisions"].append(
                 {
                     **state["decision"],
@@ -211,6 +255,7 @@ class Agent:
                 if selected == "NEEDS_INPUT":
                     state["input_request"] = state["stop_reason"]
                 state["plan_index"] = int(selected == "DONE")
+                self.finish_trace("terminal", state["stop_reason"], "passed")
                 state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
                 return self.snapshot()
             action = next(a for a in page["actions"] if a["id"] == selected)
@@ -224,6 +269,7 @@ class Agent:
                 state["stop_reason"] = (
                     f"Reached the {state.get('max_steps', MAX_STEPS)}-action limit before completing the task."
                 )
+                self.finish_trace("rejected", state["stop_reason"], "rejected")
                 self._elapsed()
                 return self.snapshot()
             if navigation_cycle(state["history"], action):
@@ -232,6 +278,7 @@ class Agent:
                     "Stopped a repeated navigation cycle before changing another tab. "
                     "No further browser actions will run. Revise the task before restarting."
                 )
+                self.finish_trace("rejected", state["stop_reason"], "rejected")
                 self._elapsed()
                 return self.snapshot()
             text = None
@@ -246,6 +293,7 @@ class Agent:
                 return self.snapshot()
             # Browser.act checks freshness and target geometry immediately before input.
             state["browser"].act(action, page, text=text)
+            self.finish_trace("executed", "Selected action passed browser checks and was dispatched", "passed")
             state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
             # Record execution before observing. A stale post-action observation must not erase the action.
             state["history"].append(
@@ -306,6 +354,7 @@ class Agent:
             self.browser.set_navigation_urls(navigation_urls(state["goal"], self.values))
             state["values"] = list(self.values)
             state["decision"] = None
+            self.finish_trace("cancelled", "Supplied values changed; preview discarded")
             state.pop("input_request", None)
             state["stop_reason"] = None
             state["last_decision"] = None
@@ -316,7 +365,7 @@ class Agent:
         return self.snapshot()
 
     def run(self):
-        while self.state["status"] not in {"done", "blocked", "needs_input", "error", "paused"}:
+        while self.state["status"] not in {"done", "blocked", "needs_input", "error", "paused", "cancelled"}:
             yield self.command("tick")
 
     def close(self):

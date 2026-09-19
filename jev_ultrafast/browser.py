@@ -33,25 +33,27 @@ class OutsideTaskScope(StalePage):
 
 class Browser:
     def __init__(self, url=None, *, target_id=None, navigation_urls=None):
-        if bool(url) == bool(target_id):
+        destinations = validate_navigation_urls(navigation_urls)
+        if (url and target_id) or (not url and not target_id and not destinations):
             raise ValueError("Select an existing tab or supply a URL for a new tab.")
         if not status()["connected"] and not connect(wait=2)["connected"]:
             raise RuntimeError(status()["message"])
         self.target = None
         self.session = None
+        self._closed = False
         self._consumed = set()
         self.cancel_event = None
         self._pending_navigation = None
         self._selected_start_host = None
         self._has_acted = False
-        self.set_navigation_urls(navigation_urls)
+        self.set_navigation_urls(destinations)
         if target_id:
             info = cdp("Target.getTargetInfo", targetId=target_id)["targetInfo"]
             if not selectable_tab(info):
                 raise ValueError("Select an ordinary web page, not an internal Chrome or CTRL tab.")
             self.target = target_id
             self._selected_start_host = scope_host(info["url"])
-        else:
+        elif url:
             parsed = urlparse(url)
             if parsed.scheme not in {"http", "https"} or not parsed.hostname:
                 raise ValueError("Use an http:// or https:// URL for a new tab.")
@@ -59,7 +61,8 @@ class Browser:
                 raise ValueError("The agent cannot control its own CTRL console.")
             self.target = cdp("Target.createTarget", url=url, background=True)["targetId"]
             self._selected_start_host = scope_host(url)
-        self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
+        if self.target:
+            self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
         if url and self.in_scope(url):
             deadline = time.monotonic() + 15
             while time.monotonic() < deadline:
@@ -71,6 +74,8 @@ class Browser:
                 time.sleep(0.05)
 
     def call(self, method, **params):
+        if self._closed or self.session is None:
+            raise RuntimeError("No browser tab is attached.")
         return cdp(method, session_id=self.session, **params)
 
     def set_navigation_urls(self, urls):
@@ -85,6 +90,10 @@ class Browser:
         return selectable_tab({"type": "page", "url": url}) and host_allowed(url, self.allowed_hosts)
 
     def target_info(self):
+        if self._closed:
+            raise RuntimeError("This browser session is closed. Start a new task.")
+        if self.target is None:
+            return {"targetId": None, "type": "page", "url": "", "title": "Choose a task destination"}
         return cdp("Target.getTargetInfo", targetId=self.target)["targetInfo"]
 
     def scope_info(self, outside=False):
@@ -372,10 +381,11 @@ class Browser:
                 new_session = cdp("Target.attachToTarget", targetId=target, flatten=True)["sessionId"]
                 previous_session = self.session
                 self.target, self.session = target, new_session
-                try:
-                    cdp("Target.detachFromTarget", sessionId=previous_session)
-                except RuntimeError:
-                    pass  # The previous target is preserved even when detach is not confirmed.
+                if previous_session:
+                    try:
+                        cdp("Target.detachFromTarget", sessionId=previous_session)
+                    except RuntimeError:
+                        pass  # The previous target is preserved even when detach is not confirmed.
         except Exception as exc:
             raise RuntimeError("Browser navigation was not confirmed. Inspect the tabs before a new task.") from exc
         self.after_input = None
@@ -429,6 +439,7 @@ class Browser:
         return result
 
     def close(self):
+        self._closed = True
         session, self.session = self.session, None
         self.target = None
         if session:
@@ -459,7 +470,7 @@ def scoped_expression(expression, allowed_hosts):
     return (
         "(() => { const rawHost=location.hostname.toLowerCase().replace(/^\\[|\\]$/g,'').replace(/\\.$/,''); "
         "const local=rawHost==='localhost' || rawHost.endsWith('.localhost') || rawHost==='::1' || "
-        "/^127(?:\\.\\d{1,3}){3}$/.test(rawHost); "
+        "/^127(?:\\.\\d{1,3}){3}$/.test(rawHost) || /^::ffff:7f[0-9a-f]{2}:[0-9a-f]{1,4}$/.test(rawHost); "
         "const host=local ? rawHost : rawHost.replace(/^www\\./,''); "
         "const port=location.port || (location.protocol==='https:' ? '443' : '80'); "
         "const key=local ? (host.includes(':') ? '['+host+']' : host)+':'+port : host; "
@@ -527,6 +538,12 @@ def browser_operation(request):
         before_mutation()
         if kind not in {"scroll", "wait", "click", "fill", "select"}:
             raise ValueError("Unsupported browser operation")
+        if kind != "wait":
+            # Chrome can deliver pointer input to a background tab without giving
+            # its field focus. Activate only when executing a real page action,
+            # then hit-test again; mere tab-selection decisions stay unfocused.
+            call("Page.bringToFront")
+            before_mutation()
         if kind == "scroll":
             viewport = evaluate("({w:innerWidth,h:innerHeight})")
             if not viewport or viewport["w"] <= 0 or viewport["h"] <= 0:

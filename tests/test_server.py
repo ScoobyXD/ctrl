@@ -35,7 +35,8 @@ def request(server, path, token=None, body=None, headers=None):
 
 
 def test_task_data_and_mutations_require_token(server):
-    for path, body in [('/api/state', None), ('/api/control', None), ('/api/start', {'goal': 'x'})]:
+    for path, body in [('/api/state', None), ('/api/control', None), ('/api/start', {'goal': 'x'}),
+                       ('/api/traces/example', None), ('/api/cancel', {})]:
         with pytest.raises(urllib.error.HTTPError) as error:
             request(server, path, body=body)
         assert error.value.code == 403
@@ -122,3 +123,23 @@ def test_emergency_stop_never_waits_for_tab_discovery_and_cannot_be_resumed(monk
     control.busy = False
     with pytest.raises(RuntimeError, match="agent is off"):
         control.submit("credentials", {})
+
+
+def test_trace_endpoint_not_found_and_cancel_keeps_service_alive(server):
+    token = re.search('content="([^"]+)"', request(server, '/').read().decode())[1]
+    with pytest.raises(urllib.error.HTTPError) as error:
+        request(server, '/api/traces/missing', token)
+    assert error.value.code == 404
+    assert json.load(request(server, '/api/cancel', token, {}))["status"] == "cancelled"
+    assert json.load(request(server, '/health'))["status"] == "ok"
+
+
+def test_targetless_start_requires_an_explicit_destination_or_known_site():
+    for task in ("Open YouTube and search for NASA", "Open https://example.org/"):
+        Controller.validate_start({"goal": task})
+    with pytest.raises(ValueError, match="destination website"):
+        Controller.validate_start({"goal": "Click the search button"})
+    with pytest.raises(ValueError, match="supplied value"):
+        Controller.validate_start({"goal": "Open YouTube", "values": [None]})
+    with pytest.raises(ValueError):
+        Controller.validate_start({"goal": "Open http://127.0.0.1:8766/"})
