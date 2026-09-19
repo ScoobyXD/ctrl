@@ -510,7 +510,10 @@ def test_local_browser_scope_excludes_other_ports_from_tabs_and_back(browser):
     instance.set_navigation_urls(["http://127.0.0.1:8877/"])
     for target, port in (("lab", 8877), ("other-local-app", 8878)):
         chrome.targets[target] = {
-            "targetId": target, "type": "page", "url": f"http://127.0.0.1:{port}/", "title": target,
+            "targetId": target,
+            "type": "page",
+            "url": f"http://127.0.0.1:{port}/",
+            "title": target,
         }
     page = instance.observe(screenshot=False)
     assert instance.allowed_hosts == ["127.0.0.1:8877"]
@@ -592,3 +595,44 @@ def test_targetless_bootstrap_requires_valid_destinations_before_connection(monk
     for destinations in (None, [], ["javascript:alert(1)"], ["http://127.0.0.1:8766/"]):
         with pytest.raises(ValueError):
             module.Browser(navigation_urls=destinations)
+
+
+def test_transient_document_scope_guard_during_history_restore_retries_only_guarded_reads(browser, monkeypatch):
+    instance, chrome = browser
+    original = chrome.cdp
+    rejected = False
+
+    def transient(method, **params):
+        nonlocal rejected
+        if method == "Runtime.evaluate" and module.READ_STATE in params["expression"] and not rejected:
+            rejected = True
+            return {"result": {"value": module.OUTSIDE_SCOPE}}
+        return original(method, **params)
+
+    monkeypatch.setattr(module, "cdp", transient)
+    instance._has_acted = True
+    page = instance.observe(screenshot=False)
+    assert rejected
+    assert page["url"] == "https://example.com/article"
+    assert "scope_blocked" not in page
+    assert not any(method.startswith("Input.") for method, _, _ in chrome.calls)
+
+
+def test_persistent_document_scope_rejection_stays_bounded_and_never_reads_outside(browser, monkeypatch):
+    instance, chrome = browser
+    original = chrome.cdp
+    reads = 0
+
+    def rejected(method, **params):
+        nonlocal reads
+        if method == "Runtime.evaluate" and module.READ_STATE in params["expression"]:
+            reads += 1
+            return {"result": {"value": module.OUTSIDE_SCOPE}}
+        return original(method, **params)
+
+    monkeypatch.setattr(module, "cdp", rejected)
+    instance._has_acted = True
+    page = instance.observe(screenshot=False)
+    assert reads == 10
+    assert page["scope_blocked"]
+    assert "Page content" not in page["text"]

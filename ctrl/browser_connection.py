@@ -14,6 +14,7 @@ import threading
 from pathlib import Path
 from urllib.parse import urlparse
 
+from .browser_lease import BrowserLease
 from .browser_scope import is_loopback_host, normalized_host
 
 SETUP_MESSAGE = (
@@ -71,7 +72,7 @@ def selectable_tab(tab: dict) -> bool:
     ui_port = int(os.environ.get("CTRL_PORT", "8766"))
     try:
         effective_port = parsed.port if parsed.port is not None else (443 if parsed.scheme == "https" else 80)
-        if is_loopback_host(normalized_host(tab.get("url", ""))) and effective_port == ui_port:
+        if is_loopback_host(normalized_host(tab.get("url", ""))) and effective_port in {8766, 8767, ui_port}:
             return False
     except ValueError:
         return False
@@ -89,6 +90,7 @@ class ChromeConnection:
         self._state = "disconnected"
         self._message = "Connect to your normal Chrome."
         self._version = None
+        self._lease = BrowserLease()
 
     def _start_loop(self):
         if self._loop is not None:
@@ -123,8 +125,11 @@ class ChromeConnection:
             future.result()
         except BaseException:
             with self._lock:
+                if self._pending is not future:
+                    return  # A cancelled earlier handshake cannot release a newer connection's lease.
                 self._state = "disconnected"
                 self._client = None
+                self._lease.release()
                 self._message = (
                     "Chrome did not accept the connection. Check that Chrome is open, remote debugging "
                     "is enabled, and approve its native connection prompt; then connect again."
@@ -140,6 +145,13 @@ class ChromeConnection:
                 except RuntimeError as exc:
                     self._state = "disconnected"
                     self._message = str(exc)
+                    return self.status()
+                if not self._lease.acquire():
+                    self._state = "owned_by_other_experiment"
+                    self._message = (
+                        "Another CTRL experiment owns Chrome. Stop that app, then click Connect Chrome here. "
+                        "The experiments never control your browser simultaneously."
+                    )
                     return self.status()
                 self._start_loop()
                 self._state = "waiting_for_approval"
@@ -197,6 +209,7 @@ class ChromeConnection:
             pending.cancel()
         if client is not None and loop is not None:
             asyncio.run_coroutine_threadsafe(client.stop(), loop).result(timeout=5)
+        self._lease.release()
 
 
 _connection = ChromeConnection()

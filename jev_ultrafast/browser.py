@@ -104,9 +104,12 @@ class Browser:
             "outside_scope": outside,
         }
 
-    def evaluate(self, expression):
+    def evaluate(self, expression, *, response_timeout=None):
         response = self.call(
-            "Runtime.evaluate", expression=scoped_expression(expression, self.allowed_hosts), returnByValue=True
+            "Runtime.evaluate",
+            expression=scoped_expression(expression, self.allowed_hosts),
+            returnByValue=True,
+            **({"_response_timeout": response_timeout} if response_timeout is not None else {}),
         )
         if response.get("exceptionDetails"):
             raise StalePage("Document changed during evaluation")
@@ -114,6 +117,56 @@ class Browser:
         if value == OUTSIDE_SCOPE:
             raise OutsideTaskScope("The document left this task's allowed sites.")
         return value
+
+    def activate_for_input(self):
+        """Restore only the selected minimized window and wait for real rendering."""
+
+        def check_cancel():
+            if self.cancel_event is not None and self.cancel_event.is_set():
+                raise ActionPaused("Paused during tab activation and before page input.")
+
+        check_cancel()
+        window = cdp("Browser.getWindowForTarget", targetId=self.target, _response_timeout=1.0)
+        check_cancel()
+        if window.get("bounds", {}).get("windowState") == "minimized":
+            cdp(
+                "Browser.setWindowBounds",
+                windowId=window["windowId"],
+                bounds={"windowState": "normal"},
+                _response_timeout=1.0,
+            )
+            check_cancel()
+        self.call("Page.bringToFront", _response_timeout=1.0)
+        check_cancel()
+        deadline = time.monotonic() + 2.0
+        error_message = (
+            "Chrome's selected tab did not become visible, focused, and ready to render. "
+            "Restore or uncover that Chrome window on the current desktop, then start the task again. "
+            "No page input was sent for this action."
+        )
+        expression = activation_readiness_expression(uuid.uuid4().hex)
+        while True:
+            check_cancel()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(error_message)
+            try:
+                current = self.evaluate(expression, response_timeout=min(0.5, remaining))
+            except RuntimeError as error:
+                check_cancel()
+                raise RuntimeError(error_message) from error
+            check_cancel()
+            if (
+                isinstance(current, dict)
+                and current.get("visible")
+                and current.get("focused")
+                and current.get("frames", 0) >= 2
+            ):
+                return
+            if self.cancel_event is not None:
+                self.cancel_event.wait(min(0.05, remaining))
+            else:
+                time.sleep(min(0.05, remaining))
 
     def outside_scope_page(self, info):
         self.after_input = None
@@ -213,7 +266,16 @@ class Browser:
                 page["observation_id"] = uuid.uuid4().hex
                 return page
             except OutsideTaskScope:
-                return self.outside_scope_page(self.target_info())
+                info = self.target_info()
+                if attempt < 9 and self.in_scope(info.get("url", "")):
+                    # A history restore can replace the document between metadata
+                    # and evaluation. Retry only guarded reads while metadata stays
+                    # in scope; never inspect the rejected document or replay input.
+                    if self.cancel_event is not None and self.cancel_event.is_set():
+                        raise ActionPaused("Paused while the document changes.")
+                    time.sleep(0.02)
+                    continue
+                return self.outside_scope_page(info)
             except StalePage:
                 if attempt == 9:
                     raise
@@ -411,7 +473,7 @@ class Browser:
         if action["kind"] in {"click", "fill", "select", "scroll"}:
             # Activation is input preflight. Visibility/focus handlers may alter
             # this same observed node, so revalidate identity after activation.
-            self.call("Page.bringToFront")
+            self.activate_for_input()
             if self.cancel_event is not None and self.cancel_event.is_set():
                 raise ActionPaused("Paused after tab activation and before page input.")
             if not self.fresh(page, action):
@@ -457,6 +519,27 @@ class Browser:
                 cdp("Target.detachFromTarget", sessionId=session)
             except RuntimeError:
                 pass  # A closed/disconnected tab is already detached.
+
+
+def activation_readiness_expression(token):
+    # Never await rAF: hidden documents may never receive a frame. The host polls
+    # with a deadline and cancellation. At most one harmless callback is pending.
+    return """(() => {
+      const token=TOKEN, visible=document.visibilityState==='visible', focused=document.hasFocus();
+      let state=window.__ctrlActivationReadiness;
+      if (!state || state.token!==token)
+        state=window.__ctrlActivationReadiness={token,frames:0,pending:false};
+      if (!visible || !focused) state.frames=0;
+      if (visible && focused && state.frames<2 && !state.pending) {
+        state.pending=true;
+        requestAnimationFrame(()=>{
+          if (window.__ctrlActivationReadiness!==state) return;
+          state.pending=false;
+          state.frames=document.visibilityState==='visible' && document.hasFocus() ? state.frames+1 : 0;
+        });
+      }
+      return {visible,focused,frames:state.frames};
+    })()""".replace("TOKEN", json.dumps(token))
 
 
 def fingerprint(state):

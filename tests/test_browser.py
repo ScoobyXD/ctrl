@@ -11,7 +11,10 @@ def attached(monkeypatch, *, url=None):
 
     def cdp(method, **kwargs):
         calls.append((method, kwargs))
+        if method == "Runtime.evaluate" and "__ctrlActivationReadiness" in kwargs.get("expression", ""):
+            return {"result": {"value": {"visible": True, "focused": True, "frames": 2}}}
         return {
+            "Browser.getWindowForTarget": {"windowId": 42, "bounds": {"windowState": "normal"}},
             "Target.getTargetInfo": {"targetInfo": {"type": "page", "url": "https://example.com"}},
             "Target.createTarget": {"targetId": "new-tab"},
             "Target.attachToTarget": {"sessionId": "session"},
@@ -88,12 +91,12 @@ def test_activation_revalidates_observed_target_before_input(monkeypatch):
     browser, page, action = action_browser(monkeypatch)
     browser.fresh = Mock(side_effect=[True, False])
     activate = Mock()
-    browser.call = activate
+    browser.activate_for_input = activate
     execute = Mock()
     monkeypatch.setattr(module, "browser_operation", execute)
     with pytest.raises(module.StalePage, match="changed when activated"):
         browser.act(action, page)
-    activate.assert_called_once_with("Page.bringToFront")
+    activate.assert_called_once_with()
     assert browser.fresh.call_count == 2
     assert page["observation_id"] not in browser._consumed
     execute.assert_not_called()
@@ -102,7 +105,7 @@ def test_activation_revalidates_observed_target_before_input(monkeypatch):
 def test_pause_during_tab_activation_prevents_page_input(monkeypatch):
     browser, page, action = action_browser(monkeypatch)
     browser.cancel_event = threading.Event()
-    browser.call = Mock(side_effect=lambda *_args: browser.cancel_event.set())
+    browser.activate_for_input = Mock(side_effect=browser.cancel_event.set)
     execute = Mock()
     monkeypatch.setattr(module, "browser_operation", execute)
     with pytest.raises(module.ActionPaused, match="after tab activation"):
@@ -248,6 +251,7 @@ def test_pause_after_mouse_pressed_does_not_leave_button_down(monkeypatch):
 
 def test_paused_before_input_can_resume_from_unchanged_observation(monkeypatch):
     browser, page, action = action_browser(monkeypatch)
+    browser.activate_for_input = Mock()
     cancel = browser.cancel_event = threading.Event()
     inputs = []
     pause_first_read = True

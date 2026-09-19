@@ -13,7 +13,7 @@
     "passed": false
   },
   "resulting_change": "Bring the controlled tab forward before actual page input, then recheck cancellation, observed identity, and hit-test the control.",
-  "retest_status": "Pending native Chrome connection approval after app restart; AWS/Jev access is ready again",
+  "retest_status": "Catalog and 12-message synthetic inbox passed; 100-message inbox failed. Investigating focused but hidden Chrome page receiving no pointer events.",
   "native_debugger": {
     "verification": "Rendered WinForms UI with injected synthetic API; no live browser actions in UI test",
     "options_probabilities_rendered": true,
@@ -23,12 +23,142 @@
     "no_automatic_submission": true,
     "connection_retry_controls": true,
     "stop_visible_at_minimum_size": true,
-    "stop_stub_invocations": 2
+    "stop_stub_invocations": 2,
+    "live_api_render": {
+      "actual_state": "blocked",
+      "actions": 4,
+      "offered_options": 30,
+      "rendered_option_rows": 30,
+      "commands_submitted": 0
+    }
   },
   "independent_stop": {
     "owned_live_server_terminated": true,
     "localhost_health_unavailable_after_stop": true,
     "global_hotkey_registered_in_selftest": true,
     "chrome_processes_untouched_by_stop": true
+  },
+  "live_catalog_after_activation_fix": {
+    "scenario": "catalog",
+    "validated": true,
+    "passed": true,
+    "agent_status": "done",
+    "stop_reason": "Jev marked the task complete. Check the final page and action history.",
+    "error": null,
+    "actions": 6,
+    "elapsed_seconds": 3.28,
+    "evidence": {
+      "session": "d73042f25b38582e",
+      "catalog": {
+        "submissions": [
+          {
+            "query": "trail",
+            "department": "outdoors",
+            "stock_only": true
+          }
+        ],
+        "opened_items": [
+          "alpine-trail-mug"
+        ],
+        "body_view_items": [
+          "alpine-trail-mug"
+        ]
+      },
+      "inbox": {
+        "message_count": 100,
+        "page_size": 10,
+        "list_pages": [],
+        "opened_unique": 0,
+        "body_view_unique": 0,
+        "body_view_ids": []
+      }
+    }
+  },
+  "live_inbox_small_after_activation_fix": {
+    "scenario": "inbox-small",
+    "validated": true,
+    "passed": true,
+    "agent_status": "done",
+    "stop_reason": "Jev marked the task complete. Check the final page and action history.",
+    "error": null,
+    "actions": 27,
+    "elapsed_seconds": 12.05,
+    "evidence": {
+      "session": "a6d39b52dba2e8ee",
+      "catalog": {
+        "submissions": [],
+        "opened_items": [],
+        "body_view_items": []
+      },
+      "inbox": {
+        "message_count": 12,
+        "page_size": 5,
+        "list_pages": [
+          1,
+          2,
+          3
+        ],
+        "opened_unique": 12,
+        "body_view_unique": 12,
+        "body_view_ids": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12
+        ]
+      }
+    }
+  },
+  "live_inbox_100_after_activation_fix": {
+    "scenario": "inbox-100",
+    "validated": false,
+    "passed": false,
+    "agent_status": "blocked",
+    "stop_reason": "Three consecutive actions produced no visible change. Inspect the page before restarting.",
+    "error": null,
+    "actions": 4,
+    "elapsed_seconds": 3.83,
+    "evidence": {
+      "session": "b9d4323e6d7eeca8",
+      "catalog": {
+        "submissions": [],
+        "opened_items": [],
+        "body_view_items": []
+      },
+      "inbox": {
+        "message_count": 100,
+        "page_size": 10,
+        "list_pages": [
+          1
+        ],
+        "opened_unique": 0,
+        "body_view_unique": 0,
+        "body_view_ids": []
+      }
+    }
+  },
+  "live_inbox_trace_audit": {
+    "trace_count": 35,
+    "executed": 27,
+    "rejected_stale": 7,
+    "terminal": 1,
+    "executed_matches_history": true,
+    "private_freshness_fields_absent": true
+  },
+  "input_diagnostics": {
+    "page_focus_events": true,
+    "visibility_at_focus": "hidden",
+    "pointer_or_mouse_events_received": 0,
+    "device_pixel_ratio": 1.5,
+    "visual_viewport_scale": 1,
+    "source": "Local synthetic page capture listeners; no private account data"
   }
 }

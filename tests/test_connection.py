@@ -76,6 +76,11 @@ def connection(monkeypatch):
     FakeClient.approved.clear()
     monkeypatch.setattr(module, "_harness_client", FakeClient)
     monkeypatch.setattr(module, "chrome_endpoint", lambda: "ws://127.0.0.1:12345/devtools/browser/id")
+    # Transport tests must never compete with the user's running browser experiment.
+    import uuid
+
+    from ctrl.browser_lease import BrowserLease
+    monkeypatch.setattr(module, "BrowserLease", lambda: BrowserLease("Local\\CTRL.Test." + uuid.uuid4().hex))
     conn = module.ChromeConnection()
     yield conn
     conn.disconnect()
@@ -109,3 +114,11 @@ def test_disconnect_stops_transport_without_closing_targets(connection):
     client = FakeClient.instances[0]
     assert client.stopped
     assert [call[0] for call in client.calls] == ["Browser.getVersion"]
+
+
+def test_other_experiment_prevents_even_starting_approval_handshake(connection, monkeypatch):
+    monkeypatch.setattr(connection._lease, "acquire", lambda: False)
+    result = connection.connect(wait=0)
+    assert result["state"] == "owned_by_other_experiment"
+    assert not result["connected"]
+    assert FakeClient.instances == []
