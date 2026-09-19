@@ -210,10 +210,16 @@ public sealed class CtrlPanelForm : Form {
 }
 
 public static class CtrlPanelApp {
-    static Process Launch(string root, string script, string[] arguments) {
+    public static ProcessStartInfo LaunchInfo(string root, string script, string[] arguments) {
         string powershell = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "WindowsPowerShell\\v1.0\\powershell.exe");
         string command = "-NoProfile -ExecutionPolicy Bypass -STA -File \"" + Path.Combine(root, script) + "\" " + String.Join(" ", arguments);
-        return Process.Start(new ProcessStartInfo(powershell, command) { UseShellExecute = false, CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden, WorkingDirectory = root });
+        bool interactive = String.Equals(script.Replace('/', '\\'), "scripts\\Debug-CTRL.ps1", StringComparison.OrdinalIgnoreCase);
+        // CREATE_NO_WINDOW hides PowerShell's console; SW_HIDE would also hide the
+        // first WinForms window. Background lifecycle helpers keep their old style.
+        return new ProcessStartInfo(powershell, command) { UseShellExecute = false, CreateNoWindow = true, WindowStyle = interactive ? ProcessWindowStyle.Normal : ProcessWindowStyle.Hidden, WorkingDirectory = root };
+    }
+    static Process Launch(string root, string script, string[] arguments) {
+        return Process.Start(LaunchInfo(root, script, arguments));
     }
     public static void Run(string root) {
         Application.EnableVisualStyles();

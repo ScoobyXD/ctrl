@@ -15,7 +15,10 @@ try {
         $ctrlShortcut.Arguments = '-NoProfile -ExecutionPolicy Bypass ' + $ctrlItem.Extra + ' -File "' + (Join-Path $ctrlRoot $ctrlItem.Script) + '"'
         if ($ctrlItem.Script -eq 'Stop-CTRL.ps1') { $ctrlShortcut.Arguments += ' -Force' }
         $ctrlShortcut.WorkingDirectory = $ctrlRoot
-        $ctrlShortcut.WindowStyle = 7
+        # Direct WinForms scripts must receive a normal first-show state.
+        $ctrlShortcut.WindowStyle = if ($ctrlItem.Script -in @(
+            'scripts\Experiment-Chooser.ps1', 'scripts\Control-CTRL.ps1', 'scripts\Debug-CTRL.ps1'
+        )) { 1 } else { 7 }
         $ctrlShortcut.Description = $ctrlItem.Description
         $ctrlShortcut.Save()
     }
