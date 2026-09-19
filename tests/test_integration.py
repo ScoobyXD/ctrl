@@ -164,3 +164,19 @@ def test_controller_shutdown_cleanup_is_idempotent(control):
     control.close()
     control.agent.close.assert_called_once()
     assert control.shutdown.is_set()
+
+
+def test_private_freshness_data_never_reaches_local_debugger(control):
+    import json
+
+    control.agent = StubAgent()
+    control.agent.state["page"].update(
+        page_key=["OFFSCREEN-PRIVATE-VALUE"], marker=["INTERNAL-MARKER"], guards={"1": "PRIVATE-GUARD"},
+        text="Visible page", title="Public title",
+    )
+    control.capture()
+    public = control.state()["page"]
+    assert public["fingerprint"] == "page-1" and public["text"] == "Visible page"
+    assert not {"page_key", "marker", "guards"} & public.keys()
+    assert "PRIVATE" not in json.dumps(control.state())
+    assert control.agent.state["page"]["page_key"] == ["OFFSCREEN-PRIVATE-VALUE"]

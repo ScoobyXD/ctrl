@@ -22,6 +22,10 @@ from .diagnostics import MODEL, check_openrouter
 
 STATIC = Path(__file__).with_name("static")
 TERMINAL = {"done", "blocked", "needs_input", "error", "paused", "cancelled"}
+PUBLIC_PAGE_FIELDS = {
+    "url", "title", "text", "w", "h", "scroll", "actions", "fingerprint", "omitted_actions",
+    "target_id", "browser_context", "task_browser_scope", "bootstrap", "scope_blocked", "observation_id",
+}
 
 
 class Controller:
@@ -86,6 +90,10 @@ class Controller:
         if self.agent is None:
             return
         snapshot = self.agent.snapshot()
+        # Freshness guards can contain offscreen input values. They remain in
+        # the worker and are never needed by the local debugger or web UI.
+        if snapshot.get("page"):
+            snapshot["page"] = {key: value for key, value in snapshot["page"].items() if key in PUBLIC_PAGE_FIELDS}
         # The inspector needs decision evidence, not the full model request or every historical response.
         snapshot.pop("decisions", None)
         for field in ("decision", "last_decision"):

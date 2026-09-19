@@ -1,3 +1,11 @@
+function Test-CtrlLaunchGeneration {
+    param([string]$Root, [string]$Generation)
+    if (-not $Generation) { return $true }
+    $ctrlGenerationFile = Join-Path $Root '.ctrl\stop-generation'
+    $ctrlGenerationNow = if (Test-Path -LiteralPath $ctrlGenerationFile) { [System.IO.File]::ReadAllText($ctrlGenerationFile).Trim() } else { 'initial' }
+    return $Generation -eq $ctrlGenerationNow
+}
+
 function Test-CtrlServerProcess {
     param($Process, [string]$Root)
     if (-not $Process -or -not $Process.ExecutablePath) { return $false }
