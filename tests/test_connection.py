@@ -65,6 +65,8 @@ class FakeClient:
         self.calls.append((method, params, session_id))
         if method == "Browser.getVersion":
             return {"product": "Chrome/147.0.0.0"}
+        if method == "SystemInfo.getProcessInfo":
+            return {"processInfo": [{"type": "renderer", "id": 42}, {"type": "browser", "id": 12345}]}
         if method == "Input.dispatchMouseEvent":
             await asyncio.sleep(10)
         return {}
@@ -97,7 +99,13 @@ def test_pending_approval_reuses_same_handshake_and_never_attaches_a_tab(connect
     assert len(FakeClient.instances) == 1
     FakeClient.approved.set()
     assert connection.connect(wait=1)["connected"]
-    assert [call[0] for call in FakeClient.instances[0].calls] == ["Browser.getVersion"]
+    assert FakeClient.instances[0].calls == [
+        ("Browser.getVersion", None, None),
+        ("SystemInfo.getProcessInfo", None, None),
+    ]
+    assert connection.status()["process_id"] == 12345
+    assert connection.connect(wait=0)["process_id"] == 12345
+    assert len(FakeClient.instances[0].calls) == 2  # Cache the verified connection's PID.
 
 
 def test_timed_out_mutation_is_sent_exactly_once(connection):
@@ -114,7 +122,8 @@ def test_disconnect_stops_transport_without_closing_targets(connection):
     connection.disconnect()
     client = FakeClient.instances[0]
     assert client.stopped
-    assert [call[0] for call in client.calls] == ["Browser.getVersion"]
+    assert [call[0] for call in client.calls] == ["Browser.getVersion", "SystemInfo.getProcessInfo"]
+    assert connection.status()["process_id"] is None
 
 
 def test_other_experiment_prevents_even_starting_approval_handshake(connection, monkeypatch):
@@ -154,6 +163,7 @@ def test_cancelled_approval_keeps_lease_until_slow_transport_cleanup_finishes(co
         assert stopping.wait(1)
         assert connection.status()["state"] == "closing"
         assert not connection.status()["connected"]
+        assert connection.status()["process_id"] is None
         assert connection._client is None
         assert not contender.acquire()
         assert connection.connect(wait=0)["state"] == "closing"
@@ -181,6 +191,7 @@ def test_disconnect_immediately_before_success_publication_cannot_publish_stale_
     assert not connection.connect(wait=1)["connected"]
     connection.disconnect(wait=1)
     assert connection._client is None
+    assert connection.status()["process_id"] is None
     assert FakeClient.instances[0].stopped
     assert connection.status()["state"] == "disconnected"
 
@@ -204,6 +215,7 @@ def test_reconnect_waits_for_old_client_stop_and_retains_new_lease(connection, m
         assert connection.connect(wait=1)["connected"]
         connection.disconnect(wait=0.01)
         assert stopping.wait(1)
+        assert connection.status()["process_id"] is None
         old_cleanup = connection._cleanup_future
         assert connection.connect(wait=0)["state"] == "closing"
         assert len(FakeClient.instances) == 1
@@ -239,3 +251,109 @@ def test_unconfirmed_stop_retains_lease_and_blocks_reconnect_until_process_exit(
     finally:
         contender.release()
         connection._lease.release()  # Only a fake transport exists in this test.
+
+
+@pytest.mark.parametrize("failure", ["unsupported", "timeout"])
+def test_browser_pid_lookup_failure_keeps_connection_usable(connection, monkeypatch, failure):
+    class UnavailableProcessClient(FakeClient):
+        async def send_raw(self, method, params=None, session_id=None):
+            if method == "SystemInfo.getProcessInfo":
+                if failure == "timeout":
+                    await asyncio.sleep(10)
+                raise RuntimeError("Method not supported")
+            return await super().send_raw(method, params, session_id)
+
+    monkeypatch.setattr(module, "_harness_client", UnavailableProcessClient)
+    monkeypatch.setattr(module, "PROCESS_INFO_TIMEOUT", 0.01)
+    FakeClient.approved.set()
+    assert connection.connect(wait=1)["connected"]
+    assert connection.status()["process_id"] is None
+    assert connection.cdp("Target.getTargets") == {}
+
+
+@pytest.mark.parametrize(
+    "processes",
+    [
+        None,
+        {},
+        [],
+        [{"type": "renderer", "id": 12345}],
+        [{"type": "browser", "id": 12345}, {"type": "browser", "id": 67890}],
+        *[[{"type": "browser", "id": value}] for value in (None, True, 0, -1, 0xFFFFFFFF, "12345", 1.5)],
+    ],
+)
+def test_pid_metadata_never_projects_an_ambiguous_or_all_processes_grant(connection, monkeypatch, processes):
+    class MalformedProcessClient(FakeClient):
+        async def send_raw(self, method, params=None, session_id=None):
+            if method == "SystemInfo.getProcessInfo":
+                return {"processInfo": processes}
+            return await super().send_raw(method, params, session_id)
+
+    monkeypatch.setattr(module, "_harness_client", MalformedProcessClient)
+    FakeClient.approved.set()
+    assert connection.connect(wait=1)["connected"]
+    assert connection.status()["process_id"] is None
+
+
+def test_late_pid_lookup_after_disconnect_cannot_publish_old_connection_metadata(connection, monkeypatch):
+    started, cancelled, finish = threading.Event(), threading.Event(), threading.Event()
+
+    class LateProcessClient(FakeClient):
+        async def send_raw(self, method, params=None, session_id=None):
+            if method != "SystemInfo.getProcessInfo":
+                return await super().send_raw(method, params, session_id)
+            started.set()
+            try:
+                while not finish.is_set():
+                    await asyncio.sleep(0.001)
+            except asyncio.CancelledError:
+                cancelled.set()
+                while not finish.is_set():
+                    await asyncio.sleep(0.001)
+            return {"processInfo": [{"type": "browser", "id": 98765}]}
+
+    monkeypatch.setattr(module, "_harness_client", LateProcessClient)
+    FakeClient.approved.set()
+    try:
+        connection.connect(wait=0.01)
+        assert started.wait(1)
+        connection.disconnect(wait=0.01)
+        assert cancelled.wait(1)
+        assert connection.status()["state"] == "closing"
+        assert connection.status()["process_id"] is None
+        finish.set()
+        connection.disconnect(wait=1)
+        assert connection.status()["state"] == "disconnected"
+        assert connection.status()["process_id"] is None
+        monkeypatch.setattr(module, "_harness_client", FakeClient)
+        assert connection.connect(wait=1)["process_id"] == 12345
+    finally:
+        finish.set()
+
+
+def test_reconnect_without_pid_does_not_reuse_previous_process_id(connection, monkeypatch):
+    FakeClient.approved.set()
+    assert connection.connect(wait=1)["process_id"] == 12345
+    connection.disconnect()
+
+    class NoProcessClient(FakeClient):
+        async def send_raw(self, method, params=None, session_id=None):
+            if method == "SystemInfo.getProcessInfo":
+                return {}
+            return await super().send_raw(method, params, session_id)
+
+    monkeypatch.setattr(module, "_harness_client", NoProcessClient)
+    assert connection.connect(wait=1)["connected"]
+    assert connection.status()["process_id"] is None
+
+
+def test_unexpected_transport_disconnect_immediately_hides_cached_pid(connection):
+    import concurrent.futures
+
+    FakeClient.approved.set()
+    assert connection.connect(wait=1)["process_id"] == 12345
+    stopped_handler = concurrent.futures.Future()
+    stopped_handler.set_result(None)
+    FakeClient.instances[0]._message_handler_task = stopped_handler
+    assert connection.status()["state"] == "disconnected"
+    assert connection.status()["process_id"] is None

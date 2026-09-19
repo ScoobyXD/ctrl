@@ -21,6 +21,19 @@ SETUP_MESSAGE = (
     "In your normal Google Chrome, open chrome://inspect/#remote-debugging and enable "
     "'Allow remote debugging for this browser instance', then connect again."
 )
+PROCESS_INFO_TIMEOUT = 1.0
+
+
+def _browser_process_id(response):
+    """Accept only one browser OS PID; never Windows' all-processes sentinel."""
+    processes = response.get("processInfo") if isinstance(response, dict) else None
+    if not isinstance(processes, list):
+        return None
+    browsers = [item for item in processes if isinstance(item, dict) and item.get("type") == "browser"]
+    if len(browsers) != 1:
+        return None
+    process_id = browsers[0].get("id")
+    return process_id if type(process_id) is int and 0 < process_id < 0xFFFFFFFF else None
 
 
 def _harness_client(endpoint):
@@ -90,6 +103,7 @@ class ChromeConnection:
         self._state = "disconnected"
         self._message = "Connect to your normal Chrome."
         self._version = None
+        self._process_id = None
         self._lease = BrowserLease()
         self._generation = 0
         self._attempt = None
@@ -121,6 +135,15 @@ class ChromeConnection:
             product = version.get("product", "")
             if not product.startswith("Chrome/"):
                 raise RuntimeError("The normal Google Chrome connection could not be verified.")
+            process_id = None
+            try:
+                # The native Run click may grant foreground activation to this
+                # exact browser process. Metadata failure must not break Chrome.
+                process_id = _browser_process_id(
+                    await asyncio.wait_for(client.send_raw("SystemInfo.getProcessInfo"), PROCESS_INFO_TIMEOUT)
+                )
+            except Exception:
+                pass
             with self._lock:
                 if self._closing or attempt["generation"] != self._generation or self._attempt is not attempt:
                     return
@@ -128,6 +151,7 @@ class ChromeConnection:
                 self._state = "connected"
                 self._message = "Connected to your normal Chrome. Select a tab to start."
                 self._version = product
+                self._process_id = process_id
                 published = True
         finally:
             if not published:
@@ -146,6 +170,7 @@ class ChromeConnection:
             with self._lock:
                 if self._pending is not future:
                     return  # A cancelled earlier handshake cannot release a newer connection's lease.
+                self._process_id = None
                 if self._closing:
                     return  # The disconnect cleanup owns the lease until its coroutine finishes.
                 if self._attempt and self._attempt["clients"]:
@@ -183,6 +208,7 @@ class ChromeConnection:
                     return self.status()
                 self._start_loop()
                 self._generation += 1
+                self._process_id = None
                 attempt = {
                     "generation": self._generation,
                     "task": None,
@@ -207,6 +233,7 @@ class ChromeConnection:
             handler = getattr(client, "_message_handler_task", None)
             if self._state == "connected" and handler is not None and handler.done():
                 self._state = "disconnected"
+                self._process_id = None
                 self._message = "Chrome disconnected. Connect again to resume."
             return {
                 "state": self._state,
@@ -215,6 +242,7 @@ class ChromeConnection:
                 "message": self._message,
                 "browser": "Google Chrome",
                 "version": self._version,
+                "process_id": self._process_id if self._state == "connected" else None,
             }
 
     def cdp(self, method, session_id=None, _response_timeout=15.0, **params):
@@ -263,6 +291,7 @@ class ChromeConnection:
             self._attempt = None
             self._closing = False
             self._state = "disconnected"
+            self._process_id = None
             self._message = "Disconnected from Chrome. Your tabs remain open."
             self._lease.release()
 
@@ -273,6 +302,7 @@ class ChromeConnection:
                 self._generation += 1  # Invalidate success publication before requesting cancellation.
                 self._closing = True
                 self._client = None
+                self._process_id = None
                 self._state = "closing"
                 self._message = "Disconnecting Chrome; waiting for the previous transport to stop."
                 if self._loop is None:
