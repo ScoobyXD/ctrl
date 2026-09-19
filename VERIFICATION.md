@@ -1,18 +1,20 @@
 # Verification
 
-## Current reliability and native debugger update (2026-09-19)
+## Current baseline and isolated hybrid update (2026-09-19)
 
-- Native Windows debugger implemented with task entry, Run/Step/Choose/Execute, Pause, Cancel, Restart task, connection retry controls, a page/action tree, trace timeline, and all offered Jev probabilities. No embedded browser is used.
-- Its injected synthetic-API test renders the actual WinForms form at normal and minimum sizes. Selection versus usage, tri-state validation, cancellation/restart, empty starting tab, no automatic task submission, and repeatable Stop routing pass. This verifies the native controls and rendering; it is not a live browser task.
-- 304 offline Python tests and 18 frontend regressions pass. Ruff, TypeScript checks, compiled assets, source distribution, and wheel build pass. GitHub Windows CI also checks the native debugger with synthetic data.
-- Internal freshness guards stay inside the worker; authenticated debugger responses expose only the observed page fields needed by the UI. Cancelled native startup requests are checked before and after UI compilation.
-- The reported alternating-tab loop was reproduced from a prior run's 153 navigation-only actions. Task-site filtering, neutral bootstrap, bounded request history, navigation-cycle stopping, and an independent emergency panel were added. The navigation guard rejects a reproduced A/B/A/B cycle before its fourth switch.
-- The independent Stop script was exercised against the owned idle local server. The server stopped and its health endpoint became unavailable. The script does not target Chrome. Its native self-test also registered the global emergency shortcut and checked button/shortcut routing with a stub launcher.
-- A live Jev task on the synthetic catalog opened the destination in normal Chrome, then failed before text insertion: `The observed field did not receive focus; no text was inserted.` Independent fixture evidence confirmed no search submission and no product detail opened. This run **failed**.
-- The executor now brings the selected tab forward before actual page input, then rechecks cancellation, observed identity, and target geometry. Offline focus/cancellation tests pass. The corrected live task is **not yet verified**: Chrome requires its native connection approval again. AWS access initially reported expired sign-in after restart and is now ready.
-- The app is installed in `C:\Users\Jonat\ctrl`; the native debugger and emergency panel are available through Start CTRL.cmd and desktop shortcuts. No previous task starts automatically.
+- The native Windows mode chooser opens Ultra-fast / Jev only or the separate hybrid installation. Each has its own environment, API port, task state, native debugger, and Stop controls. No task starts from choosing a mode.
+- Baseline: 339 offline Python tests pass; Ruff and source/wheel builds pass. Native debugger and chooser tests render the actual forms using synthetic callbacks. The debugger also decoded and rendered a real recorded synthetic-inbox trace: blocked status, four actions, all 30 offered options. That rendering submitted no commands.
+- The catalog live test passed in normal Chrome with real Jev: six actions in 3.28 seconds entered `trail`, selected Outdoors, enabled In stock only, applied the search, and opened Alpine Trail Mug. Independent fixture evidence confirmed the filters and rendered product body.
+- The 12-message synthetic inbox passed: 27 actions in 12.05 seconds, all 12 unique bodies rendered, and all three list pages visited. Its 35 traces contained 27 executed actions, seven stale decisions rejected without replay, and one terminal decision. Internal freshness fields were absent from the API projection.
+- The 100-message synthetic inbox failed. Three dispatched clicks had no visible effect. Fixture instrumentation then proved the page was focused but hidden and received no mouse events. These runs are failures, not evidence of 100-item capability.
+- The executor now restores only the selected minimized Chrome window, activates the tab once, and waits for actual visibility, focus, and two animation frames before page input. A bounded timeout stops before input if Chrome remains hidden. Freshness is rechecked afterward. The corrected live retest is waiting for Chrome's renewed native Allow approval.
+- A process-lifetime lease prevents both experiments from owning Chrome at once. It includes approval and disconnect cleanup; delayed cancellation cannot release ownership before transport cleanup finishes. Offline cross-process and race regressions pass.
+- Actual two-backend verification passed: the hybrid at port 8767 remained idle and could not connect while baseline owned Chrome. The hybrid's actual Stop script made its health endpoint unavailable while baseline at port 8766 stayed idle and running. Chrome and its tabs were preserved.
+- The baseline is still on the reliability branch. It has not been merged to main because the corrected live browser retest is incomplete.
 
-Sanitized evidence is in [docs/reliability-verification.json](docs/reliability-verification.json). The older checks below are historical and do not establish that the latest multi-site or 100-message tasks work.
+The hybrid's own test record and limitations are in its separate repository, `ctrl-tiptour-experiment`, under `windows-browser/VERIFICATION.md`. Its planner-plus-Jev API compatibility on synthetic supplied observations is not proof of a completed live browser task. Baseline remains Jev-only.
+
+Sanitized baseline evidence is in [docs/reliability-verification.json](docs/reliability-verification.json). Older checks below are historical.
 
 ## Earlier setup checks
 

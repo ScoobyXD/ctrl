@@ -12,8 +12,8 @@
     "product_details_rendered": 0,
     "passed": false
   },
-  "resulting_change": "Bring the controlled tab forward before actual page input, then recheck cancellation, observed identity, and hit-test the control.",
-  "retest_status": "Catalog and 12-message synthetic inbox passed; 100-message inbox failed. Investigating focused but hidden Chrome page receiving no pointer events.",
+  "resulting_change": "Restore only selected minimized window; activate once; wait for visible, focused, two-frame rendering; then revalidate freshness before input.",
+  "retest_status": "Pending renewed native Chrome Allow approval. Catalog and 12-message runs passed before readiness change; 100-message run failed; readiness correction not live-verified.",
   "native_debugger": {
     "verification": "Rendered WinForms UI with injected synthetic API; no live browser actions in UI test",
     "options_probabilities_rendered": true,
@@ -160,5 +160,14 @@
     "device_pixel_ratio": 1.5,
     "visual_viewport_scale": 1,
     "source": "Local synthetic page capture listeners; no private account data"
+  },
+  "offline_python_tests": 339,
+  "experiment_isolation": {
+    "separate_private_repository": "ScoobyXD/ctrl-tiptour-experiment",
+    "baseline_port": 8766,
+    "hybrid_port": 8767,
+    "hybrid_blocked_by_baseline_lease": true,
+    "hybrid_stop_preserved_baseline": true,
+    "baseline_main_merged": false
   }
 }

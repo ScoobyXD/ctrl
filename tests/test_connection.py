@@ -80,6 +80,7 @@ def connection(monkeypatch):
     import uuid
 
     from ctrl.browser_lease import BrowserLease
+
     monkeypatch.setattr(module, "BrowserLease", lambda: BrowserLease("Local\\CTRL.Test." + uuid.uuid4().hex))
     conn = module.ChromeConnection()
     yield conn
@@ -122,3 +123,119 @@ def test_other_experiment_prevents_even_starting_approval_handshake(connection, 
     assert result["state"] == "owned_by_other_experiment"
     assert not result["connected"]
     assert FakeClient.instances == []
+
+
+@pytest.mark.parametrize("ignore_cancel", [False, True])
+def test_cancelled_approval_keeps_lease_until_slow_transport_cleanup_finishes(connection, monkeypatch, ignore_cancel):
+    from ctrl.browser_lease import BrowserLease
+
+    stopping, permit_stop = threading.Event(), threading.Event()
+
+    class SlowClient(FakeClient):
+        async def start(self):
+            try:
+                await super().start()
+            except asyncio.CancelledError:
+                if not ignore_cancel:
+                    raise
+                # Model a handshake which completes despite the cancellation request.
+
+        async def stop(self):
+            stopping.set()
+            while not permit_stop.is_set():
+                await asyncio.sleep(0.001)
+            await super().stop()
+
+    monkeypatch.setattr(module, "_harness_client", SlowClient)
+    contender = BrowserLease(connection._lease.name)
+    try:
+        connection.connect(wait=0.01)
+        connection.disconnect(wait=0.01)
+        assert stopping.wait(1)
+        assert connection.status()["state"] == "closing"
+        assert not connection.status()["connected"]
+        assert connection._client is None
+        assert not contender.acquire()
+        assert connection.connect(wait=0)["state"] == "closing"
+        assert len(FakeClient.instances) == 1
+        permit_stop.set()
+        connection.disconnect(wait=1)
+        assert connection.status()["state"] == "disconnected"
+        assert FakeClient.instances[0].stopped
+        assert contender.acquire()
+    finally:
+        permit_stop.set()
+        contender.release()
+
+
+def test_disconnect_immediately_before_success_publication_cannot_publish_stale_client(connection, monkeypatch):
+    class FinishingClient(FakeClient):
+        async def send_raw(self, method, params=None, session_id=None):
+            result = await super().send_raw(method, params, session_id)
+            if method == "Browser.getVersion":
+                connection.disconnect(wait=0)
+            return result
+
+    monkeypatch.setattr(module, "_harness_client", FinishingClient)
+    FakeClient.approved.set()
+    assert not connection.connect(wait=1)["connected"]
+    connection.disconnect(wait=1)
+    assert connection._client is None
+    assert FakeClient.instances[0].stopped
+    assert connection.status()["state"] == "disconnected"
+
+
+def test_reconnect_waits_for_old_client_stop_and_retains_new_lease(connection, monkeypatch):
+    from ctrl.browser_lease import BrowserLease
+
+    stopping, permit_stop = threading.Event(), threading.Event()
+
+    class SlowClient(FakeClient):
+        async def stop(self):
+            stopping.set()
+            while not permit_stop.is_set():
+                await asyncio.sleep(0.001)
+            await super().stop()
+
+    monkeypatch.setattr(module, "_harness_client", SlowClient)
+    FakeClient.approved.set()
+    contender = BrowserLease(connection._lease.name)
+    try:
+        assert connection.connect(wait=1)["connected"]
+        connection.disconnect(wait=0.01)
+        assert stopping.wait(1)
+        old_cleanup = connection._cleanup_future
+        assert connection.connect(wait=0)["state"] == "closing"
+        assert len(FakeClient.instances) == 1
+        permit_stop.set()
+        connection.disconnect(wait=1)
+        assert connection.connect(wait=1)["connected"]
+        connection._cleanup_completed(old_cleanup)  # Late callback from the previous disconnect.
+        assert connection.status()["connected"]
+        assert not contender.acquire()
+    finally:
+        permit_stop.set()
+        contender.release()
+
+
+def test_unconfirmed_stop_retains_lease_and_blocks_reconnect_until_process_exit(connection, monkeypatch):
+    from ctrl.browser_lease import BrowserLease
+
+    class FailingStopClient(FakeClient):
+        async def stop(self):
+            raise RuntimeError("Transport close not confirmed")
+
+    monkeypatch.setattr(module, "_harness_client", FailingStopClient)
+    FakeClient.approved.set()
+    contender = BrowserLease(connection._lease.name)
+    try:
+        assert connection.connect(wait=1)["connected"]
+        connection.disconnect(wait=1)
+        assert connection.status()["state"] == "closing"
+        assert "cleanup could not be confirmed" in connection.status()["message"]
+        assert not contender.acquire()
+        assert not connection.connect(wait=0)["connected"]
+        assert len(FakeClient.instances) == 1
+    finally:
+        contender.release()
+        connection._lease.release()  # Only a fake transport exists in this test.

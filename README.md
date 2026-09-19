@@ -4,7 +4,7 @@ Local browser agent, powered only by Jev through OpenRouter. Uses your normal ru
 
 ## Start
 
-On this laptop, double-click **Start CTRL.cmd** or the **CTRL Debugger** desktop shortcut. From PowerShell:
+On this laptop, double-click **Start CTRL.cmd** or the **CTRL** desktop shortcut to choose **Ultra-fast / Jev only** or the separately installed **Hybrid experiment**. The chooser submits no task. **CTRL Debugger** opens the Jev baseline directly. From PowerShell:
 
 ```powershell
 Set-Location -LiteralPath 'C:\Users\Jonat\ctrl'
@@ -12,6 +12,8 @@ Set-Location -LiteralPath 'C:\Users\Jonat\ctrl'
 ```
 
 This opens a native Windows debugger and an independent emergency control panel. Python runs locally at `127.0.0.1:8766`; the debugger is a desktop window, with no embedded browser. It reuses a running [CTRL] server and never resumes a previous task automatically. The older web dashboard is optional: `Start-CTRL.ps1 -WebDashboard`.
+
+The hybrid lives in its own TipTour worktree at `C:\Users\Jonat\ctrl-experiments\tiptour-windows\windows-browser`, with a separate environment, native interface, runtime state, and port 8767. It uses an OpenRouter reasoning planner plus Jev; no planner is added to this baseline. Its private repository is [ctrl-tiptour-experiment](https://github.com/ScoobyXD/ctrl-tiptour-experiment). The original TipTour app requires macOS; the Windows adaptation is explicitly experimental. Stop the current app before connecting Chrome from the other mode. A process-lifetime lease prevents simultaneous browser ownership, including while approval or disconnect cleanup is pending.
 
 1. Startup loads the OpenRouter key directly from AWS Secrets Manager into Python memory and verifies Jev. **Check access** retries that check if needed.
 2. On first connection, open `chrome://inspect/#remote-debugging`, enable **Allow remote debugging for this browser instance**, and accept Chrome's connection prompt. [CTRL] connects automatically when the setting becomes available; **Connect Chrome** retries a failed connection. Keep Chrome open.
@@ -55,7 +57,7 @@ Each observation reads visible page text and supported controls. One Jev request
 - Text entry is selection, not prose generation. Quoted task strings and supplied values are copied verbatim. If needed text is missing, the run stops at `needs_input`; add values and resume.
 - Supports ordinary visible DOM controls. Password/file inputs, browser-internal pages, canvas-only controls, and controls inside inaccessible frames or shadow roots are not supported. There is no screenshot/vision fallback.
 - Up to the selected action limit (default 200, maximum 500) and twice that many model decisions per run. At most 32 supplied strings; more than 255 field/string pairs produces an explicit error asking for fewer strings.
-- New tabs are preserved and created in the background. The selected tab is brought forward when executing an actual page action so Chrome delivers input to it. Merely selecting a tab does not pull focus. Links that open a separate task-site tab become available as observed SWITCH_TAB targets. There is no automatic tab closing.
+- New tabs are preserved and created in the background. Before page input, the selected minimized Chrome window is restored, the tab is activated, and actual visibility, focus, and two rendered frames are checked. If Chrome stays hidden or unfocused, the task stops before sending that input. Merely selecting a tab does not pull focus. Links that open a separate task-site tab become available as observed SWITCH_TAB targets. There is no automatic tab closing.
 - Jev selects actions and stop reasons; it does not write email summaries or arbitrary prose. Asking to "interact" with a feed allows browsing, opening, and scrolling; posting, messaging, voting, following, deleting, or archiving require a specific request.
 - A model's `done` status is its judgment, not independent proof. Inspect the final page and action history.
 

@@ -91,6 +91,10 @@ class ChromeConnection:
         self._message = "Connect to your normal Chrome."
         self._version = None
         self._lease = BrowserLease()
+        self._generation = 0
+        self._attempt = None
+        self._closing = False
+        self._cleanup_future = None
 
     def _start_loop(self):
         if self._loop is not None:
@@ -99,26 +103,41 @@ class ChromeConnection:
         self._thread = threading.Thread(target=self._loop.run_forever, name="ctrl-chrome", daemon=True)
         self._thread.start()
 
-    async def _open(self, endpoint):
+    async def _open(self, endpoint, attempt):
         # Private API intentionally pinned to browser-harness==0.1.13.
-        previous = self._client
-        if previous is not None:
-            await previous.stop()
-        client = _harness_client(endpoint)
+        with self._lock:
+            attempt["task"] = asyncio.current_task()
+            if self._closing or attempt["generation"] != self._generation:
+                return
+        published = False
         try:
+            for previous in list(attempt["clients"]):
+                await previous.stop()
+                attempt["clients"].remove(previous)
+            client = _harness_client(endpoint)
+            attempt["clients"].append(client)
             await client.start()
             version = await asyncio.wait_for(client.send_raw("Browser.getVersion"), 10)
             product = version.get("product", "")
             if not product.startswith("Chrome/"):
                 raise RuntimeError("The normal Google Chrome connection could not be verified.")
-        except BaseException:
-            await client.stop()
-            raise
-        with self._lock:
-            self._client = client
-            self._state = "connected"
-            self._message = "Connected to your normal Chrome. Select a tab to start."
-            self._version = product
+            with self._lock:
+                if self._closing or attempt["generation"] != self._generation or self._attempt is not attempt:
+                    return
+                self._client = client
+                self._state = "connected"
+                self._message = "Connected to your normal Chrome. Select a tab to start."
+                self._version = product
+                published = True
+        finally:
+            if not published:
+                # A cancelled concurrent Future is not cleanup confirmation. Keep
+                # every transport recorded until its asynchronous stop succeeds.
+                for client in list(attempt["clients"]):
+                    await client.stop()
+                    attempt["clients"].remove(client)
+            with self._lock:
+                attempt["task"] = None
 
     def _completed(self, future):
         try:
@@ -127,6 +146,13 @@ class ChromeConnection:
             with self._lock:
                 if self._pending is not future:
                     return  # A cancelled earlier handshake cannot release a newer connection's lease.
+                if self._closing:
+                    return  # The disconnect cleanup owns the lease until its coroutine finishes.
+                if self._attempt and self._attempt["clients"]:
+                    self._closing = True
+                    self._state = "closing"
+                    self._message = "Chrome cleanup could not be confirmed. Stop this app before connecting another."
+                    return
                 self._state = "disconnected"
                 self._client = None
                 self._lease.release()
@@ -137,6 +163,8 @@ class ChromeConnection:
 
     def connect(self, wait=2.0):
         with self._lock:
+            if self._closing:
+                return self.status()
             if self._state == "connected":
                 return self.status()
             if self._pending is None or self._pending.done():
@@ -154,9 +182,16 @@ class ChromeConnection:
                     )
                     return self.status()
                 self._start_loop()
+                self._generation += 1
+                attempt = {
+                    "generation": self._generation,
+                    "task": None,
+                    "clients": [self._client] if self._client is not None else [],
+                }
+                self._attempt = attempt
                 self._state = "waiting_for_approval"
                 self._message = "If Chrome asks to allow remote debugging, approve its native prompt."
-                self._pending = asyncio.run_coroutine_threadsafe(self._open(endpoint), self._loop)
+                self._pending = asyncio.run_coroutine_threadsafe(self._open(endpoint, attempt), self._loop)
                 self._pending.add_done_callback(self._completed)
             future = self._pending
         try:
@@ -184,11 +219,11 @@ class ChromeConnection:
 
     def cdp(self, method, session_id=None, _response_timeout=15.0, **params):
         with self._call_lock:
-            if not self.status()["connected"]:
-                raise RuntimeError(self.status()["message"])
-            future = asyncio.run_coroutine_threadsafe(
-                self._client.send_raw(method, params, session_id=session_id), self._loop
-            )
+            with self._lock:
+                if not self.status()["connected"]:
+                    raise RuntimeError(self.status()["message"])
+                client, loop = self._client, self._loop
+            future = asyncio.run_coroutine_threadsafe(client.send_raw(method, params, session_id=session_id), loop)
             try:
                 return future.result(timeout=_response_timeout)
             except concurrent.futures.TimeoutError as exc:
@@ -197,19 +232,65 @@ class ChromeConnection:
             except Exception as exc:
                 raise RuntimeError(f"Chrome rejected {method}; the command was not retried.") from exc
 
-    def disconnect(self):
-        """Release only the transport, preserving Chrome and every tab."""
+    async def _close_attempt(self, attempt, pending):
+        if attempt is not None:
+            task = attempt["task"]
+            if task is not None and not task.done():
+                task.cancel()
+        if pending is not None:
+            try:
+                # Do not cancel this concurrent Future: its completion must mean
+                # _open's finally block, including client.stop(), has finished.
+                await asyncio.wrap_future(pending)
+            except (Exception, asyncio.CancelledError):
+                pass
+        if attempt is not None:
+            for client in list(attempt["clients"]):
+                await client.stop()
+                attempt["clients"].remove(client)
+
+    def _cleanup_completed(self, future):
         with self._lock:
-            pending, client, loop = self._pending, self._client, self._loop
+            if self._cleanup_future is not future:
+                return
+            self._cleanup_future = None
+            try:
+                future.result()
+            except BaseException:
+                self._message = "Chrome cleanup could not be confirmed. Stop this app before connecting another."
+                return  # Keep the lease and reject reconnect until process shutdown.
             self._pending = None
-            self._client = None
+            self._attempt = None
+            self._closing = False
             self._state = "disconnected"
             self._message = "Disconnected from Chrome. Your tabs remain open."
-        if pending is not None and not pending.done():
-            pending.cancel()
-        if client is not None and loop is not None:
-            asyncio.run_coroutine_threadsafe(client.stop(), loop).result(timeout=5)
-        self._lease.release()
+            self._lease.release()
+
+    def disconnect(self, *, wait=5.0):
+        """Release only the transport, preserving Chrome and every tab."""
+        with self._lock:
+            if not self._closing:
+                self._generation += 1  # Invalidate success publication before requesting cancellation.
+                self._closing = True
+                self._client = None
+                self._state = "closing"
+                self._message = "Disconnecting Chrome; waiting for the previous transport to stop."
+                if self._loop is None:
+                    self._closing = False
+                    self._state = "disconnected"
+                    self._lease.release()
+                    return
+                self._cleanup_future = asyncio.run_coroutine_threadsafe(
+                    self._close_attempt(self._attempt, self._pending), self._loop
+                )
+                self._cleanup_future.add_done_callback(self._cleanup_completed)
+            future = self._cleanup_future
+        if future is not None:
+            try:
+                future.result(timeout=max(0, wait))
+                self._cleanup_completed(future)
+            except Exception:
+                pass  # Timeout does not release the lease or permit another connection.
 
 
 _connection = ChromeConnection()

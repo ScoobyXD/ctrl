@@ -5,6 +5,7 @@ $ctrlPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\pow
 $ctrlShell = New-Object -ComObject WScript.Shell
 try {
     foreach ($ctrlItem in @(
+        @{ Name='CTRL.lnk'; Script='scripts\Experiment-Chooser.ps1'; Extra='-STA'; Description='Choose Ultra-fast Jev or the isolated Hybrid experiment.' },
         @{ Name='CTRL Debugger.lnk'; Script='Start-CTRL.ps1'; Extra='-STA'; Description='Start the local CTRL app and open its native task debugger.' },
         @{ Name='CTRL Control Panel.lnk'; Script='scripts\Control-CTRL.ps1'; Extra='-STA'; Description='Open the independent CTRL control panel. Starting the agent is manual.' },
         @{ Name='STOP CTRL Agent.lnk'; Script='Stop-CTRL.ps1'; Extra=''; Description='Turn off only the local CTRL agent. Chrome remains open.' }
@@ -19,4 +20,4 @@ try {
         $ctrlShortcut.Save()
     }
 } finally { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($ctrlShell) | Out-Null }
-Write-Output '[CTRL] Debugger, Control Panel, and STOP CTRL Agent desktop shortcuts installed.'
+Write-Output '[CTRL] mode chooser, Debugger, Control Panel, and STOP CTRL Agent desktop shortcuts installed.'
