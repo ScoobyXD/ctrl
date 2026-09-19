@@ -1,0 +1,14 @@
+{
+  "name": "ctrl-browser-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "The local control surface for the [CTRL] browser agent",
+  "scripts": {
+    "build": "tsc -p browser/tsconfig.json && node web/build.mjs",
+    "typecheck": "tsc --noEmit && tsc -p browser/tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.10",
+    "typescript": "5.9.2"
+  }
+}
