@@ -12,8 +12,8 @@
     "product_details_rendered": 0,
     "passed": false
   },
-  "resulting_change": "Bring the controlled tab forward before actual page input, then recheck cancellation and hit-test the observed control.",
-  "retest_status": "Pending AWS SSO renewal and native Chrome connection approval after app restart",
+  "resulting_change": "Bring the controlled tab forward before actual page input, then recheck cancellation, observed identity, and hit-test the control.",
+  "retest_status": "Pending native Chrome connection approval after app restart; AWS/Jev access is ready again",
   "native_debugger": {
     "verification": "Rendered WinForms UI with injected synthetic API; no live browser actions in UI test",
     "options_probabilities_rendered": true,

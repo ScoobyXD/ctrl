@@ -84,6 +84,33 @@ def test_unobserved_action_is_rejected(monkeypatch):
         browser.act({**action, "node": 99}, page)
 
 
+def test_activation_revalidates_observed_target_before_input(monkeypatch):
+    browser, page, action = action_browser(monkeypatch)
+    browser.fresh = Mock(side_effect=[True, False])
+    activate = Mock()
+    browser.call = activate
+    execute = Mock()
+    monkeypatch.setattr(module, "browser_operation", execute)
+    with pytest.raises(module.StalePage, match="changed when activated"):
+        browser.act(action, page)
+    activate.assert_called_once_with("Page.bringToFront")
+    assert browser.fresh.call_count == 2
+    assert page["observation_id"] not in browser._consumed
+    execute.assert_not_called()
+
+
+def test_pause_during_tab_activation_prevents_page_input(monkeypatch):
+    browser, page, action = action_browser(monkeypatch)
+    browser.cancel_event = threading.Event()
+    browser.call = Mock(side_effect=lambda *_args: browser.cancel_event.set())
+    execute = Mock()
+    monkeypatch.setattr(module, "browser_operation", execute)
+    with pytest.raises(module.ActionPaused, match="after tab activation"):
+        browser.act(action, page)
+    execute.assert_not_called()
+    assert page["observation_id"] not in browser._consumed
+
+
 def test_interrupted_select_is_not_reported_as_safe_to_retry(monkeypatch):
     monkeypatch.setattr(module, "cdp", lambda *_args, **_kwargs: {"exceptionDetails": {"text": "navigated"}})
     with pytest.raises(RuntimeError, match="interrupted"):
@@ -190,7 +217,7 @@ def test_pause_during_hit_test_prevents_first_mouse_event(monkeypatch):
                 },
             }
         )
-    assert calls == ["Page.bringToFront", "Runtime.evaluate"]
+    assert calls == ["Runtime.evaluate"]
 
 
 def test_pause_after_mouse_pressed_does_not_leave_button_down(monkeypatch):

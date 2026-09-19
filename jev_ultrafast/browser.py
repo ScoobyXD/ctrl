@@ -408,6 +408,16 @@ class Browser:
             raise StalePage("Page changed since this decision. Observe again.")
         if self.cancel_event is not None and self.cancel_event.is_set():
             raise ActionPaused("Paused before browser input.")
+        if action["kind"] in {"click", "fill", "select", "scroll"}:
+            # Activation is input preflight. Visibility/focus handlers may alter
+            # this same observed node, so revalidate identity after activation.
+            self.call("Page.bringToFront")
+            if self.cancel_event is not None and self.cancel_event.is_set():
+                raise ActionPaused("Paused after tab activation and before page input.")
+            if not self.fresh(page, action):
+                raise StalePage("The page changed when activated. Observe and choose again.")
+            if self.cancel_event is not None and self.cancel_event.is_set():
+                raise ActionPaused("Paused before page input.")
         # Consume before the first possible mutation, including partial or unconfirmed inputs.
         if observation:
             self._consumed.add(observation)
@@ -429,7 +439,7 @@ class Browser:
                 )
             )
         except ActionPaused:
-            # ActionPaused can only be raised before the first mutation, so a new
+            # ActionPaused can only be raised before the first page input, so a new
             # decision after Resume may still use this unchanged observation.
             if observation:
                 self._consumed.discard(observation)
@@ -538,12 +548,6 @@ def browser_operation(request):
         before_mutation()
         if kind not in {"scroll", "wait", "click", "fill", "select"}:
             raise ValueError("Unsupported browser operation")
-        if kind != "wait":
-            # Chrome can deliver pointer input to a background tab without giving
-            # its field focus. Activate only when executing a real page action,
-            # then hit-test again; mere tab-selection decisions stay unfocused.
-            call("Page.bringToFront")
-            before_mutation()
         if kind == "scroll":
             viewport = evaluate("({w:innerWidth,h:innerHeight})")
             if not viewport or viewport["w"] <= 0 or viewport["h"] <= 0:
