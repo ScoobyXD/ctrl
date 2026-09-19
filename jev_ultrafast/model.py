@@ -36,6 +36,86 @@ INPUT_REASONS = {
 QUOTED = re.compile(r'"([^"\r\n]+)"|“([^”\r\n]+)”|(?<!\w)\'([^\'\r\n]+)\'(?!\w)|‘([^’\r\n]+)’')
 
 
+class DecisionAuditError(ValueError):
+    """A rejected model response with a safe, finite-choice audit for the debugger."""
+
+    def __init__(self, message, audit):
+        super().__init__(message)
+        self.audit = audit
+
+
+def audit_number(value):
+    """Missing or malformed provider numbers must never be displayed as zero."""
+    if type(value) in (int, float) and 0 <= value <= 1 and math.isfinite(value):
+        return value
+    return None
+
+
+def decision_audit(questions, result, targets, request_bytes, latency_ms):
+    """Project provider values onto offered choices; never expose arbitrary response text."""
+    result = result if isinstance(result, dict) else {}
+    answers = result.get("answers")
+    answers = answers if isinstance(answers, dict) else {}
+    returned_model = result.get("model", MODEL)
+    if not isinstance(returned_model, str) or re.fullmatch(r"typesafe/jev-1\.13(?:-\d{8})?", returned_model) is None:
+        returned_model = None
+    audit = {
+        "questions": [],
+        "selected": {"operation": None, "action_id": None, "target_id": None, "target_label": None},
+        "model": returned_model, "latency_ms": latency_ms, "request_bytes": request_bytes,
+    }
+    for name, question in questions.items():
+        answer = answers.get(name)
+        answer = answer if isinstance(answer, dict) else {}
+        probabilities = answer.get("probabilities")
+        probabilities = probabilities if isinstance(probabilities, dict) else {}
+        selected_id = answer.get("choice")
+        if not isinstance(selected_id, str) or selected_id not in question["criteria"]:
+            selected_id = None
+        applies = name == "operation"
+        options = []
+        for identifier, criterion in question["criteria"].items():
+            label = criterion
+            if name.endswith("_target"):
+                action = targets[name.removesuffix("_target").upper()][identifier]
+                label = action["label"]
+                if "payload_id" in action:
+                    label = f"{label} — {action['payload_id']}: {action['text']}"
+            options.append({
+                "id": identifier, "label": label,
+                "probability": audit_number(probabilities.get(identifier)),
+                "selected": identifier == selected_id, "used": applies and identifier == selected_id,
+                "allowed": None,
+                "validation_note": "Model validation pending" if applies else "Ignored speculative head",
+            })
+        audit["questions"].append({
+            "id": name, "label": "Next operation" if applies else name.replace("_", " ").capitalize(),
+            "applies": applies, "selected_id": selected_id,
+            "confidence": audit_number(answer.get("confidence")),
+            "validation": "pending" if applies else "ignored", "options": options,
+        })
+    return audit
+
+
+def validate_audited_choice(audit, answers, name, ids):
+    """Only the operation and its matching head participate in decision validation."""
+    question = next(question for question in audit["questions"] if question["id"] == name)
+    question["applies"] = True
+    for option in question["options"]:
+        option["used"] = option["selected"]
+    try:
+        answer = validate_choice(answers.get(name, {}), ids)
+    except ValueError:
+        question["validation"] = "invalid"
+        for option in question["options"]:
+            option["validation_note"] = "Invalid Jev choice; no action executed."
+        raise DecisionAuditError("Invalid Jev choice; no action executed.", audit) from None
+    question["validation"] = "valid"
+    for option in question["options"]:
+        option["validation_note"] = "Browser validation pending" if option["used"] else "Not selected"
+    return answer
+
+
 def supplied_values(goal, values=None):
     """An ordered, bounded tuple of exact supplied strings, including task quotes."""
     if values is None:
@@ -91,7 +171,7 @@ def validate_choice(answer, ids):
             and abs(sum(probabilities.values()) - 1) < 0.02
             and probabilities[answer["choice"]] >= max(probabilities.values()) - 1e-6
         )
-    except (AttributeError, KeyError, TypeError, ValueError):
+    except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
         valid = False
     if not valid:
         raise ValueError("Invalid Jev choice; no action executed.")
@@ -320,21 +400,58 @@ def choose(state, goal, history, values=None):
             "The decision context is too large. Narrow the task, supplied strings, or visible page before trying again."
         )
     started = time.perf_counter()
-    result = post_json(ENDPOINT, get_openrouter_key(), body)
+    key = get_openrouter_key()
+    try:
+        result = post_json(ENDPOINT, key, body)
+    except (ValueError, RuntimeError) as error:
+        audit = decision_audit(questions, {}, targets, request_bytes, round((time.perf_counter() - started) * 1000))
+        audit["model"] = None
+        audit["questions"][0]["validation"] = "invalid"
+        for option in audit["questions"][0]["options"]:
+            option["validation_note"] = "No usable model response; no action executed."
+        # post_json emits only fixed messages; do not forward arbitrary exception text.
+        message = str(error)
+        if message not in {
+            "Model connection failed; no action executed.",
+            "OpenRouter returned invalid JSON; no action executed.",
+            "OpenRouter returned invalid decisions; no action executed.",
+            "Model unavailable",
+        } and re.fullmatch(r"OpenRouter returned HTTP \d{3}; no action executed\.", message) is None:
+            message = "Model response unavailable; no action executed."
+        raise DecisionAuditError(message, audit) from None
+    audit = decision_audit(questions, result, targets, request_bytes, round((time.perf_counter() - started) * 1000))
+    if not isinstance(result, dict) or not isinstance(result.get("answers"), dict):
+        audit["model"] = None
+        audit["questions"][0]["validation"] = "invalid"
+        for option in audit["questions"][0]["options"]:
+            option["validation_note"] = "Invalid model response; no action executed."
+        raise DecisionAuditError("OpenRouter returned invalid decisions; no action executed.", audit)
     if "model" in result and (
         not isinstance(result["model"], str)
         or re.fullmatch(r"typesafe/jev-1\.13(?:-\d{8})?", result["model"]) is None
     ):
-        raise ValueError("OpenRouter returned a different model; no action executed.")
+        audit["questions"][0]["validation"] = "invalid"
+        for option in audit["questions"][0]["options"]:
+            option["validation_note"] = "Unexpected model; no action executed."
+        raise DecisionAuditError("OpenRouter returned a different model; no action executed.", audit)
     answers = result.get("answers", {})
-    operation_answer = validate_choice(answers.get("operation", {}), operations)
+    operation_answer = validate_audited_choice(audit, answers, "operation", operations)
     operation = operation_answer["choice"]
+    audit["selected"]["operation"] = operation
     target = target_answer = payload_id = text = None
     stop_reason = None
     probabilities = {}
     if operation in targets:
         # Only the target head corresponding to the chosen operation can cause input.
-        target_answer = validate_choice(answers.get(operation.lower() + "_target", {}), targets[operation])
+        target_name = operation.lower() + "_target"
+        target_question = next(question for question in audit["questions"] if question["id"] == target_name)
+        selected_id = target_question["selected_id"]
+        if selected_id is not None:
+            selected_action = targets[operation][selected_id]
+            audit["selected"].update(
+                action_id=selected_action["id"], target_id=selected_id, target_label=selected_action["label"],
+            )
+        target_answer = validate_audited_choice(audit, answers, target_name, targets[operation])
         target = target_answer["choice"]
         selected = targets[operation][target]
         choice = selected["id"]
@@ -343,10 +460,14 @@ def choose(state, goal, history, values=None):
             probabilities[action["id"]] = probabilities.get(action["id"], 0) + target_answer["probabilities"][index]
     else:
         choice = controls[operation]["id"] if operation in controls else operation
+        if operation in controls:
+            audit["selected"].update(action_id=choice, target_label=controls[operation]["label"])
         probabilities[choice] = operation_answer["probabilities"][operation]
         if operation in {"BLOCKED", "NEEDS_INPUT"}:
             reasons = BLOCKED_REASONS if operation == "BLOCKED" else INPUT_REASONS
-            stop_reason = validate_choice(answers.get(operation.lower() + "_reason", {}), reasons)["choice"]
+            stop_reason = validate_audited_choice(audit, answers, operation.lower() + "_reason", reasons)["choice"]
+            audit["selected"].update(target_id=stop_reason, target_label=reasons[stop_reason])
+    audit["latency_ms"] = round((time.perf_counter() - started) * 1000)
     return {
         "choice": choice, "operation": operation, "target": target, "payload_id": payload_id, "text": text,
         "stop_reason": stop_reason,
@@ -356,5 +477,5 @@ def choose(state, goal, history, values=None):
         "target_confidence": target_answer["confidence"] if target_answer else None,
         "model": result.get("model", MODEL), "usage": result.get("usage", {}),
         "request_bytes": request_bytes, "recent_action_count": len(recent_actions),
-        "latency_ms": round((time.perf_counter() - started) * 1000),
+        "latency_ms": audit["latency_ms"], "audit": audit,
     }

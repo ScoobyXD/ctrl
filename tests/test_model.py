@@ -514,3 +514,264 @@ def test_model_scope_excludes_other_local_apps_and_ctrl_port():
     assert model.in_task_scope("http://127.0.0.1:8877/fixture", scope)
     assert not model.in_task_scope("http://127.0.0.1:8878/unrelated", scope)
     assert not model.in_task_scope("http://127.0.0.1:8766/", scope)
+
+
+def audited_questions(audit):
+    return {question["id"]: question for question in audit["questions"]}
+
+
+def audited_options(question):
+    return {option["id"]: option for option in question["options"]}
+
+
+def test_audit_contains_every_offered_option_with_actual_probabilities(monkeypatch):
+    offered = {}
+
+    def post(_url, _key, body):
+        offered.update(body["questions"])
+        questions = body["questions"]
+        operation = choice(questions["operation"]["criteria"], "CLICK")
+        operation["confidence"] = .86
+        operation["probabilities"].update(CLICK=.8, DONE=.2)
+        click = choice(questions["click_target"]["criteria"], "2")
+        click["probabilities"] = {"1": .25, "2": .75}
+        return {"model": model.MODEL + "-20260917", "answers": {
+            "operation": operation, "click_target": click,
+            "type_text_target": choice(questions["type_text_target"]["criteria"], "1@v1"),
+            "blocked_reason": choice(questions["blocked_reason"]["criteria"], "sign_in_required"),
+        }}
+
+    monkeypatch.setattr(model, "post_json", post)
+    result = model.choose(page(), "Find a book", [], ["exact text"])
+    audit = result["audit"]
+    questions = audited_questions(audit)
+    assert set(audit) == {"questions", "selected", "model", "latency_ms", "request_bytes"}
+    assert list(questions) == list(offered)
+    for name, question in questions.items():
+        assert list(audited_options(question)) == list(offered[name]["criteria"])
+        assert all(option["allowed"] is None for option in question["options"])
+    assert questions["operation"]["confidence"] == .86
+    assert audited_options(questions["operation"])["CLICK"]["probability"] == .8
+    assert audited_options(questions["click_target"])["1"]["probability"] == .25
+    assert audited_options(questions["click_target"])["2"]["label"] == "Go"
+    assert questions["click_target"]["validation"] == "valid"
+    assert questions["click_target"]["applies"]
+    assert audited_options(questions["click_target"])["2"]["used"]
+    assert not audited_options(questions["click_target"])["1"]["used"]
+    for name in ("type_text_target", "blocked_reason"):
+        ignored = questions[name]
+        selected = next(option for option in ignored["options"] if option["selected"])
+        assert selected["probability"] == 1.
+        assert not selected["used"] and selected["allowed"] is None
+        assert not ignored["applies"] and ignored["validation"] == "ignored"
+    assert questions["needs_input_reason"]["selected_id"] is None
+    assert all(option["probability"] is None for option in questions["needs_input_reason"]["options"])
+    assert audit["selected"] == {"operation": "CLICK", "action_id": "e3", "target_id": "2", "target_label": "Go"}
+    assert audit["model"] == result["model"] == model.MODEL + "-20260917"
+    assert audit["latency_ms"] == result["latency_ms"]
+    assert audit["request_bytes"] == result["request_bytes"]
+    json.dumps(audit, allow_nan=False)
+
+
+@pytest.mark.parametrize("bad", [None, True, False, "0.7", [], {}, float("nan"), float("inf"), -1, 2, 10**400])
+def test_audit_malformed_numbers_are_null_and_reject_required_head(monkeypatch, bad):
+    def post(_url, _key, body):
+        questions = body["questions"]
+        target = choice(questions["click_target"]["criteria"], "2")
+        target["probabilities"]["2"] = bad
+        target["confidence"] = bad
+        return {"answers": {
+            "operation": choice(questions["operation"]["criteria"], "CLICK"), "click_target": target,
+        }}
+
+    monkeypatch.setattr(model, "post_json", post)
+    with pytest.raises(model.DecisionAuditError, match="Invalid Jev") as error:
+        model.choose(page(), "Task", [])
+    audit = error.value.audit
+    target = audited_questions(audit)["click_target"]
+    selected = audited_options(target)["2"]
+    assert target["applies"] and target["validation"] == "invalid"
+    assert target["confidence"] is None and selected["probability"] is None
+    assert selected["selected"] and selected["used"] and selected["allowed"] is None
+    assert audit["selected"]["action_id"] == "e3"
+    assert audited_questions(audit)["operation"]["validation"] == "valid"
+    json.dumps(audit, allow_nan=False)
+
+
+@pytest.mark.parametrize("malformed", [None, [], "provider-private-sentinel", {"probabilities": []}])
+def test_malformed_speculative_heads_are_ignored_and_never_exposed(monkeypatch, malformed):
+    def post(_url, _key, body):
+        questions = body["questions"]
+        return {"answers": {
+            "operation": choice(questions["operation"]["criteria"], "WAIT"),
+            "click_target": malformed, "blocked_reason": malformed,
+            "provider-private-sentinel": {"text": "provider-private-sentinel"},
+        }, "reasoning": "provider-private-sentinel", "usage": {"private": "provider-private-sentinel"}}
+
+    monkeypatch.setattr(model, "post_json", post)
+    result = model.choose(page(), "Task", [])
+    questions = audited_questions(result["audit"])
+    assert result["choice"] == "wait"
+    for name in ("click_target", "blocked_reason"):
+        assert questions[name]["validation"] == "ignored"
+        assert not questions[name]["applies"]
+        assert all(option["probability"] is None and not option["used"] for option in questions[name]["options"])
+    assert "provider-private-sentinel" not in json.dumps(result["audit"], allow_nan=False)
+
+
+@pytest.mark.parametrize("head", ["operation", "click_target"])
+def test_unknown_returned_ids_are_not_added_or_echoed_in_audit(monkeypatch, head):
+    def post(_url, _key, body):
+        questions = body["questions"]
+        answers = {
+            "operation": choice(questions["operation"]["criteria"], "CLICK"),
+            "click_target": choice(questions["click_target"]["criteria"], "2"),
+        }
+        answers[head]["choice"] = "private-provider-value"
+        answers[head]["probabilities"]["private-provider-value"] = .7
+        return {"answers": answers}
+
+    monkeypatch.setattr(model, "post_json", post)
+    with pytest.raises(model.DecisionAuditError) as error:
+        model.choose(page(), "Task", [])
+    questions = audited_questions(error.value.audit)
+    assert questions[head]["selected_id"] is None
+    assert questions[head]["validation"] == "invalid"
+    assert not any(option["selected"] or option["used"] for option in questions[head]["options"])
+    if head == "operation":
+        assert not questions["click_target"]["applies"]
+    assert "private-provider-value" not in json.dumps(error.value.audit)
+    assert "private-provider-value" not in str(error.value)
+
+
+@pytest.mark.parametrize("mutation", ["missing_key", "extra_key", "sum", "non_max", "type"])
+def test_audit_preserves_selected_head_distribution_validation(monkeypatch, mutation):
+    def post(_url, _key, body):
+        questions = body["questions"]
+        target = choice(questions["click_target"]["criteria"], "2")
+        if mutation == "missing_key":
+            del target["probabilities"]["1"]
+        elif mutation == "extra_key":
+            target["probabilities"]["unknown-private-value"] = 0
+        elif mutation == "sum":
+            target["probabilities"]["2"] = .7
+        elif mutation == "non_max":
+            target["choice"] = "1"
+        else:
+            target["type"] = "score"
+        return {"answers": {
+            "operation": choice(questions["operation"]["criteria"], "CLICK"), "click_target": target,
+        }}
+
+    monkeypatch.setattr(model, "post_json", post)
+    with pytest.raises(model.DecisionAuditError) as error:
+        model.choose(page(), "Task", [])
+    target = audited_questions(error.value.audit)["click_target"]
+    assert target["validation"] == "invalid"
+    assert set(audited_options(target)) == {"1", "2"}
+
+
+@pytest.mark.parametrize("operation,reason", [("BLOCKED", "sign_in_required"), ("NEEDS_INPUT", "missing_text")])
+def test_audit_only_uses_matching_terminal_reason(monkeypatch, operation, reason):
+    def post(_url, _key, body):
+        questions = body["questions"]
+        return {"answers": {
+            "operation": choice(questions["operation"]["criteria"], operation),
+            "blocked_reason": choice(questions["blocked_reason"]["criteria"], "sign_in_required"),
+            "needs_input_reason": choice(questions["needs_input_reason"]["criteria"], "missing_text"),
+        }}
+
+    monkeypatch.setattr(model, "post_json", post)
+    audit = model.choose(page(), "Task", [])["audit"]
+    questions = audited_questions(audit)
+    assert {name for name, question in questions.items() if question["applies"]} == {
+        "operation", operation.lower() + "_reason",
+    }
+    assert audit["selected"]["operation"] == operation
+    assert audit["selected"]["action_id"] is None
+    assert audit["selected"]["target_id"] == reason
+
+
+def test_audit_fill_labels_preserve_exact_offered_payloads(monkeypatch):
+    values = ["  first exact  ", "second"]
+
+    def post(_url, _key, body):
+        questions = body["questions"]
+        return {"answers": {
+            "operation": choice(questions["operation"]["criteria"], "TYPE_TEXT"),
+            "type_text_target": choice(questions["type_text_target"]["criteria"], "1@v2"),
+        }}
+
+    monkeypatch.setattr(model, "post_json", post)
+    audit = model.choose(page(), "Task", [], values)["audit"]
+    options = audited_options(audited_questions(audit)["type_text_target"])
+    assert options["1@v1"]["label"] == "Search — v1:   first exact  "
+    assert options["1@v2"]["label"] == "Search — v2: second"
+    assert options["1@v2"]["used"] and not options["1@v1"]["used"]
+    assert audit["selected"]["action_id"] == "e1"
+
+
+@pytest.mark.parametrize("response", [
+    None, [], {}, {"answers": []}, {"answers": {}, "model": "private-provider-value"},
+])
+def test_invalid_response_has_safe_audit(monkeypatch, response):
+    monkeypatch.setattr(model, "post_json", Mock(return_value=response))
+    with pytest.raises(model.DecisionAuditError) as error:
+        model.choose(page(), "Task", [])
+    audit = error.value.audit
+    assert audited_questions(audit)["operation"]["validation"] == "invalid"
+    assert all(not option["used"] for question in audit["questions"] for option in question["options"])
+    assert "private-provider-value" not in json.dumps(audit, allow_nan=False)
+
+
+@pytest.mark.parametrize("failure,expected", [
+    (ValueError("OpenRouter returned invalid JSON; no action executed."), "invalid JSON"),
+    (RuntimeError("OpenRouter returned HTTP 503; no action executed."), "HTTP 503"),
+    (RuntimeError("private-provider-value"), "Model response unavailable"),
+])
+def test_failed_response_audit_has_no_fabricated_probabilities(monkeypatch, failure, expected):
+    monkeypatch.setattr(model, "post_json", Mock(side_effect=failure))
+    with pytest.raises(model.DecisionAuditError, match=expected) as error:
+        model.choose(page(), "Task", [])
+    audit = error.value.audit
+    assert audit["model"] is None
+    assert all(option["probability"] is None for question in audit["questions"] for option in question["options"])
+    assert "private-provider-value" not in str(error.value)
+    assert "private-provider-value" not in json.dumps(audit, allow_nan=False)
+
+
+def test_credential_errors_remain_outside_model_audit_wrapper(monkeypatch):
+    class FakeCredentialError(RuntimeError):
+        pass
+
+    failure = FakeCredentialError("Credential connection required")
+    post = Mock()
+    monkeypatch.setattr(model, "get_openrouter_key", Mock(side_effect=failure))
+    monkeypatch.setattr(model, "post_json", post)
+    with pytest.raises(FakeCredentialError) as error:
+        model.choose(page(), "Task", [])
+    assert error.value is failure
+    post.assert_not_called()
+
+
+def test_ignored_head_selection_with_invalid_distribution_does_not_gate_execution(monkeypatch):
+    def post(_url, _key, body):
+        questions = body["questions"]
+        return {"answers": {
+            "operation": choice(questions["operation"]["criteria"], "DONE"),
+            "click_target": {
+                "choice": "2", "confidence": float("nan"),
+                "probabilities": {"1": True, "2": .12, "private-provider-value": .88},
+            },
+        }}
+
+    monkeypatch.setattr(model, "post_json", post)
+    result = model.choose(page(), "Task", [])
+    target = audited_questions(result["audit"])["click_target"]
+    options = audited_options(target)
+    assert result["operation"] == "DONE"
+    assert target["selected_id"] == "2" and target["confidence"] is None
+    assert target["validation"] == "ignored" and not target["applies"]
+    assert options["1"]["probability"] is None
+    assert options["2"]["probability"] == .12 and options["2"]["selected"] and not options["2"]["used"]
+    assert "private-provider-value" not in json.dumps(result["audit"], allow_nan=False)
