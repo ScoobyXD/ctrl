@@ -41,18 +41,25 @@ try { [System.Windows.Forms.Application]::Run($form) } finally { $timer.Dispose(
     wrapper.write_text(r'''param([string]$Root)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $Root 'scripts/Start-CtrlNativeWindow.ps1')
+$probeLaunch = @{
+    Root=$Root; Script='Debug-CTRL.ps1'; Generation='initial'
+    PidFile='debugger.pid'; Title='CTRL disposable native probe'
+}
 $probe = $null
 try {
-    Start-CtrlNativeWindow -Root $Root -Script 'Debug-CTRL.ps1' -Generation initial -PidFile debugger.pid -Title 'CTRL disposable native probe'
+    Start-CtrlNativeWindow @probeLaunch
     $first = [int][IO.File]::ReadAllText((Join-Path $Root '.ctrl/debugger.pid'))
     $probe = Get-Process -Id $first
     $handle = $probe.MainWindowHandle.ToInt64()
-    Start-CtrlNativeWindow -Root $Root -Script 'Debug-CTRL.ps1' -Generation initial -PidFile debugger.pid -Title 'CTRL disposable native probe'
+    Start-CtrlNativeWindow @probeLaunch
     $second = [int][IO.File]::ReadAllText((Join-Path $Root '.ctrl/debugger.pid'))
     @{ first=$first; second=$second; handle=$handle; responding=$probe.Responding } | ConvertTo-Json -Compress
 } finally { if ($probe -and -not $probe.HasExited) { $probe.Kill() } }
 ''', encoding="utf-8")
-    result = subprocess.run([POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(wrapper), str(root)], capture_output=True, text=True, timeout=35)
+    result = subprocess.run(
+        [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(wrapper), str(root)],
+        capture_output=True, text=True, timeout=35,
+    )
     assert result.returncode == 0, result.stderr
     evidence = json.loads(result.stdout)
     assert evidence["first"] == evidence["second"]
@@ -67,8 +74,15 @@ def test_native_helper_surfaces_real_child_startup_failure(tmp_path):
     wrapper.write_text(r'''param([string]$Root)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $Root 'scripts/Start-CtrlNativeWindow.ps1')
-Start-CtrlNativeWindow -Root $Root -Script 'Debug-CTRL.ps1' -Generation initial -PidFile debugger.pid -Title 'CTRL disposable native probe'
+$probeLaunch = @{
+    Root=$Root; Script='Debug-CTRL.ps1'; Generation='initial'
+    PidFile='debugger.pid'; Title='CTRL disposable native probe'
+}
+Start-CtrlNativeWindow @probeLaunch
 ''', encoding="utf-8")
-    result = subprocess.run([POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(wrapper), str(tmp_path)], capture_output=True, text=True, timeout=20)
+    result = subprocess.run(
+        [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(wrapper), str(tmp_path)],
+        capture_output=True, text=True, timeout=20,
+    )
     assert result.returncode != 0
     assert "failed to start (exit 7)" in result.stderr
