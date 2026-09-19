@@ -169,5 +169,39 @@
     "hybrid_blocked_by_baseline_lease": true,
     "hybrid_stop_preserved_baseline": true,
     "baseline_main_merged": false
+  },
+  "live_catalog_readiness_retest": {
+    "scenario": "catalog",
+    "validated": false,
+    "passed": false,
+    "agent_status": "error",
+    "stop_reason": null,
+    "error": "Chrome's selected tab did not become visible, focused, and ready to render. Restore or uncover that Chrome window on the current desktop, then start the task again. No page input was sent for this action.",
+    "actions": 1,
+    "elapsed_seconds": 3.38,
+    "evidence": {
+      "session": "de667f3460e4259e",
+      "catalog": {
+        "submissions": [],
+        "opened_items": [],
+        "body_view_items": []
+      },
+      "inbox": {
+        "message_count": 100,
+        "page_size": 10,
+        "list_pages": [],
+        "opened_unique": 0,
+        "body_view_unique": 0,
+        "body_view_ids": []
+      }
+    }
+  },
+  "latest_offline_verification": {
+    "python_tests_passed": 363,
+    "ruff": "passed",
+    "native_chooser_and_debuggers": "synthetic checks passed",
+    "navigation_activation": "implemented; live retest pending",
+    "native_foreground_handoff": "explicit Run/Step/Execute/Restart to verified browser PID; synthetic tests passed",
+    "main_merged": false
   }
 }
