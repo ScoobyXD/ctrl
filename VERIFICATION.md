@@ -1,5 +1,11 @@
 # Verification
 
+## Native launcher correction (2026-09-19)
+
+The user reported that chooser buttons did nothing. Earlier synthetic callback tests missed the actual defect: GUI processes were launched with `WindowStyle Hidden`, leaving their native windows invisible. The launch helper now suppresses the console while showing the WinForms window, waits for a visible debugger/control panel, and reports failures. The chooser awaits that result, shows errors, and minimizes after confirmed success.
+
+The exact production chooser launch function opened the baseline debugger in 1.86 seconds and the custom hybrid debugger in 2.30 seconds. A repeated baseline launch restored the same process/window in 1.03 seconds. All reported responding native window handles. These checks preserved both backends and submitted no browser task. Real disposable-window regressions cover visibility, repeat launch, and child startup failure. Evidence: [docs/native-launch-verification.json](docs/native-launch-verification.json).
+
 ## Current baseline and isolated hybrid update (2026-09-19)
 
 - The native Windows mode chooser opens Ultra-fast / Jev only or the separate hybrid installation. Each has its own environment, API port, task state, native debugger, and Stop controls. No task starts from choosing a mode.

@@ -47,19 +47,12 @@ if (-not $ctrlReady) {
 if ((Test-Path -LiteralPath $ctrlGenerationPath) -and [System.IO.File]::ReadAllText($ctrlGenerationPath).Trim() -ne $StopGeneration) {
     throw 'Startup cancelled by Stop.'
 }
-if (-not $NoPanel) {
-    $ctrlPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $ctrlPanelScript = Join-Path $ctrlRoot 'scripts\Control-CTRL.ps1'
-    Start-Process -FilePath $ctrlPowerShell -WindowStyle Hidden -ArgumentList @(
-        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', ('"' + $ctrlPanelScript + '"'), '-StopGeneration', $StopGeneration
-    ) | Out-Null
-}
+. (Join-Path $ctrlRoot 'scripts\Start-CtrlNativeWindow.ps1')
 if (-not $NoDebugger) {
-    $ctrlPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $ctrlDebugScript = Join-Path $ctrlRoot 'scripts\Debug-CTRL.ps1'
-    Start-Process -FilePath $ctrlPowerShell -WindowStyle Hidden -ArgumentList @(
-        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', ('"' + $ctrlDebugScript + '"'), '-StopGeneration', $StopGeneration
-    ) | Out-Null
+    Start-CtrlNativeWindow -Root $ctrlRoot -Script 'Debug-CTRL.ps1' -Generation $StopGeneration -PidFile 'debugger.pid' -Title '[CTRL] Native Debugger'
+}
+if (-not $NoPanel) {
+    Start-CtrlNativeWindow -Root $ctrlRoot -Script 'Control-CTRL.ps1' -Generation $StopGeneration -PidFile 'panel.pid' -Title '[CTRL] Control Panel'
 }
 if ($WebDashboard -and -not $NoBrowser) {
     $ctrlChrome = Join-Path $env:ProgramFiles 'Google\Chrome\Application\chrome.exe'

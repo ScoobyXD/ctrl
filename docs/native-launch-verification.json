@@ -1,0 +1,32 @@
+{
+  "date": "2026-09-19",
+  "defect": "PowerShell GUI children inherited a Hidden startup window state: process alive, managed Form.Visible true, native window invisible.",
+  "fix": "CreateNoWindow true with WindowStyle Normal for interactive GUI children; verify actual visible window before success; capture startup failures; restore existing debugger.",
+  "production_launch_function": "CtrlExperimentChooserApp.OpenInstallation",
+  "actual_launches": [
+    {
+      "mode": "baseline",
+      "pid": 37736,
+      "window_handle": 1838410,
+      "responding": true,
+      "elapsed_seconds": 1.86
+    },
+    {
+      "mode": "hybrid",
+      "pid": 6608,
+      "window_handle": 1445440,
+      "responding": true,
+      "elapsed_seconds": 2.3
+    },
+    {
+      "mode": "baseline repeat",
+      "pid": 37736,
+      "window_handle": 1838410,
+      "responding": true,
+      "elapsed_seconds": 1.03
+    }
+  ],
+  "browser_task_submitted": false,
+  "backend_restarted": false,
+  "scope": "Native application launch verified. This is not evidence that a browser task completed."
+}
