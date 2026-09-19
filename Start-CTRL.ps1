@@ -2,6 +2,11 @@ param([switch]$NoBrowser, [switch]$NoPanel, [switch]$NoDebugger, [switch]$WebDas
 $ErrorActionPreference = 'Stop'
 $ctrlRoot = $PSScriptRoot
 Set-Location -LiteralPath $ctrlRoot
+$env:CTRL_PORT = '8766'
+$env:CTRL_EXPERIMENT = 'baseline'
+$env:UV_PROJECT_ENVIRONMENT = Join-Path $ctrlRoot '.venv'
+$env:PYTHONPATH = $null
+$env:PYTHONHOME = $null
 $ctrlPython = Join-Path $ctrlRoot '.venv\Scripts\python.exe'
 $ctrlState = Join-Path $ctrlRoot '.ctrl'
 $ctrlGenerationPath = Join-Path $ctrlState 'stop-generation'
@@ -10,7 +15,7 @@ if (-not $StopGeneration) { $StopGeneration = $ctrlCurrentGeneration }
 if ($StopGeneration -ne $ctrlCurrentGeneration) { throw 'Startup cancelled by Stop.' }
 if (-not (Test-Path -LiteralPath $ctrlPython)) {
     Write-Host '[CTRL] Setting up the local Python environment...'
-    & uv sync --locked --python 3.12
+    & uv sync --locked --python 3.12 --project $ctrlRoot
     if ($LASTEXITCODE -ne 0) { throw 'Dependency setup failed. Check uv and network access.' }
 }
 if (-not (Test-Path -LiteralPath (Join-Path $ctrlRoot 'ctrl\static\index.html'))) {
