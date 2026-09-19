@@ -197,11 +197,16 @@
     }
   },
   "latest_offline_verification": {
-    "python_tests_passed": 363,
+    "python_tests_passed": 371,
     "ruff": "passed",
     "native_chooser_and_debuggers": "synthetic checks passed",
     "navigation_activation": "implemented; live retest pending",
     "native_foreground_handoff": "explicit Run/Step/Execute/Restart to verified browser PID; synthetic tests passed",
-    "main_merged": false
+    "main_merged": false,
+    "shutdown_regressions": {
+      "passed": 8,
+      "copied_script_only": true,
+      "real_installed_app_stopped_by_tests": false
+    }
   }
 }
