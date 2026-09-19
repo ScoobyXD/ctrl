@@ -7,6 +7,7 @@ using System.IO;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 
 public sealed class CtrlChoiceButton : Button {
@@ -51,7 +52,7 @@ public sealed class CtrlExperimentChooser : Form {
         ownership.Padding = new Padding(4, 8, 4, 0); main.Controls.Add(ownership, 0, 3);
         notice = Label("Ready for your selection. Local file availability is shown; no connection has been checked.", Muted);
         main.Controls.Add(notice, 0, 4);
-        baselineLaunch.Click += delegate { Launch(baselineRoot, "Baseline"); };
+        baselineLaunch.Click += delegate { Launch(baselineRoot, "Ultra-fast"); };
         hybridLaunch.Click += delegate { Launch(hybridRoot, "Hybrid experiment"); };
         baselineFolder.Click += delegate { Open(baselineRoot); };
         hybridFolder.Click += delegate { Open(hybridRoot); };
@@ -89,7 +90,7 @@ public sealed class CtrlExperimentChooser : Form {
         Label heading = Label(hybrid ? "Gemini planner + Jev" : "Ultra-fast / Jev only", Ink); heading.Font = new Font("Segoe UI", 19, FontStyle.Bold);
         card.Controls.Add(heading, 0, 1);
         card.Controls.Add(Label(hybrid
-            ? "TipTour Windows browser adaptation.\r\nGemini proposes browser subgoals; Jev chooses observed actions. Public planner summaries and Jev probabilities appear in the native debugger."
+            ? "Custom Windows hybrid experiment.\r\nGemini plans browser tasks; Jev chooses actions. Public planner summaries and Jev probabilities appear in the native debugger."
             : "The original local CTRL workflow.\r\nJev chooses from observed browser actions. Inspect offered options, probabilities, validation, and the recorded action timeline.", Muted), 0, 2);
         card.Controls.Add(Label(hybrid ? "Local port 8767   |   Emergency stop: Ctrl+Alt+Shift+H" : "Local port 8766   |   Emergency stop: Ctrl+Alt+Shift+S", accent), 0, 3);
         Label path = Label(root, Muted); path.Font = new Font("Consolas", 8); card.Controls.Add(path, 0, 4);
@@ -100,16 +101,26 @@ public sealed class CtrlExperimentChooser : Form {
         folder = Button("Open source folder", Card); folder.ForeColor = Muted; folder.Font = new Font("Segoe UI", 9); folder.FlatAppearance.BorderColor = Color.FromArgb(63, 79, 69); card.Controls.Add(folder, 0, 7);
         return card;
     }
-    void Launch(string root, string mode) {
+    async void Launch(string root, string mode) {
         if (!available(root)) { notice.Text = mode + " launcher is unavailable. No app was started."; return; }
-        try { launch(root); launchRequests++; notice.Text = mode + " launch requested. No browser task was submitted. Stop the other app before connecting Chrome."; }
-        catch (Exception error) { notice.Text = "Launch failed: " + error.Message; }
+        baselineLaunch.Enabled = hybridLaunch.Enabled = false;
+        notice.Text = "Opening " + mode + "... waiting for its debugger window.";
+        try {
+            if (testing) launch(root); else await Task.Run(delegate { launch(root); });
+            launchRequests++; if (!IsDisposed) { notice.Text = mode + " debugger is open. Enter your task there and click Run task."; if (!testing) WindowState = FormWindowState.Minimized; }
+        }
+        catch (Exception error) { if (!IsDisposed) { notice.Text = "Launch failed: " + error.Message; if (!testing) MessageBox.Show(this, error.Message, "[CTRL] Could not open " + mode, MessageBoxButtons.OK, MessageBoxIcon.Error); } }
+        finally { if (!IsDisposed) { baselineLaunch.Enabled = available(baselineRoot); hybridLaunch.Enabled = available(hybridRoot); } }
     }
     void Open(string root) {
         try { openFolder(root); folderRequests++; notice.Text = "Opened source folder: " + root; }
         catch (Exception error) { notice.Text = "Folder could not open: " + error.Message; }
     }
     protected override bool ShowWithoutActivation { get { return testing; } }
+    public void VerifyLaunchFailure() {
+        baselineLaunch.TestClick();
+        if (!notice.Text.Contains("Synthetic startup failure") || launchRequests != 0 || !baselineLaunch.Enabled || !hybridLaunch.Enabled) throw new InvalidOperationException("Launch failure was not reported or prevented retry.");
+    }
     public void Verify(string preview, List<string> launches, List<string> folders) {
         if (launches.Count != 0 || folders.Count != 0) throw new InvalidOperationException("Chooser performed an action before selection.");
         ShowInTaskbar = false; StartPosition = FormStartPosition.Manual; Location = new Point(-32000, -32000); Show(); Application.DoEvents();
@@ -144,6 +155,22 @@ public sealed class CtrlExperimentChooser : Form {
     }
 }
 public static class CtrlExperimentChooserApp {
+    public static void OpenInstallation(string root) {
+        string powershell = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "WindowsPowerShell\\v1.0\\powershell.exe");
+        using (Process process = Process.Start(new ProcessStartInfo(powershell, "-NoProfile -ExecutionPolicy Bypass -File \"" + Path.Combine(root, "Start-CTRL.ps1") + "\"") { UseShellExecute = false, CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden, WorkingDirectory = root, RedirectStandardOutput = true, RedirectStandardError = true })) {
+            Task<string> output = process.StandardOutput.ReadToEndAsync(), error = process.StandardError.ReadToEndAsync();
+            if (!process.WaitForExit(60000)) throw new InvalidOperationException("Startup has not confirmed a visible debugger after 60 seconds. Inspect this install's .ctrl logs, then retry.");
+            // Descendant GUI processes may retain inherited pipes after the helper exits.
+            // The helper's exit code reports window readiness; diagnostics must never block it.
+            Task.WaitAny(new Task[] { Task.WhenAll(output, error) }, 500);
+            if (process.ExitCode != 0) {
+                string detail = error.Status == TaskStatus.RanToCompletion ? error.Result.Trim() : "";
+                if (detail == "" && output.Status == TaskStatus.RanToCompletion) detail = output.Result.Trim();
+                if (detail == "") detail = "Startup exited with code " + process.ExitCode + ". Check .ctrl/native-launch-error.log in this install.";
+                throw new InvalidOperationException(detail.Length > 1200 ? detail.Substring(0, 1200) : detail);
+            }
+        }
+    }
     public static void Run(string baselineRoot, string hybridRoot) {
         Application.EnableVisualStyles();
         string hash;
@@ -154,10 +181,7 @@ public static class CtrlExperimentChooserApp {
             if (!created) { showRequest.Set(); return; }
             try {
                 using (CtrlExperimentChooser form = new CtrlExperimentChooser(baselineRoot, hybridRoot,
-                    delegate(string root) {
-                        string powershell = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "WindowsPowerShell\\v1.0\\powershell.exe");
-                        Process.Start(new ProcessStartInfo(powershell, "-NoProfile -ExecutionPolicy Bypass -File \"" + Path.Combine(root, "Start-CTRL.ps1") + "\"") { UseShellExecute = false, CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden, WorkingDirectory = root });
-                    },
+                    OpenInstallation,
                     delegate(string root) { Process.Start(new ProcessStartInfo("explorer.exe", "\"" + root + "\"") { UseShellExecute = true }); },
                     delegate(string root) { return File.Exists(Path.Combine(root, "Start-CTRL.ps1")); }, false)) {
                     form.WatchActivation(showRequest); Application.Run(form);
@@ -170,6 +194,7 @@ public static class CtrlExperimentChooserApp {
         List<string> launches = new List<string>(), folders = new List<string>();
         using (CtrlExperimentChooser form = new CtrlExperimentChooser(@"C:\Synthetic\ctrl", @"C:\Synthetic\hybrid", delegate(string root) { launches.Add(root); }, delegate(string root) { folders.Add(root); }, delegate(string root) { return true; }, true)) form.Verify(preview, launches, folders);
         using (CtrlExperimentChooser missing = new CtrlExperimentChooser(@"C:\Synthetic\missing", @"C:\Synthetic\missing-hybrid", delegate(string root) { throw new InvalidOperationException("Missing launcher started."); }, delegate(string root) { }, delegate(string root) { return false; }, true)) { }
+        using (CtrlExperimentChooser failed = new CtrlExperimentChooser(@"C:\Synthetic\ctrl", @"C:\Synthetic\hybrid", delegate(string root) { throw new InvalidOperationException("Synthetic startup failure"); }, delegate(string root) { }, delegate(string root) { return true; }, true)) failed.VerifyLaunchFailure();
         return "{\"ok\":true,\"synthetic_only\":true,\"no_auto_launch\":true,\"repeat_launch_restores\":true,\"distinct_roots\":true,\"launch_stub_calls\":" + launches.Count + ",\"folder_stub_calls\":" + folders.Count + ",\"minimum_layout\":true}";
     }
 }

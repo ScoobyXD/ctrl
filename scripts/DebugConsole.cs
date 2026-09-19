@@ -80,6 +80,7 @@ public sealed class CtrlDebugForm : Form {
     readonly bool testing;
     readonly System.Windows.Forms.Timer timer, activationTimer;
     EventWaitHandle activationSignal;
+    public event Action NativeWindowReady;
     readonly TextBox goal, values, pageText;
     readonly ComboBox targets;
     readonly NumericUpDown maxActions;
@@ -211,6 +212,7 @@ public sealed class CtrlDebugForm : Form {
         activationTimer = new System.Windows.Forms.Timer { Interval = 200 };
         activationTimer.Tick += delegate { RestoreRequestedWindow(); };
         Shown += async delegate { if (!testing) { timer.Start(); await Poll(); } };
+        Shown += delegate { NotifyVisibleWindow(); };
         FormClosing += delegate { timer.Stop(); epoch++; };
         UpdateButtons();
     }
@@ -220,8 +222,14 @@ public sealed class CtrlDebugForm : Form {
         if (activationSignal == null || !activationSignal.WaitOne(0) || IsDisposed) return;
         if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
         if (!Visible) Show();
-        if (!testing) { BringToFront(); Activate(); }
+        if (!testing) { ShowWindow(Handle, 9); BringToFront(); Activate(); }
+        NotifyVisibleWindow();
     }
+    void NotifyVisibleWindow() { if (IsHandleCreated && IsWindowVisible(Handle) && NativeWindowReady != null) NativeWindowReady(); }
+    [DllImport("user32.dll")]
+    static extern bool IsWindowVisible(IntPtr window);
+    [DllImport("user32.dll")]
+    static extern bool ShowWindow(IntPtr window, int command);
     [DllImport("user32.dll", SetLastError = true)]
     static extern bool AllowSetForegroundWindow(uint processId);
     static void GrantForeground(int processId) { AllowSetForegroundWindow((uint)processId); }
@@ -398,7 +406,11 @@ public sealed class CtrlDebugForm : Form {
     protected override void Dispose(bool disposing) { if (disposing) { timer.Stop(); timer.Dispose(); activationTimer.Stop(); activationTimer.Dispose(); hints.Dispose(); IDisposable disposable = api as IDisposable; if (disposable != null) disposable.Dispose(); } base.Dispose(disposing); }
 
     public void Verify(CtrlDebugFakeApi fake, string preview) {
+        int visibleReadySignals = 0; NativeWindowReady += delegate { visibleReadySignals++; };
+        NotifyVisibleWindow(); if (visibleReadySignals != 0) throw new InvalidOperationException("Window readiness was published before a native window existed.");
         ShowInTaskbar = false; StartPosition = FormStartPosition.Manual; Location = new Point(-32000, -32000); Show(); Application.DoEvents();
+        ShowWindow(Handle, 4); NotifyVisibleWindow();
+        if (visibleReadySignals == 0 || !IsWindowVisible(Handle)) throw new InvalidOperationException("Native window readiness did not verify actual visibility.");
         string testSignalName = "Local\\CTRL-Debugger-Test-" + Guid.NewGuid().ToString("N");
         using (EventWaitHandle receiver = new EventWaitHandle(false, EventResetMode.AutoReset, testSignalName)) {
             using (EventWaitHandle sender = EventWaitHandle.OpenExisting(testSignalName)) {
@@ -502,12 +514,20 @@ public static class CtrlDebugApp {
         using (EventWaitHandle showRequest = new EventWaitHandle(false, EventResetMode.AutoReset, mutexName + "-Show"))
         using (Mutex mutex = new Mutex(true, mutexName, out created)) {
             if (!created) { showRequest.Set(); return; }
+            string pidPath = Path.Combine(root, ".ctrl", "debugger.pid");
+            string processId = Process.GetCurrentProcess().Id.ToString(CultureInfo.InvariantCulture);
             try {
                 using (CtrlDebugForm form = new CtrlDebugForm(new CtrlDebugApi(), delegate {
                     string powershell = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "WindowsPowerShell\\v1.0\\powershell.exe");
                     Process.Start(new ProcessStartInfo(powershell, "-NoProfile -ExecutionPolicy Bypass -File \"" + Path.Combine(root, "Stop-CTRL.ps1") + "\" -Force") { UseShellExecute = false, CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden, WorkingDirectory = root });
-                }, false)) { form.WatchActivation(showRequest); Application.Run(form); }
-            } finally { mutex.ReleaseMutex(); }
+                }, false)) {
+                    form.NativeWindowReady += delegate { Directory.CreateDirectory(Path.GetDirectoryName(pidPath)); File.WriteAllText(pidPath, processId); };
+                    form.WatchActivation(showRequest); Application.Run(form);
+                }
+            } finally {
+                if (File.Exists(pidPath) && File.ReadAllText(pidPath).Trim() == processId) File.Delete(pidPath);
+                mutex.ReleaseMutex();
+            }
         }
     }
     public static string Verify(string preview) {
