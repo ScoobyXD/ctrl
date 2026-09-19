@@ -35,7 +35,7 @@ def request(server, path, token=None, body=None, headers=None):
 
 
 def test_task_data_and_mutations_require_token(server):
-    for path, body in [('/api/state', None), ('/api/start', {'goal': 'x'})]:
+    for path, body in [('/api/state', None), ('/api/control', None), ('/api/start', {'goal': 'x'})]:
         with pytest.raises(urllib.error.HTTPError) as error:
             request(server, path, body=body)
         assert error.value.code == 403
@@ -89,3 +89,36 @@ def test_start_rejects_invalid_action_budget(limit):
 
 def test_start_accepts_longer_explicit_budget():
     Controller.validate_start({"goal": "browse", "target_id": "tab", "max_steps": 500})
+
+
+def test_control_panel_endpoint_has_no_task_or_page_contents(server):
+    server.control.view.update(
+        goal="private task", page={"url": "https://example.org/private?q=secret", "text": "private body"},
+    )
+    token = re.search('content="([^\"]+)"', request(server, '/').read().decode())[1]
+    result = json.load(request(server, '/api/control', token))
+    assert set(result) == {"status", "running", "busy", "action_count", "current_host"}
+    assert result["current_host"] == "example.org"
+    assert "private" not in json.dumps(result)
+    assert "secret" not in json.dumps(result)
+
+
+def test_emergency_stop_never_waits_for_tab_discovery_and_cannot_be_resumed(monkeypatch):
+    from unittest.mock import Mock
+
+    from ctrl import server as module
+
+    monkeypatch.setattr(module.browser_connection, "status", lambda: {"connected": True})
+    discover = Mock(side_effect=AssertionError("Stop must never discover tabs"))
+    monkeypatch.setattr(module.browser_connection, "list_tabs", discover)
+    control = Controller()
+    control.running = True
+    control.busy = True
+    result = control.stop()
+    assert result["status"] == "stopping"
+    assert not result["running"]
+    assert control.cancel.is_set() and control.shutdown.is_set()
+    discover.assert_not_called()
+    control.busy = False
+    with pytest.raises(RuntimeError, match="agent is off"):
+        control.submit("credentials", {})

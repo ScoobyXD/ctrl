@@ -27,6 +27,7 @@ class Controller:
         self.lock = threading.RLock()
         self.cancel = threading.Event()
         self.shutdown = threading.Event()
+        self.closed = False
         self.agent = None
         self.worker = None
         self.busy = False
@@ -36,9 +37,9 @@ class Controller:
         self.tabs = []
         self.view = {"status": "idle", "page": None, "goal": "", "history": [], "decision": None, "values": []}
 
-    def state(self):
+    def state(self, *, discover_tabs=True):
         browser = browser_connection.status()
-        if browser.get("connected") and not self.tabs:
+        if discover_tabs and browser.get("connected") and not self.tabs:
             try:
                 self.tabs = browser_connection.list_tabs()
             except RuntimeError:
@@ -55,6 +56,25 @@ class Controller:
                 "model": MODEL,
                 "max_steps": self.view.get("max_steps", MAX_STEPS),
             }
+
+    def control_state(self):
+        """Small control-panel status; never reads Chrome or returns page/task text."""
+        with self.lock:
+            return {
+                "status": "stopping" if self.shutdown.is_set() else self.view["status"],
+                "busy": self.busy, "running": self.running,
+                "action_count": len(self.view.get("history", [])),
+                "current_host": urlsplit((self.view.get("page") or {}).get("url", "")).hostname or "",
+            }
+
+    def stop(self):
+        # The latch prevents a concurrent/new Run from clearing the cancellation signal.
+        with self.lock:
+            self.shutdown.set()
+            self.cancel.set()
+            self.running = False
+        self.pause()
+        return self.control_state()
 
     def capture(self):
         if self.agent is None:
@@ -92,7 +112,7 @@ class Controller:
                 self.capture()
             if self.view["status"] not in {"idle", "done", "blocked", "needs_input", "error"}:
                 self.view["status"] = "pausing" if self.busy else "paused"
-        return self.state()
+        return self.state(discover_tabs=False)
 
     def submit(self, name, body):
         if name == "pause":
@@ -102,6 +122,8 @@ class Controller:
         if name == "start":
             self.validate_start(body)
         with self.lock:
+            if self.shutdown.is_set():
+                raise RuntimeError("The agent is off. Restart it from the CTRL Control Panel.")
             if self.busy:
                 raise RuntimeError("An operation is already in progress. Pause it or wait for it to finish.")
             if name in {"run", "step", "predict", "act", "supply_values"} and self.agent is None:
@@ -229,6 +251,10 @@ class Controller:
                 self.busy = False
 
     def close(self):
+        with self.lock:
+            if self.closed:
+                return
+            self.closed = True
         self.shutdown.set()
         self.pause()
         if self.worker and self.worker.is_alive():
@@ -300,6 +326,8 @@ def make_server(port=8766, controller=None):
             if not self.allowed(api=path.startswith("/api/")):
                 return
             try:
+                if path == "/api/control":
+                    return self.send(200, control.control_state())
                 if path == "/api/state":
                     return self.send(200, control.state())
                 if path == "/api/tabs":
@@ -333,8 +361,8 @@ def make_server(port=8766, controller=None):
                 if not path.startswith("/api/"):
                     return self.send(404, {"error": "Not found"})
                 if path == "/api/shutdown":
-                    control.pause()
-                    self.send(200, {"status": "stopping"})
+                    result = control.stop()
+                    self.send(200, result)
                     threading.Thread(target=server.shutdown, daemon=True).start()
                     return
                 self.send(202, control.submit(path.removeprefix("/api/"), body))

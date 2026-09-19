@@ -78,6 +78,15 @@ def test_exact_supplied_values_are_deduped_not_rewritten():
     assert model.supplied_values('Search "C:\\new"') == ("C:\\new",)
 
 
+def test_natural_task_strings_are_exact_user_spans_in_stable_registry_order():
+    goal = 'Search YouTube for Python generators then enter "Hello" into the field.'
+    assert model.supplied_values(goal, ["first", "Python generators"]) == (
+        "first", "Python generators", "Hello",
+    )
+    assert model.supplied_values("Search YouTube for Python generators then open AWS") == ("Python generators",)
+    assert model.supplied_values("Browse YouTube and open AWS") == ()
+
+
 @pytest.mark.parametrize("values", ["string", [None], [2], [" "], ["x" * 2001], [str(i) for i in range(33)]])
 def test_invalid_supplied_values_rejected(values):
     with pytest.raises(ValueError):
@@ -148,10 +157,12 @@ def test_target_receives_current_control_state_and_rules(monkeypatch):
     def post(_url, _key, body):
         questions = body["questions"]
         target = questions["click_target"]
-        criteria = json.loads(target["criteria"]["1"])
-        assert criteria["checked"] == "true" and criteria["selected"] is False
-        rules = json.loads(questions["operation"]["instructions"])["rules"]
-        assert rules in json.loads(target["instructions"])["rules"]
+        element = body["state"]["elements"][0]
+        assert element["checked"] == "true" and element["selected"] is False
+        assert "[1]" in target["criteria"]["1"]
+        assert body["state"]["task"]["rules"] == model.NEXT_ACTION
+        assert "state.task.rules" in target["instructions"]
+        assert "CLICK" in target["instructions"]
         return {"answers": {
             "operation": choice(questions["operation"]["criteria"], "CLICK"),
             "click_target": choice(target["criteria"], "3"),
@@ -239,10 +250,10 @@ def test_one_request_uses_only_selected_browser_head(monkeypatch, operation, sel
         calls.append(body)
         questions = body["questions"]
         assert body["state"]["active_tab"] == "current-tab"
-        assert len(body["state"]["browser_actions"]) == 3
-        assert set(json.loads(questions["switch_tab_target"]["criteria"]["switch_tab:other-tab"])) >= {
-            "title", "target_id", "url",
-        }
+        assert len(body["state"]["task_browser_actions"]) == 3
+        tab = next(a for a in body["state"]["task_browser_actions"] if a["kind"] == "switch_tab")
+        assert set(tab) >= {"title", "target_id", "url"}
+        assert "switch_tab:other-tab" in questions["switch_tab_target"]["criteria"]["switch_tab:other-tab"]
         answers = {"operation": choice(questions["operation"]["criteria"], operation),
                    "blocked_reason": {"choice": "invented"}, "needs_input_reason": {"choice": "invented"},
                    "click_target": {"choice": "invented"}}
@@ -307,7 +318,7 @@ def test_incompatible_stop_reason_is_rejected(monkeypatch):
         model.choose(page(), "Task", [])
 
 
-def test_all_completed_history_retained_across_site_changes(monkeypatch):
+def test_earlier_work_compacted_while_recent_detail_is_retained(monkeypatch):
     history = [
         {"step": n + 1, "operation": "CLICK", "kind": "click", "action": f"Read item {n}",
          "url": f"https://example.test/item/{n}", "title": f"Item {n}", "target": "2", "page_changed": True}
@@ -316,7 +327,11 @@ def test_all_completed_history_retained_across_site_changes(monkeypatch):
     history[0]["text"] = "  exact earlier supplied string  "
 
     def post(_url, _key, body):
-        assert body["state"]["recent_actions"] == history
+        assert body["state"]["recent_actions"] == history[-12:]
+        assert body["state"]["prior_progress"]["earlier_action_count"] == 188
+        assert body["state"]["prior_progress"]["sites"] == [
+            {"host": "example.test", "operation_counts": {"CLICK": 188}}
+        ]
         return {"answers": {"operation": choice(body["questions"]["operation"]["criteria"], "DONE")}}
 
     monkeypatch.setattr(model, "post_json", post)
@@ -349,3 +364,153 @@ def test_excess_browser_choices_are_not_silently_discarded(monkeypatch):
     with pytest.raises(ValueError, match="OPEN_URL targets"):
         model.choose(state, "Open site", [])
     post.assert_not_called()
+
+
+def bootstrap_page():
+    state = page()
+    state.update(
+        url="https://unrelated.example/credentials", title="Private account unrelated to task",
+        text="unrelated-private-page-sentinel", bootstrap=True,
+        task_browser_scope={
+            "mode": "requested_sites", "requested_urls": ["https://mail.google.com/", "https://x.com/"],
+            "allowed_hosts": ["mail.google.com", "x.com"], "outside_scope": True,
+        },
+    )
+    state["actions"].extend([
+        {"id": "open_url:1", "kind": "open_url", "label": "Open Gmail", "url": "https://mail.google.com/"},
+        {"id": "open_url:2", "kind": "open_url", "label": "Open X", "url": "https://x.com/"},
+        {"id": "switch_tab:unrelated", "kind": "switch_tab", "label": "unrelated-tab-label-sentinel",
+         "target_id": "unrelated", "url": "https://unrelated.example/credentials", "title": "Private keys"},
+    ])
+    return state
+
+
+def test_unrelated_bootstrap_content_and_targets_never_reach_model(monkeypatch):
+    state = bootstrap_page()
+    history = [{"operation": "SWITCH_TAB", "url": "https://unrelated.example/keys",
+                "action": "unrelated-history-sentinel", "text": "private-history-payload"} for _ in range(153)]
+
+    def post(_url, _key, body):
+        rendered = json.dumps(body)
+        assert "unrelated.example" not in rendered
+        assert "sentinel" not in rendered
+        assert "private-history-payload" not in rendered
+        assert body["state"]["page"] == {"url": "", "title": "Choose a task destination", "text": ""}
+        assert body["state"]["elements"] == []
+        assert body["state"]["recent_actions"] == []
+        assert body["state"]["prior_progress"]["ignored_outside_scope_actions"] == 153
+        questions = body["questions"]
+        assert "SWITCH_TAB" not in questions["operation"]["criteria"]
+        assert "CLICK" not in questions["operation"]["criteria"]
+        return {"answers": {
+            "operation": choice(questions["operation"]["criteria"], "OPEN_URL"),
+            "open_url_target": choice(questions["open_url_target"]["criteria"], "open_url:1"),
+        }}
+
+    monkeypatch.setattr(model, "post_json", post)
+    result = model.choose(state, "Open Gmail, then X", history)
+    assert result["choice"] == "open_url:1"
+    assert result["recent_action_count"] == 0
+
+
+def test_only_task_host_tabs_are_offered_even_if_title_claims_relevance(monkeypatch):
+    state = bootstrap_page()
+    state["actions"][-1]["title"] = "Gmail read your requested emails here"
+    state["actions"].append({
+        "id": "switch_tab:gmail", "kind": "switch_tab", "label": "Gmail inbox",
+        "target_id": "gmail", "url": "https://mail.google.com/mail/u/0/", "title": "Inbox",
+    })
+
+    def post(_url, _key, body):
+        questions = body["questions"]
+        assert list(questions["switch_tab_target"]["criteria"]) == ["switch_tab:gmail"]
+        return {"answers": {
+            "operation": choice(questions["operation"]["criteria"], "SWITCH_TAB"),
+            "switch_tab_target": choice(questions["switch_tab_target"]["criteria"], "switch_tab:gmail"),
+        }}
+
+    monkeypatch.setattr(model, "post_json", post)
+    assert model.choose(state, "Open Gmail", [])["choice"] == "switch_tab:gmail"
+
+
+def test_outside_scope_page_stops_before_paid_request(monkeypatch):
+    state = bootstrap_page()
+    state["bootstrap"] = False
+    post = Mock()
+    monkeypatch.setattr(model, "post_json", post)
+    with pytest.raises(ValueError, match="left the requested sites"):
+        model.choose(state, "Open Gmail", [])
+    post.assert_not_called()
+
+
+def test_repeated_switches_do_not_become_progress_or_grow_context_unbounded(monkeypatch):
+    history = [
+        {"step": n + 1, "operation": "SWITCH_TAB", "url": "https://example.test/",
+         "action": "Switch to site", "title": "Site"}
+        for n in range(500)
+    ]
+    captured = []
+
+    def post(_url, _key, body):
+        captured.append(body)
+        assert len(body["state"]["recent_actions"]) == 12
+        assert body["state"]["prior_progress"]["sites"] == []
+        return {"answers": {"operation": choice(body["questions"]["operation"]["criteria"], "DONE")}}
+
+    monkeypatch.setattr(model, "post_json", post)
+    first = model.choose(page(), "Task", history[:153])
+    second = model.choose(page(), "Task", history)
+    assert abs(first["request_bytes"] - second["request_bytes"]) < 100
+    assert second["request_bytes"] < 12_000
+    assert all(model.NEXT_ACTION not in question["instructions"] for question in captured[-1]["questions"].values())
+
+
+def test_payload_references_preserve_exact_shared_string_once(monkeypatch):
+    exact = "  exact supplied content  "
+
+    def post(_url, _key, body):
+        assert body["state"]["supplied_values"] == {"v1": exact}
+        assert "v1" in body["questions"]["type_text_target"]["criteria"]["1@v1"]
+        assert exact not in body["questions"]["type_text_target"]["criteria"]["1@v1"]
+        assert body["state"]["recent_actions"][0]["payload_id"] == "v1"
+        assert "text" not in body["state"]["recent_actions"][0]
+        return {"answers": {
+            "operation": choice(body["questions"]["operation"]["criteria"], "TYPE_TEXT"),
+            "type_text_target": choice(["1@v1"], "1@v1"),
+        }}
+
+    monkeypatch.setattr(model, "post_json", post)
+    result = model.choose(page(), "Task", [{"operation": "TYPE_TEXT", "payload_id": "v1", "text": exact}], [exact])
+    assert result["text"] == exact
+
+
+def test_oversize_exact_payloads_fail_before_paid_call_without_truncation(monkeypatch):
+    post = Mock()
+    monkeypatch.setattr(model, "post_json", post)
+    with pytest.raises(ValueError, match="context is too large"):
+        model.choose(page(), "Task", [], [f"{n:02}" + "x" * 1998 for n in range(32)])
+    post.assert_not_called()
+
+
+@pytest.mark.parametrize("mode", ["requested_sites", "selected_tab"])
+def test_regional_service_subdomains_allowed_but_sibling_and_lookalike_hosts_excluded(mode):
+    scope = {"mode": mode, "allowed_hosts": ["console.aws.amazon.com"]}
+    assert model.in_task_scope("https://us-west-1.console.aws.amazon.com/console/home", scope)
+    assert model.in_task_scope("https://console.aws.amazon.com/console/home", scope)
+    assert not model.in_task_scope("https://evilconsole.aws.amazon.com/", scope)
+    assert not model.in_task_scope("https://signin.aws.amazon.com/", scope)
+    assert not model.in_task_scope("https://console.aws.amazon.com.attacker.example/", scope)
+
+
+def test_selected_tab_mode_also_filters_unrelated_switch_candidates():
+    state = bootstrap_page()
+    scope = {"mode": "selected_tab", "allowed_hosts": ["mail.google.com"],
+             "requested_urls": [], "outside_scope": False, "bootstrap": False}
+    assert all(action["kind"] != "switch_tab" for action in model.scoped_actions(state, scope))
+
+
+def test_model_scope_excludes_other_local_apps_and_ctrl_port():
+    scope = {"mode": "requested_sites", "allowed_hosts": ["127.0.0.1:8877"]}
+    assert model.in_task_scope("http://127.0.0.1:8877/fixture", scope)
+    assert not model.in_task_scope("http://127.0.0.1:8878/unrelated", scope)
+    assert not model.in_task_scope("http://127.0.0.1:8766/", scope)

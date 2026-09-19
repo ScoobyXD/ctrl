@@ -42,6 +42,11 @@ let serverMessage = '';
 let previousStatus = '';
 let initialized = false;
 let targetSelectionDirty = false;
+let shutdownRequested = false;
+let shutdownConfirmed = false;
+let shutdownFailed = false;
+let pollFailures = 0;
+let pollTimer: number | undefined;
 let startingTask: { goal: string; target_id: string; previousGoal: string | undefined; previousStarted: unknown } | null = null;
 
 const object = (value: unknown): JsonObject => typeof value === 'object' && value !== null ? value as JsonObject : {};
@@ -54,16 +59,22 @@ const button = (id: string) => element<HTMLButtonElement>(id);
 const isBusy = () => requestPending || Boolean(state.busy) || Boolean(state.running);
 
 async function api(path: string, body?: JsonObject): Promise<unknown> {
+  if (shutdownRequested && path !== '/api/shutdown') throw new Error('The agent is being turned off. Restart from CTRL Control Panel.');
+  const abort = path === '/api/shutdown' ? new AbortController() : undefined;
+  const timeout = abort ? window.setTimeout(() => abort.abort(), 1800) : undefined;
+  try {
   const response = await fetch(path, {
     method: body === undefined ? 'GET' : 'POST',
     headers: { Accept: 'application/json', 'X-CTRL-Token': token, ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
     credentials: 'same-origin',
+    ...(abort ? { signal: abort.signal } : {}),
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
   const contentType = response.headers.get('content-type') ?? '';
   const result: unknown = contentType.includes('application/json') ? await response.json() : null;
   if (!response.ok) throw new Error(string(first(object(result).error, object(result).detail, `Request failed (${response.status}).`)));
   return result;
+  } finally { if (timeout !== undefined) window.clearTimeout(timeout); }
 }
 
 function showError(message: string) {
@@ -73,17 +84,18 @@ function showError(message: string) {
 }
 
 function renderButtons() {
-  const busy = isBusy();
+  const busy = isBusy() || shutdownRequested;
   const hasGoal = Boolean(goal.value.trim());
   for (const id of ['run-button', 'step-button', 'predict-button']) button(id).disabled = !connected || busy || !hasGoal;
-  button('pause-button').disabled = !connected || !(state.running || state.busy);
+  button('pause-button').disabled = !connected || shutdownRequested || !(state.running || state.busy);
+  button('emergency-stop').disabled = shutdownConfirmed || (shutdownRequested && !shutdownFailed);
   for (const id of ['connect-button', 'credentials-button', 'refresh-tabs', 'reset-button']) button(id).disabled = !connected || busy;
   const fingerprint = first(state.decision?.fingerprint, state.fingerprint);
   button('act-button').disabled = !connected || busy || !fingerprint || !state.decision || isDraft();
   tabs.disabled = busy || tabs.options.length === 0 || !tabs.options[0]?.value;
-  goal.readOnly = Boolean(state.running);
-  values.readOnly = Boolean(state.running);
-  maxSteps.readOnly = Boolean(state.running);
+  goal.readOnly = Boolean(state.running) || shutdownRequested;
+  values.readOnly = Boolean(state.running) || shutdownRequested;
+  maxSteps.readOnly = Boolean(state.running) || shutdownRequested;
 }
 
 function isDraft(): boolean {
@@ -259,9 +271,18 @@ function render() {
   previousStatus = status;
   const error = string(state.error);
   if (error) showError(error);
+  if (shutdownRequested) {
+    const message = shutdownConfirmed ? 'Agent is off — restart from CTRL Control Panel.' : shutdownFailed ? 'Stop could not be confirmed. Use CTRL Control Panel or Ctrl + Alt + Shift + S.' : 'Turning the agent off…';
+    setText('session-label', shutdownConfirmed ? 'Agent is off' : shutdownFailed ? 'Stop needs your attention' : 'Turning the agent off');
+    setText('shutdown-notice', message);
+    element('shutdown-notice').hidden = false;
+    element('session-status').dataset.tone = shutdownConfirmed ? 'idle' : 'error';
+    setText('emergency-stop', shutdownConfirmed ? 'AGENT IS OFF' : shutdownFailed ? 'RETRY STOP' : 'TURNING OFF…');
+  }
 }
 
 function consumeState(result: unknown) {
+  if (shutdownRequested) return;
   const data = object(result);
   const next = data.state && typeof data.state === 'object' ? object(data.state) : data;
   if ('status' in next || 'page' in next || 'history' in next || 'credentials' in next) {
@@ -300,7 +321,7 @@ function consumeState(result: unknown) {
 }
 
 async function command(action: () => Promise<void>) {
-  if (requestPending) return;
+  if (requestPending || shutdownRequested) return;
   requestPending = true;
   dismissedError = '';
   showError('');
@@ -339,14 +360,31 @@ async function startOrContinue(mode: 'run' | 'step' | 'predict') {
 
 async function waitUntilIdle(): Promise<boolean> {
   const started = Date.now();
-  while (state.busy) {
+  while (state.busy && !shutdownRequested) {
     if (Date.now() - started > 120_000) throw new Error('This operation is taking longer than expected. Pause it or wait for the current request to finish.');
     await new Promise<void>((resolve) => window.setTimeout(resolve, 300));
     consumeState(await api('/api/state'));
   }
   if (state.error) throw new Error(string(state.error));
-  return state.status !== 'paused' && state.status !== 'pausing';
+  return !shutdownRequested && state.status !== 'paused' && state.status !== 'pausing';
 }
+
+button('emergency-stop').addEventListener('click', () => {
+  if (shutdownConfirmed || (shutdownRequested && !shutdownFailed)) return;
+  shutdownRequested = true;
+  shutdownFailed = false;
+  if (pollTimer !== undefined) window.clearTimeout(pollTimer);
+  render();
+  void api('/api/shutdown', {}).then(() => {
+    shutdownConfirmed = true;
+    connected = false;
+    state = { ...state, running: false, busy: false, decision: null, status: 'stopped' };
+    render();
+  }).catch(() => {
+    shutdownFailed = true;
+    render();
+  });
+});
 
 button('run-button').addEventListener('click', () => void command(() => startOrContinue('run')));
 button('step-button').addEventListener('click', () => void command(() => startOrContinue('step')));
@@ -382,17 +420,25 @@ async function refreshTabs() {
 }
 
 async function poll() {
+  if (shutdownRequested) return;
   try {
     const result = await api('/api/state');
     connected = true;
+    pollFailures = 0;
     serverMessage = '';
     consumeState(result);
   } catch {
+    if (shutdownRequested) return;
     connected = false;
-    serverMessage = 'Local app is unavailable';
+    pollFailures += 1;
+    serverMessage = 'Local app is off or unreachable';
+    if (pollFailures >= 3) {
+      setText('shutdown-notice', 'Restart from CTRL Control Panel, then reload this page.');
+      element('shutdown-notice').hidden = false;
+    }
     render();
   } finally {
-    window.setTimeout(() => void poll(), document.hidden ? 1800 : 600);
+    if (!shutdownRequested && pollFailures < 3) pollTimer = window.setTimeout(() => void poll(), document.hidden ? 1800 : 600);
   }
 }
 

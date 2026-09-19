@@ -4,7 +4,7 @@ import base64
 import time
 from pathlib import Path
 
-from .browser import ActionPaused, Browser, StalePage
+from .browser import ActionPaused, Browser, StalePage, fingerprint
 from .model import action_space, choose, decision_space, supplied_values
 from .navigation import navigation_urls
 from .questions import MAX_STEPS
@@ -18,6 +18,41 @@ STOP_REASONS = {
     "missing_address": "Add the site's full web address under Text to enter, then resume.",
     "ambiguous_goal": "Specify the remaining action more precisely, then start the updated task.",
 }
+
+
+NAVIGATION_KINDS = {"switch_tab", "open_url", "back"}
+
+
+def navigation_cycle(history, proposed):
+    """Stop repeated navigation before input, independently of model confidence."""
+    if proposed.get("kind") not in NAVIGATION_KINDS:
+        return False
+    destinations = []
+    for entry in reversed(history):
+        if entry.get("kind") == "wait":
+            continue
+        if entry.get("kind") not in NAVIGATION_KINDS:
+            break
+        destinations.append(entry.get("navigation_destination", entry.get("url", "")))
+        if len(destinations) == 7:
+            break
+    destinations.reverse()
+    destinations.append(proposed.get("url", ""))
+    # AA, ABAB, ABCABC, or ABCDABCD. Ordinary work between visits resets this guard.
+    return any(
+        len(destinations) >= size * 2
+        and all(destinations[-size:])
+        and destinations[-size:] == destinations[-2 * size:-size]
+        for size in range(1, 5)
+    )
+
+
+def content_fingerprint(page):
+    """Unrelated tab titles and browser metadata never count as page progress."""
+    return fingerprint({
+        "url": page["url"], "text": page.get("text", ""), "scroll": page.get("scroll", {}),
+        "actions": [action for action in page["actions"] if action["kind"] not in NAVIGATION_KINDS],
+    })
 
 
 class Agent:
@@ -60,7 +95,7 @@ class Agent:
             started_at=None,
             record=bool(self.record_dir),
         )
-        if self.record_dir:
+        if self.record_dir and page.get("screenshot"):
             self.record_dir.mkdir(parents=True, exist_ok=True)
             (self.record_dir / "000000.jpg").write_bytes(base64.b64decode(page["screenshot"]))
 
@@ -127,10 +162,17 @@ class Agent:
             if not state["browser"].fresh(state["page"]):
                 state["page"] = state["browser"].observe(screenshot=self.screenshots)
             state["decision"] = None
+            if state["page"].get("scope_blocked"):
+                state["status"] = "blocked"
+                state["stop_reason"] = str(state["page"]["scope_blocked"])
+                self._elapsed()
+                return self.snapshot()
             if len(state["decisions"]) >= state.get("max_steps", MAX_STEPS) * 2:
                 state["status"] = "blocked"
                 state["stop_reason"] = "Reached the model-decision limit before completing the task."
                 self._elapsed()
+                return self.snapshot()
+            if self._pause_requested():
                 return self.snapshot()
             state["decision"] = choose(state["page"], state["goal"], state["history"], self.values)
             state["decisions"].append(
@@ -184,6 +226,14 @@ class Agent:
                 )
                 self._elapsed()
                 return self.snapshot()
+            if navigation_cycle(state["history"], action):
+                state["status"] = "blocked"
+                state["stop_reason"] = (
+                    "Stopped a repeated navigation cycle before changing another tab. "
+                    "No further browser actions will run. Revise the task before restarting."
+                )
+                self._elapsed()
+                return self.snapshot()
             text = None
             if action["kind"] == "fill":
                 if candidate.get("payload_id") != decision.get("payload_id"):
@@ -203,6 +253,7 @@ class Agent:
                     "step": len(state["history"]) + 1,
                     "action": action["label"],
                     "kind": action["kind"],
+                    "navigation_destination": action.get("url") if action["kind"] in NAVIGATION_KINDS else None,
                     "choice": selected,
                     "probability": decision.get("target_probabilities", {}).get(
                         decision.get("target"), decision["probabilities"][selected]
@@ -224,12 +275,13 @@ class Agent:
             state["page"] = state["browser"].observe(screenshot=self.screenshots)
             state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
             state["history"][-1].update(
-                page_changed=state["page"]["fingerprint"] != page["fingerprint"],
+                page_changed=content_fingerprint(state["page"]) != content_fingerprint(page),
                 url=state["page"]["url"],
                 title=state["page"].get("title", ""),
                 elapsed_ms=state["elapsed_ms"],
             )
-            if state["record"]:
+            if state["record"] and state["page"].get("screenshot"):
+                self.record_dir.mkdir(parents=True, exist_ok=True)
                 (self.record_dir / f"{state['elapsed_ms']:06d}.jpg").write_bytes(
                     base64.b64decode(state["page"]["screenshot"])
                 )

@@ -33,6 +33,10 @@ def test_tab_filter_hides_browser_internals_and_ctrl_console(monkeypatch):
         "file:///private",
         "http://127.0.0.1:8765/",
         "http://localhost:8765/",
+        "http://localhost.:8765/",
+        "http://127.0.0.2:8765/",
+        "http://[::1]:8765/",
+        "http://app.localhost:8765/",
     ):
         assert not module.selectable_tab({"type": "page", "url": url})
     assert not module.selectable_tab({"type": "service_worker", "url": "https://example.com"})

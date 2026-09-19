@@ -16,7 +16,7 @@ class Node {
   querySelector(selector) { return selector === 'span' ? this.span : null; }
   setAttribute(name, value) { this.attributes[name] = value; }
 }
-async function boot(overrides = {}) {
+async function boot(overrides = {}, failurePaths = []) {
   let backend = structuredClone({ ...base, ...overrides });
   let finishPending = null;
   const calls = [], timers = [];
@@ -24,13 +24,14 @@ async function boot(overrides = {}) {
   nodes['max-steps'].value = '200';
   nodes['tab-select'].innerHTML = '<option value="">Connect Chrome</option>';
   const context = {
-    exports: {}, console, Date, Promise,
+    exports: {}, console, Date, Promise, AbortController,
     document: { hidden: false, getElementById: (id) => nodes[id], querySelector: () => ({ content: 'test-token' }) },
-    window: { setTimeout(callback, ms) { if (ms === 300) queueMicrotask(callback); else timers.push(callback); return timers.length; } },
+    window: { setTimeout(callback, ms) { if (ms === 300) queueMicrotask(callback); else timers.push(callback); return timers.length; }, clearTimeout() {} },
     async fetch(path, options) {
       assert.equal(options.headers['X-CTRL-Token'], 'test-token');
       const body = options.body ? JSON.parse(options.body) : undefined;
       calls.push({ path, body });
+      if (failurePaths.includes(path)) throw new Error('Test connection failure');
       if (path === '/api/state' && finishPending) { backend = finishPending(); finishPending = null; }
       if (path === '/api/start') {
         const previous = backend;
@@ -151,5 +152,40 @@ async function boot(overrides = {}) {
     assert.ok(app.nodes['decision-content'].innerHTML.includes(message));
   }
 
-  console.log('PASS: 14 frontend regressions — edited/completed task restart, async step sequencing, blocked reason visibility, supplied-text resume, action budget validation/hydration, server-task mismatch, stale Execute prevention, automatic tab-switch continuity, user tab drafts, full 125-action history, and missing-address/ambiguous-goal messages.');
+  app = await boot({ status: 'running', running: true, busy: true });
+  const scheduledPoll = app.timers.at(-1);
+  assert.equal(app.nodes['emergency-stop'].disabled, false);
+  app.nodes['emergency-stop'].click();
+  await settle();
+  assert.equal(app.calls.at(-1).path, '/api/shutdown');
+  assert.equal(app.nodes['emergency-stop'].textContent, 'AGENT IS OFF');
+  assert.equal(app.nodes['run-button'].disabled, true);
+  assert.match(app.nodes['shutdown-notice'].textContent, /restart from CTRL Control Panel/);
+  const afterStopCalls = app.calls.length;
+  scheduledPoll();
+  await settle();
+  assert.equal(app.calls.length, afterStopCalls);
+
+  app = await boot({}, ['/api/shutdown']);
+  app.nodes['emergency-stop'].click();
+  await settle();
+  assert.equal(app.nodes['emergency-stop'].disabled, false);
+  assert.equal(app.nodes['emergency-stop'].textContent, 'RETRY STOP');
+  assert.match(app.nodes['shutdown-notice'].textContent, /Stop could not be confirmed/);
+  assert.equal(app.nodes['run-button'].disabled, true);
+
+  app = await boot();
+  app.nodes['step-button'].click();
+  app.nodes['emergency-stop'].click();
+  await settle();
+  assert.deepEqual(app.calls.filter((call) => call.body).map((call) => call.path), ['/api/start', '/api/shutdown']);
+
+  app = await boot({}, ['/api/state']);
+  app.timers.at(-1)(); await settle();
+  app.timers.at(-1)(); await settle();
+  assert.equal(app.calls.length, 3);
+  assert.equal(app.timers.length, 2);
+  assert.match(app.nodes['shutdown-notice'].textContent, /reload this page/);
+
+  console.log('PASS: 18 frontend regressions covering task state, navigation continuity, budgets, stop reasons, emergency shutdown during a busy run, cancellation of queued actions/polling, failed-stop fallback, and offline polling limits.');
 })().catch((error) => { console.error(error); process.exitCode = 1; });

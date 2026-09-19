@@ -147,3 +147,14 @@ def test_stale_manual_preview_refreshes_without_replaying(control):
     assert state["page"]["fingerprint"] == "page-2"
     assert state["error"] is None
     control.agent.command.assert_called_once_with("act", {"fingerprint": "page-1"})
+
+
+def test_controller_shutdown_cleanup_is_idempotent(control):
+    from unittest.mock import Mock
+
+    control.agent = StubAgent()
+    control.agent.close = Mock()
+    control.close()
+    control.close()
+    control.agent.close.assert_called_once()
+    assert control.shutdown.is_set()

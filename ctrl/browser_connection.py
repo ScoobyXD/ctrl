@@ -14,6 +14,8 @@ import threading
 from pathlib import Path
 from urllib.parse import urlparse
 
+from .browser_scope import is_loopback_host, normalized_host
+
 SETUP_MESSAGE = (
     "In your normal Google Chrome, open chrome://inspect/#remote-debugging and enable "
     "'Allow remote debugging for this browser instance', then connect again."
@@ -68,7 +70,8 @@ def selectable_tab(tab: dict) -> bool:
     # Never let the agent control its own authenticated local console.
     ui_port = int(os.environ.get("CTRL_PORT", "8766"))
     try:
-        if parsed.hostname in {"127.0.0.1", "localhost", "::1"} and parsed.port == ui_port:
+        effective_port = parsed.port if parsed.port is not None else (443 if parsed.scheme == "https" else 80)
+        if is_loopback_host(normalized_host(tab.get("url", ""))) and effective_port == ui_port:
             return False
     except ValueError:
         return False

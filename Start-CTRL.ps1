@@ -1,4 +1,4 @@
-param([switch]$NoBrowser)
+param([switch]$NoBrowser, [switch]$NoPanel)
 $ErrorActionPreference = 'Stop'
 $ctrlRoot = $PSScriptRoot
 Set-Location -LiteralPath $ctrlRoot
@@ -34,6 +34,13 @@ if (-not $ctrlReady) {
         if ($ctrlProcess.HasExited) { break }
     }
     if (-not $ctrlReady) { throw 'Could not start [CTRL]. Inspect .ctrl/server-error.log.' }
+}
+if (-not $NoPanel) {
+    $ctrlPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $ctrlPanelScript = Join-Path $ctrlRoot 'scripts\Control-CTRL.ps1'
+    Start-Process -FilePath $ctrlPowerShell -WindowStyle Hidden -ArgumentList @(
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', ('"' + $ctrlPanelScript + '"')
+    ) | Out-Null
 }
 if (-not $NoBrowser) {
     $ctrlChrome = Join-Path $env:ProgramFiles 'Google\Chrome\Application\chrome.exe'

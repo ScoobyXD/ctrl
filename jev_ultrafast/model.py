@@ -4,17 +4,23 @@ import json
 import math
 import re
 import time
+from collections import Counter
+from urllib.parse import urlsplit
 
 import httpx
 
+from ctrl.browser_scope import host_allowed
 from ctrl.credentials import get_openrouter_key
 
+from .navigation import task_text_values
 from .questions import NEXT_ACTION, TARGET
 
 ENDPOINT = "https://openrouter.ai/api/alpha/decisions"
 MODEL = "typesafe/jev-1.13"
 CLIENT = httpx.Client(http2=True, timeout=25)
 MAX_HISTORY = 500
+RECENT_HISTORY = 12
+MAX_REQUEST_BYTES = 60_000
 BLOCKED_REASONS = {
     "unavailable_control": "The next required control is absent or disabled and waiting or navigation cannot help.",
     "sign_in_required": "The task needs the user to sign in or complete an authentication challenge themselves.",
@@ -38,7 +44,7 @@ def supplied_values(goal, values=None):
         raise ValueError("Supplied values must be a list of strings.")
     result = []
     quoted = [next(part for part in match.groups() if part is not None) for match in QUOTED.finditer(goal)]
-    for value in [*values, *quoted]:
+    for value in [*values, *quoted, *task_text_values(goal)]:
         if not isinstance(value, str) or not value.strip() or len(value) > 2000:
             raise ValueError("Each supplied value must contain 1–2,000 characters and cannot be blank.")
         if value not in result:
@@ -134,19 +140,93 @@ def action_space(actions):
     return elements, targets, controls
 
 
-def completed_history(history):
-    """Retain every completed step within the run budget, with compact labels."""
+def task_browser_scope(state):
+    """Copy only code-owned task boundaries, never infer relevance from tab text."""
+    scope = state.get("task_browser_scope")
+    if not isinstance(scope, dict):
+        return None
+    return {
+        "mode": scope.get("mode"),
+        "requested_urls": list(scope.get("requested_urls", [])),
+        "allowed_hosts": list(scope.get("allowed_hosts", [])),
+        "outside_scope": bool(scope.get("outside_scope")),
+        "bootstrap": bool(state.get("bootstrap")),
+    }
+
+
+def in_task_scope(url, scope):
+    if not scope:
+        return True
+    return host_allowed(url, scope["allowed_hosts"])
+
+
+def scoped_actions(state, scope):
+    if not scope:
+        return state["actions"]
+    if scope["outside_scope"] and not scope["bootstrap"]:
+        raise ValueError("The browser left the requested sites. Inspect the task before continuing.")
+    actions = []
+    for action in state["actions"]:
+        kind = action["kind"]
+        if kind == "open_url":
+            if action["url"] in scope["requested_urls"]:
+                actions.append(action)
+        elif kind == "switch_tab":
+            if in_task_scope(action["url"], scope):
+                actions.append(action)
+        elif not scope["outside_scope"] and (kind != "back" or in_task_scope(action["url"], scope)):
+            actions.append(action)
+    return actions
+
+
+def history_context(history, scope=None):
+    """Recent detail plus deterministic counts; navigation is never completed work."""
     if len(history) > MAX_HISTORY:
         raise ValueError("Completed action history exceeds the 500-action run limit.")
+    relevant = [entry for entry in history if in_task_scope(entry.get("url", ""), scope)]
+    older, recent = relevant[:-RECENT_HISTORY], relevant[-RECENT_HISTORY:]
     fields = ("step", "operation", "action", "kind", "url", "title", "target", "target_id", "text", "page_changed")
     result = []
-    for entry in history:
+    for entry in recent:
         compact = {key: entry[key] for key in fields if entry.get(key) is not None}
-        label = compact.get("action")
-        if isinstance(label, str) and len(label) > 240:
-            compact["action"] = label[:237] + "..."
+        for key, limit in (("action", 160), ("title", 160), ("url", 1000), ("text", 2000)):
+            value = compact.get(key)
+            if isinstance(value, str) and len(value) > limit:
+                compact[key] = value[:limit - 3] + "..."
+        if entry.get("payload_id"):
+            compact["payload_id"] = entry["payload_id"]
+            compact.pop("text", None)  # Exact payload remains in the shared supplied_values registry.
         result.append(compact)
-    return result
+    site_counts = {}
+    for entry in older:
+        operation = entry.get("operation")
+        if operation not in {"CLICK", "TYPE_TEXT", "SELECT", "SCROLL_UP", "SCROLL_DOWN"}:
+            continue
+        try:
+            host = urlsplit(entry.get("url", "")).hostname
+        except ValueError:
+            host = None
+        if host:
+            site_counts.setdefault(host, Counter())[operation] += 1
+    progress = {
+        "earlier_action_count": len(older),
+        "sites": [{"host": host, "operation_counts": dict(counts)} for host, counts in list(site_counts.items())[:16]],
+        "omitted_site_count": max(0, len(site_counts) - 16),
+        "ignored_outside_scope_actions": len(history) - len(relevant),
+        "meaning": "Executed DOM-operation counts only. They do not prove completed requirements or items read.",
+    }
+    return result, progress
+
+
+def target_criterion(operation, index, action):
+    """Reference shared context rather than duplicating field and payload contents."""
+    if operation == "TYPE_TEXT":
+        return f"Element [{index.split('@')[0]}], exact supplied value {action['payload_id']}."
+    if operation == "SELECT":
+        return f"Observed option [{index}] on element [{index.split(':')[0]}]."
+    if operation in {"OPEN_URL", "SWITCH_TAB"}:
+        return f"Browser action [{index}] from task_browser_actions."
+    return f"Observed element [{index}] from elements."
 
 
 def decision_space(actions, values):
@@ -171,13 +251,16 @@ def decision_space(actions, values):
 
 def choose(state, goal, history, values=None):
     values = supplied_values(goal, values)
-    elements, targets, controls = decision_space(state["actions"], values)
+    scope = task_browser_scope(state)
+    actions = scoped_actions(state, scope)
+    elements, targets, controls = decision_space(actions, values)
+    recent_actions, prior_progress = history_context(history, scope)
     labels = {
         "CLICK": "Click an observed element, menu option, autocomplete suggestion, or calendar day.",
         "TYPE_TEXT": "Replace an editable field with one exact supplied string; choose a field/string pair.",
         "SELECT": "Select an observed dropdown value.",
-        "OPEN_URL": "Open an offered destination URL in a new normal Chrome tab, preserving existing tabs.",
-        "SWITCH_TAB": "Continue in one observed browser tab relevant to the next unfinished task requirement.",
+        "OPEN_URL": "Open the next requested destination when it is not already open in a task-relevant tab.",
+        "SWITCH_TAB": "Switch only to an existing tab for the next unfinished requested site, never a random open tab.",
     }
     operations = {key: labels[key] for key in targets}
     operations.update({key: value["label"] for key, value in controls.items()})
@@ -188,15 +271,15 @@ def choose(state, goal, history, values=None):
     )
     questions = {"operation": {
         "type": "choice", "criteria": operations,
-        "instructions": json.dumps({"goal": goal, "rules": NEXT_ACTION}, ensure_ascii=False),
+        "instructions": "Choose the next operation for state.task.goal. Follow task.rules and task_browser_scope.",
     }}
     for operation, reasons in (("BLOCKED", BLOCKED_REASONS), ("NEEDS_INPUT", INPUT_REASONS)):
         questions[operation.lower() + "_reason"] = {
             "type": "choice", "criteria": reasons,
-            "instructions": json.dumps({
-                "goal": goal, "operation": operation, "rules": NEXT_ACTION,
-                "question": f"If the next operation is {operation}, choose the reason supported by current evidence.",
-            }, ensure_ascii=False),
+            "instructions": (
+                f"Assume the next operation is {operation}. Following state.task.rules, "
+                "choose the reason supported by the current task and page."
+            ),
         }
     for operation, candidates in targets.items():
         if len(candidates) > 255:
@@ -204,34 +287,38 @@ def choose(state, goal, history, values=None):
         questions[operation.lower() + "_target"] = {
             "type": "choice",
             "criteria": {
-                index: json.dumps({
-                    "target": a["label"],
-                    "current_value": a.get("current_value", a.get("value", "")),
-                    **{k: a[k] for k in (
-                        "role", "checked", "selected", "expanded", "payload_id", "text", "url", "title", "target_id"
-                    ) if k in a},
-                }, ensure_ascii=False)
+                index: target_criterion(operation, index, a)
                 for index, a in candidates.items()
             },
-            "instructions": json.dumps(
-                {"goal": goal, "operation": operation, "rules": [NEXT_ACTION, TARGET]}, ensure_ascii=False
-            ),
+            "instructions": f"Assume the next operation is {operation}. {TARGET}",
         }
     body = {
         "model": MODEL,
         "state": {
-            "page": {k: state[k] for k in ("url", "title", "text")},
+            "task": {"goal": goal, "rules": NEXT_ACTION},
+            "page": (
+                {"url": "", "title": "Choose a task destination", "text": ""}
+                if scope and scope["outside_scope"]
+                else {"url": state["url"], "title": state["title"][:240], "text": state["text"][:6000]}
+            ),
             "elements": elements,
-            "browser_actions": [
+            "task_browser_actions": [
                 {key: action[key] for key in ("id", "kind", "label", "url", "title", "target_id") if key in action}
-                for action in state["actions"] if action["kind"] in {"open_url", "switch_tab", "back"}
+                for action in actions if action["kind"] in {"open_url", "switch_tab", "back"}
             ],
+            "task_browser_scope": scope,
             "active_tab": state.get("target_id"),
             "supplied_values": {f"v{number}": value for number, value in enumerate(values, 1)},
-            "recent_actions": completed_history(history),
+            "recent_actions": recent_actions,
+            "prior_progress": prior_progress,
         },
         "questions": questions,
     }
+    request_bytes = len(json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    if request_bytes > MAX_REQUEST_BYTES:
+        raise ValueError(
+            "The decision context is too large. Narrow the task, supplied strings, or visible page before trying again."
+        )
     started = time.perf_counter()
     result = post_json(ENDPOINT, get_openrouter_key(), body)
     if "model" in result and (
@@ -268,5 +355,6 @@ def choose(state, goal, history, values=None):
         "target_probabilities": target_answer["probabilities"] if target_answer else {},
         "target_confidence": target_answer["confidence"] if target_answer else None,
         "model": result.get("model", MODEL), "usage": result.get("usage", {}),
+        "request_bytes": request_bytes, "recent_action_count": len(recent_actions),
         "latency_ms": round((time.perf_counter() - started) * 1000),
     }

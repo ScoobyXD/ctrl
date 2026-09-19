@@ -260,3 +260,76 @@ def test_browser_target_decision_executes_observed_url_not_model_text(runner):
     act(runner)
     runner.browser.act.assert_called_once_with(action, runner.state["page"], text=None)
     assert runner.state["history"][-1]["operation"] == "OPEN_URL"
+
+
+@pytest.mark.parametrize("destinations,next_url", [
+    (["https://a.test/"], "https://a.test/"),
+    (["https://a.test/", "https://b.test/", "https://a.test/"], "https://b.test/"),
+    (["https://a.test/", "https://b.test/", "https://c.test/"] * 2, "https://a.test/"),
+])
+def test_navigation_cycle_detects_repeated_destinations(destinations, next_url):
+    history = [{"kind": "switch_tab", "navigation_destination": url} for url in destinations]
+    assert loop.navigation_cycle(history, {"kind": "switch_tab", "url": next_url})
+
+
+def test_distinct_site_visits_and_useful_work_are_not_navigation_cycles():
+    history = [{"kind": "switch_tab", "navigation_destination": "https://a.test/"}]
+    assert not loop.navigation_cycle(history, {"kind": "open_url", "url": "https://b.test/"})
+    history.append({"kind": "click"})
+    assert not loop.navigation_cycle(history, {"kind": "switch_tab", "url": "https://a.test/"})
+
+
+def test_wait_does_not_hide_navigation_cycle():
+    history = [{"kind": "open_url", "navigation_destination": "https://a.test/"}, {"kind": "wait"}]
+    assert loop.navigation_cycle(history, {"kind": "open_url", "url": "https://a.test/"})
+
+
+def test_reproduced_alternating_tab_loop_stops_before_fourth_switch(runner):
+    runner.state["history"] = [
+        {"kind": "switch_tab", "navigation_destination": f"https://{host}.test/"}
+        for host in ["a", "b", "a"]
+    ]
+    action = {
+        "id": "switch_tab:b", "kind": "switch_tab", "label": "Switch to B",
+        "url": "https://b.test/", "target_id": "b",
+    }
+    runner.state["page"]["actions"].append(action)
+    runner.state["decision"] = {**decision(action["id"]), "operation": "SWITCH_TAB", "target": action["id"]}
+    result = act(runner)
+    runner.browser.act.assert_not_called()
+    assert result["status"] == "blocked"
+    assert "navigation cycle" in result["stop_reason"]
+    assert len(result["history"]) == 3
+    assert result["decision"] is None
+
+
+def test_scope_boundary_stops_before_model_request(runner, monkeypatch):
+    runner.state["page"]["scope_blocked"] = "This page is outside the task's allowed sites."
+    choose = Mock()
+    monkeypatch.setattr(loop, "choose", choose)
+    result = runner.command("tick")
+    choose.assert_not_called()
+    runner.browser.act.assert_not_called()
+    assert result["status"] == "blocked"
+    assert result["stop_reason"] == runner.state["page"]["scope_blocked"]
+
+
+def test_other_tab_metadata_is_not_progress():
+    first = page()
+    second = {**first, "target_id": "different-tab", "browser_context": {"tabs": ["new title"]}}
+    second["actions"] = [*first["actions"], {"id": "switch_tab:x", "kind": "switch_tab", "url": "https://x.test/"}]
+    assert loop.content_fingerprint(first) == loop.content_fingerprint(second)
+
+
+def test_pause_while_reading_page_prevents_new_model_request(runner, monkeypatch):
+    def fresh(_page):
+        runner.cancel_event.set()
+        return True
+
+    runner.browser.fresh.side_effect = fresh
+    choose = Mock()
+    monkeypatch.setattr(loop, "choose", choose)
+    result = runner.command("tick")
+    choose.assert_not_called()
+    runner.browser.act.assert_not_called()
+    assert result["status"] == "paused"
