@@ -48,8 +48,10 @@ class Chrome:
             session = f"session-{len(self.sessions)}"
             self.sessions[session] = params["targetId"]
             return {"sessionId": session}
-        if method in {"Target.detachFromTarget", "Target.activateTarget"}:
+        if method in {"Target.detachFromTarget", "Target.activateTarget", "Page.bringToFront"}:
             return {}
+        if method == "Browser.getWindowForTarget":
+            return {"windowId": 1, "bounds": {"windowState": "normal"}}
         if method == "Page.getNavigationHistory":
             return copy.deepcopy(self.history)
         if method == "Page.navigateToHistoryEntry":
@@ -62,6 +64,8 @@ class Chrome:
         if method == "Runtime.evaluate":
             info = self.targets[self.sessions[session_id]]
             marker = [info["url"], info["title"]]
+            if "__ctrlActivationReadiness" in params["expression"]:
+                return {"result": {"value": {"visible": True, "focused": True, "frames": 2}}}
             if module.MARKER in params["expression"]:
                 return {"result": {"value": marker}}
             if module.NAVIGATION_READY in params["expression"]:
@@ -123,7 +127,7 @@ def test_observation_offers_only_observed_tabs_supplied_urls_and_real_back_histo
     assert instance.fresh(page)
 
 
-def test_open_url_creates_background_tab_preserves_source_and_observes_destination(browser):
+def test_open_url_creates_preserved_tab_then_activates_only_destination(browser):
     instance, chrome = browser
     page = instance.observe(screenshot=False)
     action = selected(page, "open_url")
@@ -133,10 +137,13 @@ def test_open_url_creates_background_tab_preserves_source_and_observes_destinati
     assert instance.observe(screenshot=False)["url"] == action["url"]
     creates = [params for method, params, _ in chrome.calls if method == "Target.createTarget"]
     assert creates == [{"url": action["url"], "background": True}]
+    activated = [session for method, _, session in chrome.calls if method == "Page.bringToFront"]
+    assert activated == [instance.session]
+    assert chrome.sessions[activated[0]] == instance.target
     assert not any(method in {"Page.navigate", "Target.closeTarget"} for method, _, _ in chrome.calls)
 
 
-def test_switch_tab_attaches_exact_observed_target_without_navigation_or_activation(browser):
+def test_switch_tab_activates_exact_observed_target_without_navigation(browser):
     instance, chrome = browser
     page = instance.observe(screenshot=False)
     instance.act(selected(page, "switch_tab"), page)
@@ -146,6 +153,45 @@ def test_switch_tab_attaches_exact_observed_target_without_navigation_or_activat
         method in {"Page.navigate", "Target.createTarget", "Target.closeTarget", "Target.activateTarget"}
         for method, _, _ in chrome.calls
     )
+    activated = [chrome.sessions[session] for method, _, session in chrome.calls if method == "Page.bringToFront"]
+    assert activated == ["other"]
+
+
+def test_passive_attachment_and_observation_do_not_activate_tabs(browser):
+    instance, chrome = browser
+    instance.observe(screenshot=False)
+    assert not any(method in {"Page.bringToFront", "Target.activateTarget"} for method, _, _ in chrome.calls)
+
+
+@pytest.mark.parametrize("kind", ["open_url", "switch_tab"])
+def test_navigation_activation_failure_keeps_dispatch_and_cannot_replay(browser, kind):
+    instance, chrome = browser
+    page = instance.observe(screenshot=False)
+    action = selected(page, kind)
+    assert instance.act(action, page) == {"executed": action["id"]}
+    count = len(chrome.targets)
+    chrome.fail = "Page.bringToFront"
+    with pytest.raises(RuntimeError):
+        instance.observe(screenshot=False)
+    with pytest.raises(RuntimeError, match="already used"):
+        instance.act(action, page)
+    assert len(chrome.targets) == count
+    assert instance._pending_navigation is not None
+
+
+def test_pause_after_navigation_dispatch_does_not_activate_or_recreate(browser):
+    instance, chrome = browser
+    page = instance.observe(screenshot=False)
+    instance.act(selected(page, "open_url"), page)
+    instance.cancel_event = threading.Event()
+    instance.cancel_event.set()
+    with pytest.raises(module.ActionPaused):
+        instance.observe(screenshot=False)
+    assert not any(method == "Page.bringToFront" for method, _, _ in chrome.calls)
+    instance.cancel_event.clear()
+    instance.observe(screenshot=False)
+    assert sum(method == "Target.createTarget" for method, _, _ in chrome.calls) == 1
+    assert sum(method == "Page.bringToFront" for method, _, _ in chrome.calls) == 1
 
 
 @pytest.mark.parametrize("field,value", [("url", "https://changed.example/"), ("title", "Changed title")])
@@ -275,7 +321,8 @@ def test_open_waits_past_transient_blank_document_without_creating_again(browser
     monkeypatch.setattr(
         instance,
         "evaluate",
-        lambda expression: next(readiness) if expression == module.NAVIGATION_READY else evaluate(expression),
+        lambda expression, **kwargs: next(readiness)
+        if expression == module.NAVIGATION_READY else evaluate(expression, **kwargs),
     )
     monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
     assert instance.observe(screenshot=False)["url"] == action["url"]

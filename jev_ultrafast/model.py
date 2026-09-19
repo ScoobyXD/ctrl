@@ -345,10 +345,11 @@ def choose(state, goal, history, values=None):
     operations = {key: labels[key] for key in targets}
     operations.update({key: value["label"] for key, value in controls.items()})
     operations.update(
-        DONE="Every requirement is visibly satisfied.",
         BLOCKED="No supported operation can progress for a reason other than missing input text.",
         NEEDS_INPUT="Progress requires missing exact text, a destination URL, or a more specific user instruction.",
     )
+    if not state.get("bootstrap"):
+        operations["DONE"] = "Every requirement is visibly satisfied."
     questions = {"operation": {
         "type": "choice", "criteria": operations,
         "instructions": "Choose the next operation for state.task.goal. Follow task.rules and task_browser_scope.",

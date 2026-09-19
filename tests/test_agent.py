@@ -198,6 +198,16 @@ def test_done_requires_fresh_page(runner):
     assert runner.state["status"] != "done"
 
 
+def test_done_cannot_complete_neutral_bootstrap_even_with_a_fresh_page(runner):
+    runner.state["page"]["bootstrap"] = True
+    runner.state["decision"] = decision("DONE")
+    with pytest.raises(ValueError, match="before observing a requested destination"):
+        act(runner)
+    assert runner.state["status"] != "done"
+    assert runner.state["decision"] is None
+    runner.browser.act.assert_not_called()
+
+
 def test_zero_action_blocked_run_exposes_reason_and_consumed_decision(runner):
     runner.state["decision"] = {**decision("BLOCKED"), "stop_reason": "sign_in_required"}
     result = act(runner)

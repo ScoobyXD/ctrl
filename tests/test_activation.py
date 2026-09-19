@@ -163,7 +163,21 @@ def test_probe_requires_real_frames_and_resets_when_hidden():
 def test_renderer_probe_timeout_has_actionable_error_without_input(monkeypatch):
     browser, page, action, calls = activation_browser(monkeypatch)
     browser.evaluate = Mock(side_effect=RuntimeError("CDP response timed out"))
-    with pytest.raises(RuntimeError, match="No page input was sent"):
+    with pytest.raises(RuntimeError, match="No page input was sent") as error:
         browser.act(action, page)
+    assert '"probe":"unavailable"' in str(error.value)
     assert not any(name.startswith("Input.") for name, _ in calls)
     assert page["observation_id"] not in browser._consumed
+
+
+def test_readiness_diagnostics_exclude_untrusted_values(monkeypatch):
+    browser, page, action, _ = activation_browser(monkeypatch)
+    browser.evaluate = Mock(return_value={
+        "visible": "private-sentinel", "focused": False, "frames": "private-sentinel", "extra": "private-sentinel",
+    })
+    fast_clock(monkeypatch)
+    with pytest.raises(RuntimeError) as error:
+        browser.act(action, page)
+    assert "private-sentinel" not in str(error.value)
+    assert '"visible":null,"focused":false,"frames":null' in str(error.value)
+    assert '"probe":"responding"' in str(error.value)

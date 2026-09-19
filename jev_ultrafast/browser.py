@@ -144,18 +144,33 @@ class Browser:
             "Restore or uncover that Chrome window on the current desktop, then start the task again. "
             "No page input was sent for this action."
         )
+        last_readiness = {"visible": None, "focused": None, "frames": None}
+        window_state = window.get("bounds", {}).get("windowState")
+        window_state = window_state if window_state in {"normal", "minimized", "maximized", "fullscreen"} else "unknown"
+
+        def readiness_error(probe):
+            details = {"window": window_state, **last_readiness, "probe": probe}
+            return RuntimeError(error_message + " Readiness: " + json.dumps(details, separators=(",", ":")))
+
         expression = activation_readiness_expression(uuid.uuid4().hex)
         while True:
             check_cancel()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise RuntimeError(error_message)
+                raise readiness_error("responding")
             try:
                 current = self.evaluate(expression, response_timeout=min(0.5, remaining))
             except RuntimeError as error:
                 check_cancel()
-                raise RuntimeError(error_message) from error
+                raise readiness_error("unavailable") from error
             check_cancel()
+            if isinstance(current, dict):
+                last_readiness = {
+                    key: current.get(key) if type(current.get(key)) is bool else None
+                    for key in ("visible", "focused")
+                }
+                frames = current.get("frames")
+                last_readiness["frames"] = min(2, max(0, frames)) if type(frames) is int else None
             if (
                 isinstance(current, dict)
                 and current.get("visible")
@@ -423,6 +438,10 @@ class Browser:
                 url = current.get("url", "")
                 reached = url == pending["url"] or url != pending["source_url"] or pending["target_changed"]
                 if reached and urlparse(url).scheme in {"http", "https"}:
+                    if pending.get("activate"):
+                        # Navigation has already been dispatched and recorded. An
+                        # activation failure must never replay tab creation/switching.
+                        self.activate_for_input()
                     self._pending_navigation = None
                     return
             time.sleep(0.05)
@@ -455,6 +474,7 @@ class Browser:
             "url": action["url"],
             "source_url": page["url"],
             "target_changed": kind != "back",
+            "activate": kind in {"open_url", "switch_tab"},
         }
         return {"executed": action["id"]}
 

@@ -241,6 +241,8 @@ class Agent:
             if selected in {"DONE", "BLOCKED", "NEEDS_INPUT"}:
                 if decision["operation"] != selected:
                     raise ValueError("Decision operation does not match its selected action.")
+                if selected == "DONE" and page.get("bootstrap"):
+                    raise ValueError("Cannot complete the task before observing a requested destination.")
                 if not state["browser"].fresh(page):
                     state["status"] = "ready"
                     raise StalePage("Page changed since the decision. Choose again.")
