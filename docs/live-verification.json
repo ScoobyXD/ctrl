@@ -1,0 +1,38 @@
+{
+  "verified_at_utc": "2026-09-19T05:45:26.572092+00:00",
+  "goal": "Search Wikipedia for \"Ada Lovelace\", open the article, and stop when the article is visible.",
+  "outcome": "passed",
+  "browser": "Chrome/152.0.7977.83",
+  "model": "typesafe/jev-1.13-20260917",
+  "execution_surface": "Running local application API controlling normal Chrome",
+  "elapsed_ms_after_initial_observation": 5835,
+  "executed_actions": [
+    {
+      "step": 1,
+      "kind": "click",
+      "action": "Search",
+      "text": null,
+      "latency_ms": 312
+    },
+    {
+      "step": 2,
+      "kind": "fill",
+      "action": "Search Wikipedia",
+      "text": "Ada Lovelace",
+      "latency_ms": 349
+    },
+    {
+      "step": 3,
+      "kind": "click",
+      "action": "Ada Lovelace   English mathematician (1815–1852)",
+      "text": null,
+      "latency_ms": 324
+    }
+  ],
+  "final_url": "https://en.wikipedia.org/wiki/Ada_Lovelace",
+  "final_title": "Ada Lovelace - Wikipedia",
+  "visible_heading": "Ada Lovelace",
+  "result_tab_remains_open": true,
+  "error": null,
+  "scope": "One real public website task; not a universal reliability or latency benchmark."
+}
