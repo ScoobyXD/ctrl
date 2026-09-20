@@ -2,7 +2,7 @@
 
 ## Separate UIA control-options viewer
 
-The observation-only UIA milestone is available through **separate** launchers. Choose an application window, click **Observe / Refresh**, and search its native accessible controls and supported operation candidates. Selecting an option only previews it. No Jev, model, screenshot detector, or action execution runs.
+The UIA control-options viewer is available through **separate** launchers. Choose an application window, click **Observe / Refresh**, and search its native accessible controls and supported operation candidates. Observation and row selection run locally. The optional **Jev selection** preview classifies all observed options against your goal, narrows candidates in parallel rounds, and recommends one action without executing it. Remote requests start only when you explicitly start that preview.
 
 ```powershell
 pwsh -NoProfile -File ./scripts/install-uia-viewer.ps1 -Python '<CPython 3.12.13 x64 base/python.exe>'
@@ -11,7 +11,9 @@ pwsh -NoProfile -File ./scripts/start-uia-viewer.ps1
 pwsh -NoProfile -File ./scripts/start-uia-demo.ps1
 ```
 
-See [UIA setup, JSON contract, demo and actual validation](docs/UIA_VIEWER.md). The existing capture implementation and its launchers below are preserved.
+See the [UIA viewer guide](docs/UIA_VIEWER.md) for the Window picker, tabs, counts, search, export, scrolling behavior, setup and validation. The existing capture implementation and its launchers below are preserved.
+
+See [multi-stage Jev selection](docs/JEV_SELECTION.md) for setup, the classification and recovery algorithm, request budgets, and offline verification.
 
 ## Existing Capture viewer
 

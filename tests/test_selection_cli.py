@@ -1,0 +1,104 @@
+"""Offline helper contracts: explicit remote opt-in and sanitized NDJSON."""
+from contextlib import redirect_stdout
+import importlib.util
+import io
+import json
+from pathlib import Path
+import sys
+import unittest
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+from ctrl_loop import jev
+from ctrl_loop.uia_contract import build_options, new_snapshot
+
+spec = importlib.util.spec_from_file_location("jev_select_cli", ROOT / "scripts/jev-select.py")
+cli = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(cli)
+
+
+def fixture():
+    snapshot = new_snapshot(111, 222)
+    snapshot["snapshot_id"] = "cli-snapshot"
+    snapshot["target"]["title"] = "Owned fixture"
+    snapshot["elements"] = [
+        {"id": "cli-snapshot:e1", "parent_id": None, "name": "Save draft", "role": "Button",
+         "is_password": False, "value": None, "patterns": ["Invoke"], "state": {},
+         "enabled": True, "offscreen": False, "focused": False},
+    ]
+    snapshot["options"] = build_options(snapshot["elements"])
+    return {"snapshot": snapshot, "goal": "Save the draft", "run_id": "test-client"}
+
+
+def response(payload, key, *, request_id, capture_id):
+    answers = {}
+    for qid, question in payload["questions"].items():
+        options = question["criteria"]
+        winner = "promising" if "promising" in options else next(k for k in options if k != "__none__")
+        answers[qid] = {"type": "choice", "choice": winner, "confidence": 1,
+                        "probabilities": {k: int(k == winner) for k in options}}
+    return {"answers": answers, "model": jev.RESOLVED_MODEL, "provider": jev.PROVIDER,
+            "provider_request_id": "gen-mocked", "usage": {"cost": 0.001}, "latency_ms": 1,
+            "local_request": jev.request_binding(payload, request_id=request_id, capture_id=capture_id)}
+
+
+class SelectionCliTests(unittest.TestCase):
+    def invoke(self, data=None, *args):
+        body = json.dumps(fixture() if data is None else data).encode()
+        output = io.StringIO()
+        with patch.object(sys, "argv", ["jev-select.py", "--stdin", *args]), \
+             patch.object(sys, "stdin", io.TextIOWrapper(io.BytesIO(body), encoding="utf-8")), \
+             redirect_stdout(output):
+            status = cli.main()
+        return status, output.getvalue(), [json.loads(line) for line in output.getvalue().splitlines()]
+
+    def test_offline_default_never_loads_credentials_or_sends(self):
+        with patch.object(cli, "get_openrouter_key") as key, patch.object(cli, "decide") as remote, \
+             patch("socket.socket", side_effect=AssertionError("Unexpected network")):
+            code, _, records = self.invoke()
+        self.assertEqual(code, 0)
+        key.assert_not_called()
+        remote.assert_not_called()
+        self.assertEqual([r["event"] for r in records], ["result"])
+        self.assertEqual(records[0]["data"]["client_run_id"], "test-client")
+        self.assertTrue(records[0]["data"]["initial_requests"])
+
+    def test_live_stream_contains_progress_and_one_bound_preview_result(self):
+        secret = "sk-or-SYNTHETIC-TEST-ONLY"
+        with patch.object(cli, "get_openrouter_key", return_value=secret) as key, \
+             patch.object(cli, "decide", side_effect=response) as remote, \
+             patch("socket.socket", side_effect=AssertionError("Unexpected network")):
+            code, output, records = self.invoke(None, "--live")
+        self.assertEqual(code, 0)
+        key.assert_called_once_with()
+        self.assertGreaterEqual(remote.call_count, 2)
+        self.assertNotIn(secret, output)
+        self.assertTrue(any(r["event"] == "progress" for r in records))
+        result = records[-1]["data"]
+        self.assertEqual(result["status"], "selected")
+        self.assertTrue(result["preview_only"])
+        self.assertEqual(result["input_actions"], 0)
+        self.assertEqual(result["client_run_id"], "test-client")
+        self.assertEqual(result["selected_option"]["id"], "cli-snapshot:e1:activate")
+
+    def test_invalid_input_fails_before_credential_lookup(self):
+        with patch.object(cli, "get_openrouter_key") as key:
+            code, _, records = self.invoke({"snapshot": {}, "goal": "Save"}, "--live")
+        self.assertEqual(code, 1)
+        key.assert_not_called()
+        self.assertEqual(records[-1]["event"], "error")
+
+    def test_provider_exception_content_is_not_rendered(self):
+        secret = "sk-or-SYNTHETIC-TEST-ONLY"
+        with patch.object(cli, "get_openrouter_key", return_value=secret), \
+             patch.object(cli, "decide", side_effect=RuntimeError(secret)):
+            code, output, records = self.invoke(None, "--live")
+        self.assertEqual(code, 1)
+        self.assertNotIn(secret, output)
+        self.assertNotIn("Traceback", output)
+        self.assertEqual(records[-1]["event"], "error")
+
+
+if __name__ == "__main__":
+    unittest.main()

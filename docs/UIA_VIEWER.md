@@ -1,15 +1,69 @@
-# UIA control options
+# UIA viewer guide
 
-This is the observation and candidate-list milestone: select one application window, read the UIA controls it exposes, and inspect supported operation candidates. Clicking a candidate only displays its record. There is no action execution, Jev decision, model, credential lookup, OCR, screenshot capture or loop.
+The viewer reads the accessibility information exposed by one Windows application window. **Controls** shows what was observed; **Options** lists operations supported by those controls; **Jev selection preview** can recommend one option for your goal. Selecting a window, table row, or recommendation never clicks, types, scrolls, focuses, or otherwise operates the target. The optional Jev button makes remote model requests; ordinary observation and table inspection stay local.
 
-The old capture viewer, CUA adapter, YOLO detector, and Jev preview are unchanged. This implementation lives on `codex/uia-control-options` in `C:/Users/Jonat/[CTRL] Loop/worktrees/uia-control-options`, based on `a465da8`. It is not integrated into main.
+This is a manual, fixed-snapshot viewer, with no screenshot capture, OCR, action executor, or automatic agent loop. The separate capture viewer, CUA adapter, and YOLO detector are unchanged.
+
+## Quick tour
+
+1. Choose an application in **Window**. Use **Refresh windows** after opening or closing an application.
+2. Click **Observe / Refresh** to collect its current accessible controls. The previous snapshot is cleared while the helper runs. **Cancel** stops the helper and leaves no current snapshot.
+3. Inspect **Controls** and **Options**. Click a row to read its complete JSON record below the table. Resize columns, click headers to sort, and use the table's horizontal scrollbar for columns further right. Drag the divider above the details pane to give either pane more room.
+4. Optionally enter a goal on **Jev selection preview**, then click **Preview selection with Jev**. This explicitly starts remote selection. A selected preview is a recommendation to inspect, with **Input actions: 0**.
+5. After the target changes, click **Observe / Refresh** again. There is no continuous monitoring or automatic refresh.
+
+### Window picker
+
+The list contains visible, titled top-level windows, sorted by title. It can include terminals, system windows, and the viewer itself. It is a list of windows, not every installed application or every browser tab. A browser's inactive tabs are not separate targets unless they have their own windows.
+
+Each label includes the window title, **PID** (the owning process) and **HWND** (the Windows window handle). These help distinguish duplicate titles; multiple windows may share a PID. Choosing one only sets the observation target. It does not bring that application forward or immediately read its controls.
+
+The **Window (N)** label reports the actual number of entries. The popup shows up to ten rows and now scrolls in pixels, with an explicitly styled thumb that contrasts with its track. Use the mouse wheel, drag the thumb, or use the arrow keys. With eleven entries and ten visible rows, there is only one row's worth of overflow; the top and bottom views naturally differ by just one row. The previous Windows theme painted the large thumb almost like the background, making the small remaining track look like the thumb. That misleading appearance and item-by-item scrolling explained the apparent jump; it did not indicate a hidden middle group.
+
+**Refresh windows** rebuilds this list and retains the same HWND/PID if still present. It also clears the existing snapshot and Jev result, so press **Observe / Refresh** afterward. Changing the selected window clears them too. The number of entries in this picker is unrelated to the Controls and Options counts.
+
+### Controls tab: what the application exposes
+
+Each row is one UIA element from the selected window's exposed control tree. Rows can represent the window itself, panes, text, scrollbars, browser chrome, and other containers as well as interactive controls. They are not all buttons or actionable items.
+
+The columns show its accessible **Name**, **Role**, **Current value**, **Enabled**, **Focused**, **Offscreen**, **Current state**, **Supported behaviors**, physical desktop **Bounds (x, y, w, h)**, and a snapshot-scoped element ID. `Unavailable` means the provider did not supply a usable value; it does not mean false. `(No accessible name)` means the provider omitted the name. Password and unknown-password values are withheld.
+
+**Supported behaviors** are UIA patterns reported by the application, such as Invoke, Value, Toggle or Scroll. **Focused** and **Current state** describe the observation time; selecting a viewer row does not change the target's focus, checkbox, selection or text. The lower details pane shows the complete element record, including parent ID, raw state and any property errors. IDs identify rows only within this snapshot; names and AutomationId are not guaranteed unique or stable.
+
+### Options tab: supported operation candidates
+
+Each row pairs a control with one supported operation: for example `activate`, `set value`, `toggle`, `select`, `expand`, `collapse`, or horizontal/vertical `scroll`. A control may produce no options, one option, or several. **39 controls / 27 options** therefore means 39 observed elements and 27 eligible element-operation pairs, not 27 selected controls or actions already performed.
+
+Options require a control to be known enabled and onscreen, plus the relevant reported pattern and state. Writable values additionally require explicit non-password status. Disabled, offscreen, read-only or unknown-state controls may still appear in Controls without a corresponding option. See [the candidate rules](#candidate-rules-and-json-interface) for the exact mapping.
+
+**Required input** describes information a future executor would need. `set value` needs explicit text; a scroll option needs a direction. This viewer has no input form or execution button for those operations. Selecting an option only displays the option and its target element below the table, marked `preview_only: true`. Even an unexpected provider-reported setter is only a capability description; no test action is attempted.
+
+### Jev selection preview tab: a recommendation for your goal
+
+First observe a window with at least one option, then enter a nonempty goal of at most 4,000 characters. **Preview selection with Jev** starts a live selection request using the optional [Jev installation](JEV_SELECTION.md#setup-and-use). Opening the tab or writing the goal makes no remote request.
+
+The preview evaluates **all options in the snapshot**, regardless of the highlighted row, table sorting, or search filter. It sends your goal, window title, option descriptions, control names/roles/states, readable non-password values, and limited ancestor context to OpenRouter / TypeSafe. It does not send a screenshot, desktop bounds, HWND/PID or credentials as model evidence. Ordinary UI text in those descriptions can still contain target content.
+
+Jev classifies options as promising, uncertain or unlikely, narrows large groups in bounded rounds, and compares finalists. It can return no match or stop at its request budget. **Rounds and progress** shows the stages and completed requests; **Result JSON** contains the result, trace and reported usage. The recommendation identifies an observed operation and control. It does not supply text to type, execute an action, or establish that the screen is still current.
+
+Changing the goal, refreshing windows, changing targets or observing again invalidates the preview. **Cancel selection** stops the local selection helper; already dispatched remote requests may still finish and incur charges. **Export selection JSON** explicitly saves the current result separately from the UIA snapshot. The [selection guide](JEV_SELECTION.md) covers the algorithm, data flow, budgets and offline CLI preview.
+
+### Search, export, counts and incomplete results
+
+**Search** matches a case-insensitive literal substring across the displayed columns of both tables. It does not search windows, take another observation, or limit Jev's input. With a filter active, a tab such as **Controls (8 / 39)** means 8 visible matches out of 39 captured elements. The summary above the tables continues to show the full snapshot totals.
+
+**Export snapshot JSON** saves the complete current snapshot, including both elements and options, even when search hides rows. It does not include the separately exported Jev result. Normal observations stay in memory; exports can include ordinary target text. The backend never requests password values.
+
+**Element limit** caps the next observation: the viewer defaults to 1,000 and allows 100–5,000. A higher limit does not discover content that the application does not expose, and the observation still has a time budget. **PARTIAL / TRUNCATED** means controls may be missing; warnings describe the available cause. **COMPLETE** means traversal finished within its limits, not that every visual item or hidden page control was found. Collapsed/virtualized content, inactive tabs, custom canvas widgets and inaccessible or elevated targets can be absent or incomplete. The viewer never scrolls or expands the target to reveal more.
+
+The snapshot is a point-in-time approximation: providers can change or report stale information during reads. Observe again after manually switching browser tabs, expanding content or changing target values. More [coverage and validation limits](#validation-and-limits) appear below.
 
 ## Install and run
 
 Use Windows x64 in the logged-in interactive desktop, PowerShell 7.2+, CPython **3.12.13 x64**, and uv **0.11.26**. This host already has the interpreter at the path below. Setup creates a separate `.runtime/uia-venv`; it does not modify the original checkout's environments.
 
 ```powershell
-Set-Location -LiteralPath 'C:/Users/Jonat/[CTRL] Loop/worktrees/uia-control-options'
+Set-Location -LiteralPath 'C:/Users/Jonat/ctrl'
 pwsh -NoProfile -File ./scripts/install-uia-viewer.ps1 `
   -Python 'C:/Users/Jonat/AppData/Roaming/uv/python/cpython-3.12.13-windows-x86_64-none/python.exe'
 pwsh -NoProfile -File ./scripts/start-uia-viewer.ps1
@@ -17,12 +71,15 @@ pwsh -NoProfile -File ./scripts/start-uia-viewer.ps1
 
 Dependencies are five hash-pinned wheel distributions: PySide6, its addons/essentials and shiboken6 **6.11.2**, plus **comtypes 1.4.13**. The Windows UIAutomationCore COM library comes from Windows. No .NET SDK, FlaUI, CUA executable, detector weights, cloud key or account is required. Setup checks the native typelib and keeps its generated Python bindings inside the new venv. Runtime launch is isolated (`-I`) and does not install anything.
 
-1. Select a target from the window list. **Refresh windows** picks up newly opened or closed windows.
-2. Click **Observe / Refresh**. The old result is cleared; **Cancel** remains available.
-3. Search **Controls** or **Options**. A row shows a native name (or an honest missing-name marker), role, current value/state, enabled/focused/offscreen flags, supported UIA patterns, and physical desktop bounds. Select it for complete details.
-4. **Export snapshot JSON** explicitly saves the current local snapshot. Normal observations stay in memory. Exported text may include ordinary target content; the backend does not read password values.
+The existing UIA worktree can be launched with its installed runtime:
 
-The viewer does not focus or raise the selected target. It never calls Invoke, SetValue, Toggle, Select, Expand, Scroll, ScrollIntoView, Realize, or input APIs. The option list is descriptive, with no dispatch endpoint or executable command stored in it.
+```powershell
+pwsh -NoProfile -File 'C:\Users\Jonat\ctrl\worktrees\uia-control-options\scripts\start-uia-viewer.ps1'
+```
+
+Each launcher loads the source and runtime from its own checkout. Merging a change into `main` does not automatically update another worktree; update that worktree to the desired commit too. To launch directly from the main checkout after its one-time installation above, use `pwsh -NoProfile -File 'C:\Users\Jonat\ctrl\scripts\start-uia-viewer.ps1'`. Runtime directories are local to each checkout and are not included in Git merges.
+
+The viewer never calls Invoke, SetValue, Toggle, Select, Expand, Scroll, ScrollIntoView, Realize, or input APIs. The option list is descriptive, with no dispatch endpoint or executable command stored in it.
 
 ## Repeatable owned demo
 
@@ -91,11 +148,29 @@ Each command writes exactly one UTF-8 JSON object to stdout. The caller should p
 - `elements`: snapshot-scoped `id`, `parent_id`, `depth`, `name`, `role`, AutomationId/class/framework metadata, `value`, `is_password`, enabled/focused/offscreen, bounds `[x,y,width,height]`, pattern names, raw state and per-property errors.
 - `options`: snapshot-scoped `id`, `element_id`, `operation`, `label`, and a descriptive `requires` object. No native references or execution methods.
 
-Future selection/Jev code can consume this JSON, but would need an independently designed re-observation, authorization and execution boundary. This milestone provides none of those later stages.
+The optional [Jev selection preview](JEV_SELECTION.md) consumes this JSON and recommends an existing option. Any future executor would still need an independently designed re-observation, authorization and execution boundary; the current viewer provides no execution stage.
 
 ## Validation and limits
 
-The installer and hash sync were run successfully. **All 46 UIA tests passed** (22 backend, 7 CLI process, 17 Qt/process; combined run 7.730 seconds). These deterministic tests are separate from live provider evidence; they exercise password exclusion, unknown capability states, duplicate labels/IDs, budgets, missing targets, stale results, hung/crashed helpers, repeated refresh, cancel, close, filtering and explicit export. The production CLI watchdog terminated fake 10-second initialization/observation hangs with one generic JSON error; the real native reader also returned exactly 5 controls with explicit partial/truncated status under a 5-element cap. Existing capture/detector/Jev source and tests are unchanged; the full old dependency suite was not reprovisioned for this independent environment.
+### Current scrolling and guide checks
+
+The scrolling change was verified in task **# 3 UIA viewer scrolling and guide** with fresh UIA and Jev environments installed offline from the pinned dependency caches; both dependency checks and imports passed. **88 offline tests passed**: 64 UIA/backend/CLI/Qt tests and 24 selection/CLI tests. That checkout's PowerShell launch command opened the expected Qt viewer and the owned test window closed cleanly.
+
+A native Qt **Windows / windows11** rendering check exercised an eleven-window list and an eighty-window list. The eleven-window thumb occupies **327 of 360 pixels**, and an actual mouse drag reaches **17 of 36 pixels** of overflow. The long list reaches its middle and final row. The check also renders Controls, Options, and a selected Jev result using a synthetic helper, with **zero model requests and zero target input actions**.
+
+```powershell
+& ./.runtime/uia-venv/Scripts/python.exe -I -m unittest discover -s tests -p 'test_uia*.py'
+& ./.runtime/uia-venv/Scripts/python.exe -I -m unittest discover -s tests -p 'test_selection*.py'
+& ./.runtime/uia-venv/Scripts/python.exe -I ./scripts/test-uia-window-picker.py
+```
+
+The rendering command writes evidence to `.ctrl/uia-picker-check/summary.json` and adjacent `picker-11-*.png`, `picker-80-*.png`, `controls.png`, `options.png`, and `jev-preview.png` in the checkout where it runs. All contain synthetic data. These generated files are not included in Git merges. The original-checkout native/browser evidence below was not copied or rerun for this scrollbar change.
+
+### Historical observation checks from the original checkout
+
+The remainder of this subsection records the original checkout's observation milestone, not new live provider validation in this worktree.
+
+The original observation milestone's installer and hash sync ran successfully. Its **46 UIA tests passed** (22 backend, 7 CLI process, 17 Qt/process; combined run 7.730 seconds). These historical deterministic results are separate from live provider evidence; they exercise password exclusion, unknown capability states, duplicate labels/IDs, budgets, missing targets, stale results, hung/crashed helpers, repeated refresh, cancel, close, filtering and explicit export. The production CLI watchdog terminated fake 10-second initialization/observation hangs with one generic JSON error; the real native reader also returned exactly 5 controls with explicit partial/truncated status under a 5-element cap. The selection preview adds separate [offline selector, CLI and Qt tests](JEV_SELECTION.md#offline-verification). The full older capture/detector dependency suite was not reprovisioned for this independent environment.
 
 ```powershell
 & ./.runtime/uia-venv/Scripts/python.exe -I -m unittest discover -s tests -p 'test_uia_*.py' -v
@@ -115,15 +190,15 @@ It targets only the owned fixture identities, presses the viewer's own Observe c
 
 The final `--keep-open` run passed again (native 109 ms, browser 125 ms, 198 GUI timer ticks). The regular hidden-console launcher and demo reuse command were also executed successfully, including the worktree path's literal square brackets. One viewer was left open with the browser options populated; its completed status was independently confirmed through UIA.
 
-Local evidence: `.ctrl/uia/native-observation.json`, `browser-observation.json` (direct backend); `native-viewer-export.json`, `browser-viewer-export.json` (GUI exports); `viewer-summary.json` (latest repeatable GUI result); `viewer.png`, `native-viewer.png`, `browser-viewer.png` (actual Qt-rendered viewer images). These fixture-only artifacts are intentionally ignored by Git. No personal target was used for observation validation.
+Historical evidence in the original checkout: `.ctrl/uia/native-observation.json`, `browser-observation.json` (direct backend); `native-viewer-export.json`, `browser-viewer-export.json` (GUI exports); `viewer-summary.json` (repeatable GUI result); `viewer.png`, `native-viewer.png`, `browser-viewer.png` (actual Qt-rendered viewer images). These fixture-only artifacts are intentionally ignored by Git and are not present in this new worktree. No personal target was used for that observation validation.
 
-Coverage limits:
+### Coverage limits
 
 - A completed traversal means the currently exposed control view was walked within budget, **not** that every application element was found. Canvas/WebGL, inaccessible custom widgets, collapsed/virtualized children, inactive tabs and other windows can be absent. Nothing is expanded, scrolled or realized to improve coverage.
 - Browser accessibility can activate internally on observation. No browser focus/input/flags are used by the reader. Only the selected browser window's exposed tree is read; inactive page DOM is outside scope.
 - Provider metadata can be stale or inaccurate. A UIA snapshot is not atomic; values and flags may change between reads. HWND/PID checks catch common closure/reuse but do not make identities permanent.
-- Password protection depends on the provider correctly exposing `IsPassword`; the reader withholds unknowns and never requests password values. Ordinary non-password UI text can still be sensitive, and explicit exports contain that text. No observations are uploaded or automatically logged.
+- Password protection depends on the provider correctly exposing `IsPassword`; the reader withholds unknowns and never requests password values. Ordinary non-password UI text can still be sensitive, and explicit exports contain that text. Observation alone does not upload or automatically log target text; explicitly starting Jev sends the reduced control descriptions described above.
 - Elevated/protected apps, locked/noninteractive desktops, and provider failures may return an error or incomplete tree. Launch on the normal desktop at the target's accessible integrity level. The sandbox desktop produced hidden controls and slow calls here; this does not represent the normal-desktop result. No system/security settings were changed.
 - Validation covers one native framework and one Chrome page on this PC, not every browser/application. Standalone packaging and clean-machine installation are not verified.
 
-Generated environments, the isolated browser profile, JSON observations and images remain ignored under `.runtime/` and `.ctrl/`. Only implementation, launchers, pinned dependency definitions, fixtures, tests and documentation are committed.
+Generated environments, the isolated browser profile, JSON observations and images remain ignored under `.runtime/` and `.ctrl/`. Implementation, launchers, pinned dependency definitions, fixtures, tests and documentation are the source-controlled files.

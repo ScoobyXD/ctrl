@@ -10,17 +10,26 @@ import copy
 import json
 from pathlib import Path
 import sys
+import uuid
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QProcess, QSortFilterProxyModel, Qt, QTimer
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QComboBox, QFileDialog, QHBoxLayout,
-    QHeaderView, QLabel, QLineEdit, QMainWindow, QPlainTextEdit, QPushButton,
+    QHeaderView, QLabel, QLineEdit, QListView, QMainWindow, QPlainTextEdit, QPushButton,
     QSpinBox, QSplitter, QTableView, QTabWidget, QVBoxLayout, QWidget,
 )
 
 
 MAX_OUTPUT_BYTES = 8 * 1024 * 1024
 ROOT = Path(__file__).resolve().parents[2]
+TAB_GUIDANCE = (
+    "Controls are the accessible elements reported by this window. Select a row to read its details below; "
+    "the target is not clicked or focused. Counts show matches / total when searching.",
+    "Options are supported operations, not settings or a queue. One control can offer several options or none. "
+    "Select a row to inspect it below; required input is descriptive and no action runs.",
+    "Enter a goal, then explicitly start Jev to suggest one option from the full snapshot, regardless of search "
+    "or highlighted rows. The preview makes remote model requests and never executes the suggestion.",
+)
 
 
 def _text(value):
@@ -101,12 +110,27 @@ class _Rows(QAbstractTableModel):
 class UIAViewer(QMainWindow):
     def __init__(self, helper_path=None, *, observe_timeout=10.0,
                  deadline_slack_ms=3000, windows_timeout_ms=8000,
-                 auto_discover=True):
+                 auto_discover=True, selection_helper_path=None,
+                 selection_python=None, selection_timeout_ms=300000):
         super().__init__()
         self.helper_path = Path(helper_path) if helper_path else ROOT / "scripts" / "uia-observe.py"
         self.observe_timeout = observe_timeout
         self.deadline_slack_ms = deadline_slack_ms
         self.windows_timeout_ms = windows_timeout_ms
+        self.selection_helper_path = Path(selection_helper_path) if selection_helper_path else ROOT / "scripts" / "jev-select.py"
+        self.selection_python = Path(selection_python) if selection_python else ROOT / ".runtime" / "jev-venv" / "Scripts" / "python.exe"
+        self.selection_timeout_ms = max(1, min(300000, selection_timeout_ms))
+        self.selection_process = None
+        self.selection_result = None
+        self._selection_request = None
+        self._selection_buffer = bytearray()
+        self._selection_bytes = 0
+        self._selection_events = 0
+        self._selection_abort_reason = None
+        self._selection_pending_result = None
+        self._selection_deadline = QTimer(self)
+        self._selection_deadline.setSingleShot(True)
+        self._selection_deadline.timeout.connect(lambda: self._abort_selection("Selection timed out. Already dispatched provider requests may still finish."))
         self.snapshot = None
         self.process = None
         self._output = bytearray()
@@ -125,25 +149,52 @@ class UIAViewer(QMainWindow):
         title = QLabel("UIA control options")
         title.setObjectName("pageTitle")
         subtitle = QLabel("Observe a window, inspect its controls, and preview supported operations.")
-        note = QLabel("Observation only · Selecting an option never performs it · Results stay on this computer")
+        note = QLabel("Local observation · Selecting an option never performs it · Optional Jev preview uses remote model requests")
         note.setObjectName("readOnlyNote")
+        note.setWordWrap(True)
         self.target_combo = QComboBox()
+        # The native Windows theme can make the large thumb look like empty
+        # track. Use a regular list with continuous scrolling and explicit
+        # scrollbar colors below. Eleven rows / ten visible must not look like
+        # a long list with only two reachable positions.
+        target_view = QListView(self.target_combo)
+        target_view.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        target_view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.target_combo.setView(target_view)
+        # Menu-style themes can disable this during setView, before our popup
+        # style is applied. Always allow the list's own scrollbar when needed.
+        target_view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.target_combo.setMaxVisibleItems(10)
         self.target_combo.setMinimumWidth(300)
         self.target_combo.setAccessibleName("Target window")
+        self.target_combo.setToolTip(
+            "Visible top-level windows with titles, sorted by title. PID and HWND distinguish similar names.\n"
+            "Scroll or use arrow keys to choose a target, then press Observe / Refresh. Choosing does not focus it."
+        )
         self.target_combo.currentIndexChanged.connect(self._target_changed)
+        self.window_count = QLabel("Window (0)")
+        self.window_count.setToolTip("Number of windows in the picker, not controls inside the selected window.")
+        self.window_count.setBuddy(self.target_combo)
+        for signal in (self.target_combo.model().rowsInserted, self.target_combo.model().rowsRemoved,
+                       self.target_combo.model().modelReset):
+            signal.connect(self._window_count_changed)
         self.refresh_windows_button = QPushButton("Refresh windows")
+        self.refresh_windows_button.setToolTip("Update the window list. Clears the current snapshot and Jev preview; does not observe controls.")
         self.refresh_windows_button.clicked.connect(self.refresh_windows)
         self.observe_button = QPushButton("Observe / Refresh")
+        self.observe_button.setToolTip("Read a fresh local snapshot of the selected window. Results do not update automatically.")
         self.observe_button.setObjectName("observeButton")
         self.observe_button.clicked.connect(self.observe)
         self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.setToolTip("Stop the local window-list or observation helper. No current snapshot is kept.")
         self.cancel_button.clicked.connect(self.cancel)
         self.max_elements = QSpinBox()
         self.max_elements.setRange(100, 5000)
         self.max_elements.setValue(1000)
         self.max_elements.setAccessibleName("Maximum elements per observation")
+        self.max_elements.setToolTip("Maximum controls to read (100–5,000). This is a limit, not the number of windows or options.")
         toolbar = QHBoxLayout()
-        toolbar.addWidget(QLabel("Window"))
+        toolbar.addWidget(self.window_count)
         toolbar.addWidget(self.target_combo, 1)
         toolbar.addWidget(self.refresh_windows_button)
         toolbar.addWidget(QLabel("Element limit"))
@@ -157,12 +208,15 @@ class UIAViewer(QMainWindow):
         self.status.setObjectName("observationStatus")
         self.summary = QLabel("No current snapshot")
         self.summary.setTextFormat(Qt.TextFormat.PlainText)
+        self.summary.setWordWrap(True)
         self.search = QLineEdit()
         self.search.setPlaceholderText("Search names, roles, values, states, or supported behaviors…")
         self.search.setAccessibleName("Search observed controls and options")
+        self.search.setToolTip("Filter displayed columns in both tables. Does not change the snapshot export or Jev's candidate set.")
         self.search.setClearButtonEnabled(True)
         self.search.textChanged.connect(self._filter)
         self.export_button = QPushButton("Export snapshot JSON…")
+        self.export_button.setToolTip("Save the full current snapshot, including rows hidden by search. Jev results have a separate export.")
         self.export_button.clicked.connect(self.export_json)
         filter_bar = QHBoxLayout()
         filter_bar.addWidget(self.search, 1)
@@ -170,7 +224,7 @@ class UIAViewer(QMainWindow):
 
         self.controls_model = _Rows([
             "Name", "Role", "Current value", "Enabled", "Focused", "Offscreen",
-            "Current state", "Supported behaviors", "Bounds (x, y, w, h)", "Snapshot ID",
+            "Current state", "Supported behaviors", "Bounds (x, y, w, h)", "Element ID (this snapshot)",
         ], self)
         self.options_model = _Rows([
             "Operation", "Target name", "Role", "Enabled", "Required input",
@@ -187,7 +241,11 @@ class UIAViewer(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.addTab(self.controls_table, "Controls (0)")
         self.tabs.addTab(self.options_table, "Options (0)")
-        self.tabs.currentChanged.connect(lambda _: self.details.clear())
+        self.tabs.addTab(self._selection_panel(), "Jev selection preview")
+        self.tabs.currentChanged.connect(self._tab_changed)
+        self.tab_guidance = QLabel(TAB_GUIDANCE[0])
+        self.tab_guidance.setWordWrap(True)
+        self.tab_guidance.setObjectName("tabGuidance")
         self.details = QPlainTextEdit()
         self.details.setReadOnly(True)
         self.details.setAccessibleName("Selected control or option details")
@@ -210,6 +268,7 @@ class UIAViewer(QMainWindow):
         layout.addWidget(self.status)
         layout.addWidget(self.summary)
         layout.addLayout(filter_bar)
+        layout.addWidget(self.tab_guidance)
         layout.addWidget(splitter, 1)
         central = QWidget()
         central.setLayout(layout)
@@ -218,20 +277,94 @@ class UIAViewer(QMainWindow):
             QMainWindow, QWidget { background: #182027; color: #e7eef3; font: 13px 'Segoe UI'; }
             QLabel#pageTitle { font-size: 25px; font-weight: 650; }
             QLabel#readOnlyNote { color: #7edeb5; }
+            QLabel#tabGuidance { color: #b7cbd9; }
             QLabel#observationStatus { background: #24323d; border-radius: 5px; padding: 9px; }
             QPushButton { background: #30414e; border: 1px solid #435967; border-radius: 4px; padding: 8px 10px; }
             QPushButton:hover { background: #405666; }
             QPushButton:disabled { color: #81929f; background: #25323c; }
             QPushButton#observeButton { background: #2c8c69; font-weight: 600; }
             QLineEdit, QComboBox, QSpinBox { background: #10181e; border: 1px solid #435967; padding: 7px; }
+            QComboBox { combobox-popup: 0; }
             QTableView, QPlainTextEdit { background: #111a21; border: 1px solid #3a4d5b; selection-background-color: #285d75; }
             QHeaderView::section { background: #2b3c49; padding: 7px; border: 0; border-right: 1px solid #435967; }
             QTabBar::tab { background: #273743; padding: 9px 20px; }
             QTabBar::tab:selected { background: #3c5565; }
+            QComboBox QAbstractItemView { background: #111a21; border: 1px solid #435967; selection-background-color: #285d75; }
+            QComboBox QAbstractItemView::item { min-height: 28px; padding: 2px 8px; }
+            QTableView::item:selected, QComboBox QAbstractItemView::item:selected { background: #285d75; color: #ffffff; }
+            QScrollBar:vertical { background: #10181e; width: 14px; margin: 0; }
+            QScrollBar:horizontal { background: #10181e; height: 14px; margin: 0; }
+            QScrollBar::handle { background: #718b9c; border-radius: 5px; }
+            QScrollBar::handle:vertical { min-height: 24px; margin: 2px; }
+            QScrollBar::handle:horizontal { min-width: 24px; margin: 2px; }
+            QScrollBar::handle:hover { background: #9bb7c8; }
+            QScrollBar::handle:pressed { background: #b6d5e5; }
+            QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
+            QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
         """)
         self._sync_buttons()
         if auto_discover:
             QTimer.singleShot(0, self.refresh_windows)
+
+    def _window_count_changed(self, *_):
+        self.window_count.setText(f"Window ({self.target_combo.count()})")
+
+    def _selection_panel(self):
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        note = QLabel("Preview sends your goal and control descriptions to OpenRouter / TypeSafe in multiple model requests. It never executes the selected action.")
+        note.setWordWrap(True)
+        note.setTextFormat(Qt.TextFormat.PlainText)
+        layout.addWidget(note)
+        self.selection_goal = QPlainTextEdit()
+        self.selection_goal.setPlaceholderText("Describe the next action you want to select, for example: Enable notifications.")
+        self.selection_goal.setAccessibleName("Goal for Jev selection preview")
+        self.selection_goal.setMaximumHeight(80)
+        self.selection_goal.textChanged.connect(self._selection_goal_changed)
+        layout.addWidget(self.selection_goal)
+        buttons = QHBoxLayout()
+        self.selection_button = QPushButton("Preview selection with Jev")
+        self.selection_button.clicked.connect(self.preview_selection)
+        self.selection_cancel_button = QPushButton("Cancel selection")
+        self.selection_cancel_button.clicked.connect(self.cancel_selection)
+        self.selection_export_button = QPushButton("Export selection JSON…")
+        self.selection_export_button.clicked.connect(self.export_selection_json)
+        buttons.addWidget(self.selection_button)
+        buttons.addWidget(self.selection_cancel_button)
+        buttons.addStretch()
+        buttons.addWidget(self.selection_export_button)
+        layout.addLayout(buttons)
+        self.selection_status = QLabel("Observe a window, enter a goal, then explicitly start the preview.")
+        self.selection_status.setTextFormat(Qt.TextFormat.PlainText)
+        self.selection_status.setWordWrap(True)
+        layout.addWidget(self.selection_status)
+        self.selection_choice = QLabel("No current selected action")
+        self.selection_choice.setTextFormat(Qt.TextFormat.PlainText)
+        self.selection_choice.setWordWrap(True)
+        self.selection_choice.setStyleSheet("font-weight: 600; color: #7edeb5; padding: 6px 0;")
+        layout.addWidget(self.selection_choice)
+        self.selection_trace = QPlainTextEdit()
+        self.selection_trace.setReadOnly(True)
+        self.selection_trace.setMaximumBlockCount(2000)
+        self.selection_trace.setAccessibleName("Jev selection rounds and bucket decisions")
+        self.selection_trace.setPlaceholderText("Completed model requests, buckets, and narrowing rounds appear here.")
+        self.selection_json = QPlainTextEdit()
+        self.selection_json.setReadOnly(True)
+        self.selection_json.setAccessibleName("Complete Jev selection result JSON")
+        traces = QTabWidget()
+        traces.addTab(self.selection_trace, "Rounds and progress")
+        traces.addTab(self.selection_json, "Result JSON")
+        layout.addWidget(traces, 1)
+        return panel
+
+    def _tab_changed(self, index):
+        self.tab_guidance.setText(TAB_GUIDANCE[index])
+        self.details.clear()
+        self.details.setVisible(index != 2)
+        if index == 0:
+            self._show_selection(self.controls_table, self.controls_proxy, self.controls_model)
+        elif index == 1:
+            self._show_selection(self.options_table, self.options_proxy, self.options_model)
 
     def _table(self, model):
         proxy = QSortFilterProxyModel(self)
@@ -244,6 +377,8 @@ class UIAViewer(QMainWindow):
         table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         table.setWordWrap(False)
+        table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         table.setSortingEnabled(True)
         table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         table.horizontalHeader().setDefaultSectionSize(145)
@@ -287,8 +422,16 @@ class UIAViewer(QMainWindow):
         self.max_elements.setEnabled(not active)
         self.cancel_button.setEnabled(active)
         self.export_button.setEnabled(not active and self.snapshot is not None)
+        selection_active = self.selection_process is not None
+        goal = self.selection_goal.toPlainText().strip()
+        self.selection_button.setEnabled(not active and not selection_active and not self._closing
+                                         and self.snapshot is not None and bool(self.snapshot.get("options"))
+                                         and bool(goal) and len(goal) <= 4000)
+        self.selection_cancel_button.setEnabled(selection_active)
+        self.selection_export_button.setEnabled(not selection_active and self.selection_result is not None)
 
     def _clear_snapshot(self):
+        self._invalidate_selection("Snapshot changed. Run a new selection preview after observation.")
         self.snapshot = None
         self._elements = {}
         self.controls_model.replace([], [])
@@ -476,6 +619,7 @@ class UIAViewer(QMainWindow):
                 element["value"] = None
                 element["state"] = {key: value for key, value in element["state"].items()
                                     if key.lower() not in {"value", "text", "range_value", "legacy_value"}}
+        self._invalidate_selection("New snapshot ready. Enter a goal and explicitly start a selection preview.")
         self.snapshot = result
         self._elements = {element["id"]: element for element in result["elements"]}
         rows = []
@@ -519,6 +663,237 @@ class UIAViewer(QMainWindow):
         messages.extend(str(warning) for warning in result.get("warnings", [])[:8])
         messages.append("UIA coverage depends on the target application's accessibility provider.")
         self.status.setText(" ".join(messages))
+        self._sync_buttons()
+
+    def _selection_goal_changed(self):
+        self._invalidate_selection("Goal changed. Start a new preview for this goal.")
+        if len(self.selection_goal.toPlainText().strip()) > 4000:
+            self.selection_status.setText("Use a goal of at most 4,000 characters.")
+        self._sync_buttons()
+
+    def _invalidate_selection(self, reason):
+        self.selection_result = None
+        self._selection_pending_result = None
+        self.selection_choice.setText("No current selected action")
+        self.selection_json.clear()
+        self.selection_trace.clear()
+        if self.selection_process is not None:
+            self._abort_selection(reason + " Already dispatched provider requests may still finish.")
+        else:
+            self.selection_status.setText(reason)
+
+    def preview_selection(self):
+        goal = self.selection_goal.toPlainText().strip()
+        if (self.process is not None or self.selection_process is not None or self._closing
+                or self.snapshot is None or not self.snapshot.get("options") or not goal or len(goal) > 4000):
+            return
+        self._invalidate_selection("Starting Jev selection preview…")
+        request = {"snapshot": copy.deepcopy(self.snapshot), "goal": goal, "run_id": uuid.uuid4().hex}
+        payload = (json.dumps(request, ensure_ascii=False) + "\n").encode("utf-8")
+        if len(payload) > MAX_OUTPUT_BYTES:
+            self.selection_status.setText("The snapshot exceeds the 8 MiB input limit. Observe with a smaller element limit.")
+            return
+        self._selection_request = request
+        self._selection_buffer.clear()
+        self._selection_bytes = 0
+        self._selection_events = 0
+        self._selection_abort_reason = None
+        process = QProcess(self)
+        self.selection_process = process
+        process.setProgram(str(self.selection_python))
+        process.setWorkingDirectory(str(self.selection_helper_path.parent.parent))
+        process.setArguments(["-I", str(self.selection_helper_path), "--stdin", "--live"])
+        process.started.connect(lambda: self._selection_started(process, payload))
+        process.readyReadStandardOutput.connect(lambda: self._read_selection_output(process))
+        process.readyReadStandardError.connect(lambda: process.readAllStandardError())
+        process.finished.connect(lambda code, status: self._selection_finished(process, code, status))
+        process.errorOccurred.connect(lambda error: self._selection_process_error(process, error))
+        self.selection_status.setText("Jev is making model requests to classify and narrow the observed options. Cancel remains available.")
+        self.selection_trace.appendPlainText(f"Started with {len(request['snapshot']['options'])} observed options. Selection preview only; input actions: 0.")
+        self._selection_deadline.start(self.selection_timeout_ms)
+        self._sync_buttons()
+        process.start()
+
+    def _selection_started(self, process, payload):
+        if process is not self.selection_process or self._selection_abort_reason:
+            process.kill()
+            return
+        # Goal and observations go only over this process's stdin, never argv or
+        # temporary files. The helper controls the reduced remote model payload.
+        process.write(payload)
+        process.closeWriteChannel()
+
+    def cancel_selection(self):
+        self._abort_selection("Selection cancelled. Already dispatched provider requests may still finish.")
+
+    def _abort_selection(self, reason):
+        if self.selection_process is None:
+            return
+        self._selection_abort_reason = reason
+        self._selection_pending_result = None
+        self.selection_result = None
+        self.selection_choice.setText("No current selected action")
+        self.selection_json.clear()
+        self._selection_buffer.clear()
+        self._selection_deadline.stop()
+        self.selection_status.setText(reason)
+        self.selection_process.kill()
+
+    def _selection_process_error(self, process, error):
+        if process is self.selection_process and error == QProcess.ProcessError.FailedToStart:
+            self._selection_abort_reason = "Could not start the Jev helper. Run the Jev selection installer and retry."
+            self._selection_finished(process, -1, QProcess.ExitStatus.CrashExit)
+
+    def _read_selection_output(self, process):
+        chunk = bytes(process.readAllStandardOutput())
+        if process is not self.selection_process or self._selection_abort_reason:
+            return
+        self._selection_bytes += len(chunk)
+        if self._selection_bytes > MAX_OUTPUT_BYTES:
+            self._abort_selection("Selection exceeded the 8 MiB response limit. No action was selected.")
+            return
+        self._selection_buffer.extend(chunk)
+        while b"\n" in self._selection_buffer and not self._selection_abort_reason:
+            line, _, rest = self._selection_buffer.partition(b"\n")
+            self._selection_buffer = bytearray(rest)
+            if line.strip():
+                self._selection_event(line)
+
+    def _selection_is_current(self):
+        request = self._selection_request
+        return bool(request and self.snapshot is not None
+                    and self.snapshot.get("snapshot_id") == request["snapshot"].get("snapshot_id")
+                    and self.snapshot.get("target") == request["snapshot"].get("target")
+                    and self.selection_goal.toPlainText().strip() == request["goal"])
+
+    def _selection_event(self, line):
+        try:
+            self._selection_events += 1
+            if self._selection_events > 20000 or not self._selection_is_current():
+                raise ValueError("Stale or excessive events")
+            event = json.loads(line.decode("utf-8"))
+            if not isinstance(event, dict):
+                raise ValueError("Invalid envelope")
+            kind = event.get("event")
+            if kind == "error":
+                message = event.get("message")
+                if not isinstance(message, str):
+                    raise ValueError("Invalid error")
+                self._abort_selection("Selection failed: " + message[:1000])
+                return
+            data = event.get("data")
+            if not isinstance(data, dict):
+                raise ValueError("Invalid event data")
+            if data.get("client_run_id", self._selection_request["run_id"]) != self._selection_request["run_id"]:
+                raise ValueError("Wrong run")
+            if kind == "progress":
+                self.selection_trace.appendPlainText(self._progress_summary(data))
+                count = data.get("request_count")
+                if count is not None:
+                    self.selection_status.setText(f"Selection in progress · {count} model requests completed · No input actions executed")
+            elif kind == "result" and self._selection_pending_result is None:
+                self._validate_selection_result(data)
+                self._selection_pending_result = data
+            else:
+                raise ValueError("Invalid event sequence")
+        except (ValueError, TypeError, KeyError, UnicodeError, RecursionError):
+            self._abort_selection("The Jev helper returned an invalid or stale response. No action was selected.")
+
+    @staticmethod
+    def _progress_summary(data):
+        fields = []
+        for key, label in (("request_count", "Request"), ("stage", "Stage"), ("round", "Round"), ("batch", "Batch")):
+            if data.get(key) is not None:
+                fields.append(f"{label} {_text(data[key])[:100]}")
+        for key, label in (("input_ids", "inputs"), ("retained_ids", "retained")):
+            if isinstance(data.get(key), list):
+                fields.append(f"{len(data[key])} {label}")
+        if data.get("status") is not None:
+            fields.append("Status: " + _text(data["status"])[:100])
+        message = " · ".join(fields) or "Selection progress update"
+        if data.get("answers"):
+            message += "\n  Buckets / answers: " + _text(data["answers"])[:1600]
+        if data.get("classification_counts"):
+            message += "\n  Bucket counts: " + _text(data["classification_counts"])[:600]
+        return message
+
+    def _validate_selection_result(self, data):
+        request = self._selection_request
+        if (data.get("snapshot_id") != request["snapshot"]["snapshot_id"] or data.get("goal") != request["goal"]
+                or data.get("preview_only") is not True or data.get("input_actions") != 0
+                or data.get("status") not in {"selected", "no_match", "budget_exhausted", "cancelled"}
+                or not isinstance(data.get("trace"), list)):
+            raise ValueError("Invalid selection binding")
+        selected = data.get("selected_option")
+        if data["status"] == "selected":
+            if not isinstance(selected, dict):
+                raise ValueError("Missing selected option")
+            observed = {option["id"]: option for option in request["snapshot"]["options"]}
+            option = observed.get(selected.get("id"))
+            if option is None or any(selected.get(key) != option.get(key) for key in ("element_id", "operation")):
+                raise ValueError("Selected option was not observed")
+            # Present the exact captured capability, never a model-invented label
+            # or operation. Core metadata remains in the trace.
+            data["selected_option"] = copy.deepcopy(option)
+        elif selected is not None:
+            raise ValueError("Unexpected selected option")
+
+    def _selection_finished(self, process, exit_code, exit_status):
+        if process is not self.selection_process:
+            return
+        self._read_selection_output(process)
+        if self._selection_buffer.strip() and not self._selection_abort_reason:
+            self._selection_event(bytes(self._selection_buffer))
+        self._selection_buffer.clear()
+        self._selection_deadline.stop()
+        reason, result = self._selection_abort_reason, self._selection_pending_result
+        self.selection_process = None
+        self._selection_pending_result = None
+        process.deleteLater()
+        if self._closing:
+            QTimer.singleShot(0, self.close)
+            return
+        if reason:
+            self.selection_status.setText(reason)
+        elif exit_code != 0 or exit_status != QProcess.ExitStatus.NormalExit:
+            self.selection_status.setText("The Jev helper stopped unexpectedly. No action was selected.")
+        elif result is None or not self._selection_is_current():
+            self.selection_status.setText("No current selection result was returned. Start a new preview.")
+        else:
+            self.selection_result = result
+            self.selection_json.setPlainText(json.dumps(result, indent=2, ensure_ascii=False))
+            status = result["status"]
+            self.selection_status.setText(
+                f"{status.replace('_', ' ').capitalize()} · {result.get('request_count', '?')} model requests · "
+                f"{result.get('considered_options', '?')} of {result.get('observed_options', '?')} options considered · Input actions: 0"
+            )
+            option = result["selected_option"]
+            if option:
+                element = self._elements.get(option["element_id"], {})
+                self.selection_choice.setText(f"Selected preview: {option['operation'].replace('_', ' ')} → {_name(element)} ({element.get('role', 'role unavailable')})")
+            else:
+                self.selection_choice.setText("No action selected · " + str(result.get("reason") or status.replace("_", " "))[:1000])
+            if not self._selection_events or self.selection_trace.blockCount() <= 1:
+                for entry in result["trace"][:2000]:
+                    if isinstance(entry, dict):
+                        self.selection_trace.appendPlainText(self._progress_summary(entry))
+        self._selection_request = None
+        self._sync_buttons()
+
+    def export_selection_json(self, checked=False, *, path=None):
+        if self.selection_result is None or self.selection_process is not None:
+            return False
+        if path is None:
+            path, _ = QFileDialog.getSaveFileName(self, "Export current Jev selection preview", "jev-selection.json", "JSON files (*.json)")
+        if not path:
+            return False
+        try:
+            Path(path).write_text(json.dumps(self.selection_result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        except OSError:
+            self.selection_status.setText("Could not save the selection. Choose a writable destination and retry.")
+            return False
+        self.selection_status.setText("Selection preview exported locally. No input actions were executed.")
+        return True
 
     def export_json(self, checked=False, *, path=None):
         if self.snapshot is None or self.process is not None:
@@ -539,12 +914,14 @@ class UIAViewer(QMainWindow):
 
     def closeEvent(self, event):
         self._closing = True
-        if self.process is not None:
+        if self.process is not None or self.selection_process is not None:
             event.ignore()
             self.hide()
             self._abort("Closing…")
+            self._abort_selection("Closing selection preview… Already dispatched provider requests may still finish.")
             return
         self._deadline.stop()
+        self._selection_deadline.stop()
         event.accept()
 
 
