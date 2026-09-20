@@ -19,4 +19,13 @@ pwsh -NoProfile -File ./scripts/install-cua-driver.ps1
 pwsh -NoProfile -File ./scripts/test-cua-driver.ps1
 ```
 
-See [CUA Driver setup](docs/CUA_DRIVER.md) and [verification results](docs/CUA_DRIVER_VERIFICATION.md). Runtime files and captures stay under Git-ignored `.runtime/`. The application, perception components, JEV integration, and input delivery are not implemented or validated yet.
+See [CUA Driver setup](docs/CUA_DRIVER.md) and [verification results](docs/CUA_DRIVER_VERIFICATION.md).
+
+The second dependency stage adds **Windows ML's Python projection and a local UI-trained YOLO11m detector**, with a CPU comparison against its original PyTorch checkpoint. See [local perception setup](docs/LOCAL_PERCEPTION.md) and [measured verification](docs/LOCAL_PERCEPTION_VERIFICATION.md).
+
+```powershell
+pwsh -NoProfile -File ./scripts/install-local-perception.ps1 -Python '<path to unpackaged Python 3.12.13 x64/python.exe>'
+pwsh -NoProfile -File ./scripts/test-local-perception.ps1
+```
+
+Models and environments stay under ignored `.runtime/`; capture/detection evidence stays under ignored `.ctrl/`. This is a read-only fixture-to-boxes baseline. OCR, JEV, input delivery, and the full application loop are not implemented. The selected detector weights are **AGPL-3.0**, separately from this repository's MIT license.

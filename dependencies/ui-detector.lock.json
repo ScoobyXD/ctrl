@@ -1,0 +1,70 @@
+{
+  "schemaVersion": 1,
+  "id": "microsoft-omniparser-v2-icon-detect",
+  "source": {
+    "repository": "microsoft/OmniParser-v2.0",
+    "revision": "6600256cb0f1b07651e3bc86166196307bad7e2d",
+    "modelCardUrl": "https://huggingface.co/microsoft/OmniParser-v2.0/blob/6600256cb0f1b07651e3bc86166196307bad7e2d/README.md",
+    "purpose": "UI-trained interactable-region detector; detector only, without OCR or captioning",
+    "license": "AGPL-3.0",
+    "licenseNote": "The icon_detect license is AGPL-3.0. The repository-level MIT badge applies to other components and must not be substituted for the detector license.",
+    "architectureNote": "Published model.yaml/train_args.yaml describe YOLOv8, while checkpoint import metadata includes YOLO11 modules. Record architecture, names and parameter count from the hash-verified checkpoint; do not infer them from the stale sidecar files."
+  },
+  "artifacts": [
+    {
+      "role": "checkpoint",
+      "sourcePath": "icon_detect/model.pt",
+      "localName": "model.pt",
+      "sizeBytes": 40623819,
+      "sha256": "dab3d4351ad00b035db829909a4db98354d5a90f6990e4ac00222a9a95d4bf57"
+    },
+    {
+      "role": "license",
+      "sourcePath": "icon_detect/LICENSE",
+      "localName": "LICENSE",
+      "sizeBytes": 34522,
+      "sha256": "4df3c306dddaaf4baffdff5ca820cc679ac8cd6dc263c6a74517783e42fa7a3b"
+    }
+  ],
+  "export": {
+    "format": "onnx",
+    "imgsz": 1280,
+    "batch": 1,
+    "device": "cpu",
+    "half": false,
+    "dynamic": false,
+    "simplify": false,
+    "opset": 17,
+    "nms": false
+  },
+  "tensorContract": {
+    "inputName": "images",
+    "inputShape": [1, 3, 1280, 1280],
+    "inputDtype": "float32",
+    "inputColorOrder": "RGB",
+    "inputRange": [0.0, 1.0],
+    "rawFileByteOrder": "little",
+    "output": "Decoded xywh coordinates in letterboxed input pixels followed by class probabilities; NMS remains outside the model.",
+    "expectedClassCount": 1,
+    "preprocessing": "Aspect-preserving OpenCV INTER_LINEAR resize; centered padding value 114; auto=False for a full 1280x1280 canvas; BCHW RGB float32 divided by 255."
+  },
+  "exporterVersions": {
+    "ultralytics": "8.3.70",
+    "torch": "2.6.0+cpu",
+    "torchvision": "0.21.0+cpu",
+    "onnx": "1.17.0",
+    "numpy": "1.26.4",
+    "opencv-python": "4.10.0.84",
+    "pillow": "11.1.0"
+  },
+  "sources": {
+    "upstreamRequirements": "https://github.com/microsoft/OmniParser/blob/master/requirements.txt",
+    "publishedTrainingImageSize": "https://huggingface.co/microsoft/OmniParser-v2.0/blob/6600256cb0f1b07651e3bc86166196307bad7e2d/icon_detect/train_args.yaml#L41",
+    "exporter": "https://github.com/ultralytics/ultralytics/blob/v8.3.70/ultralytics/engine/exporter.py#L497",
+    "checkpointLoader": "https://github.com/ultralytics/ultralytics/blob/v8.3.70/ultralytics/utils/patches.py#L64",
+    "preprocessing": "https://github.com/ultralytics/ultralytics/blob/v8.3.70/ultralytics/engine/predictor.py#L118",
+    "letterbox": "https://github.com/ultralytics/ultralytics/blob/v8.3.70/ultralytics/data/augment.py#L1477",
+    "postprocessing": "https://github.com/ultralytics/ultralytics/blob/v8.3.70/ultralytics/models/yolo/detect/predict.py#L23",
+    "nms": "https://github.com/ultralytics/ultralytics/blob/v8.3.70/ultralytics/utils/ops.py#L181"
+  }
+}

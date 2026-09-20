@@ -1,0 +1,11 @@
+# Export tooling only. Production inference uses the Windows ML native bridge.
+# Install the two CPU wheels from https://download.pytorch.org/whl/cpu first.
+# The setup script resolves these inputs to an exact environment lock.
+torch==2.6.0+cpu
+torchvision==0.21.0+cpu
+ultralytics==8.3.70
+onnx==1.17.0
+numpy==1.26.4
+# Newer OpenCV releases require NumPy 2; preserve the upstream NumPy 1 baseline.
+opencv-python==4.10.0.84
+pillow==11.1.0
