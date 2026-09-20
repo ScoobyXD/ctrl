@@ -14,9 +14,9 @@ import uuid
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QProcess, QSortFilterProxyModel, Qt, QTimer
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QHBoxLayout,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QGridLayout, QHBoxLayout,
     QHeaderView, QLabel, QLineEdit, QListView, QMainWindow, QPlainTextEdit, QPushButton,
-    QSpinBox, QSplitter, QTableView, QTabWidget, QVBoxLayout, QWidget,
+    QScrollArea, QSpinBox, QSplitter, QTableView, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from .jev import ENDPOINT, DecisionError, request_binding
@@ -334,7 +334,7 @@ class UIAViewer(QMainWindow):
         self.selection_button.clicked.connect(self.preview_selection)
         self.selection_cancel_button = QPushButton("Cancel selection")
         self.selection_cancel_button.clicked.connect(self.cancel_selection)
-        self.selection_export_button = QPushButton("Export selection JSON…")
+        self.selection_export_button = QPushButton("Export full JSON…")
         self.selection_export_button.clicked.connect(self.export_selection_json)
         buttons.addWidget(self.selection_inspect_button)
         buttons.addWidget(self.selection_button)
@@ -346,11 +346,6 @@ class UIAViewer(QMainWindow):
         self.selection_status.setTextFormat(Qt.TextFormat.PlainText)
         self.selection_status.setWordWrap(True)
         layout.addWidget(self.selection_status)
-        self.selection_choice = QLabel("No current selected action")
-        self.selection_choice.setTextFormat(Qt.TextFormat.PlainText)
-        self.selection_choice.setWordWrap(True)
-        self.selection_choice.setStyleSheet("font-weight: 600; color: #7edeb5; padding: 6px 0;")
-        layout.addWidget(self.selection_choice)
         self.selection_trace = QPlainTextEdit()
         self.selection_trace.setReadOnly(True)
         self.selection_trace.setMaximumBlockCount(2000)
@@ -360,12 +355,134 @@ class UIAViewer(QMainWindow):
         self.selection_json.setReadOnly(True)
         self.selection_json.setAccessibleName("Complete Jev selection result JSON")
         self.selection_tabs = QTabWidget()
+        self.selection_tabs.setMinimumHeight(300)
+        self.selection_summary = self._selection_summary_panel()
         self.selection_tabs.addTab(self.selection_trace, "Rounds and progress")
         self.request_panel = self._request_panel()
-        self.selection_tabs.addTab(self.request_panel, "Request JSON")
+        self._request_tab_index = self.selection_tabs.addTab(self.request_panel, "Request JSON")
         self.selection_tabs.addTab(self.selection_json, "Result JSON")
+        self.selection_tabs.addTab(self.selection_summary, "Summary")
         layout.addWidget(self.selection_tabs, 1)
-        return panel
+        self.selection_panel_scroll = QScrollArea()
+        self.selection_panel_scroll.setWidgetResizable(True)
+        self.selection_panel_scroll.setWidget(panel)
+        return self.selection_panel_scroll
+
+    def _selection_summary_panel(self):
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(10)
+
+        def label(text, parent_layout):
+            widget = QLabel(text)
+            widget.setTextFormat(Qt.TextFormat.PlainText)
+            widget.setWordWrap(True)
+            widget.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            parent_layout.addWidget(widget)
+            return widget
+
+        heading = QHBoxLayout()
+        label("MODEL CHOICE", heading)
+        heading.addStretch()
+        self.selection_copy_button = QPushButton("Copy summary")
+        self.selection_copy_button.setEnabled(False)
+        self.selection_copy_button.clicked.connect(self.copy_selection_summary)
+        heading.addWidget(self.selection_copy_button)
+        layout.addLayout(heading)
+        self.selection_choice = label("No current selected action", layout)
+        self.selection_choice.setAccessibleName("Jev selected action")
+        self.selection_choice.setStyleSheet("font-size: 22px; font-weight: 600; color: #7edeb5;")
+        self.selection_reason = label("", layout)
+        self.selection_reason.hide()
+        label("Preview only · 0 actions performed", layout)
+        metrics = QGridLayout()
+        metrics.setHorizontalSpacing(16)
+        self.selection_metrics = {}
+        for column, (key, title) in enumerate((("observed_options", "Options found"),
+                                               ("considered_options", "Options evaluated"),
+                                               ("request_count", "Model requests"))):
+            card = QWidget()
+            card.setStyleSheet("background: #24323d; border-radius: 5px;")
+            card_layout = QVBoxLayout(card)
+            label(title, card_layout)
+            value = label("--", card_layout)
+            value.setAccessibleName(title)
+            value.setStyleSheet("font-size: 24px; font-weight: 600;")
+            self.selection_metrics[key] = value
+            metrics.addWidget(card, 0, column)
+            metrics.setColumnStretch(column, 1)
+        layout.addLayout(metrics)
+        self.selection_buckets = label("Classification totals appear after a preview.", layout)
+        self.selection_coverage = label("Counts refer to options captured in the observed window.", layout)
+        self.selection_coverage.setStyleSheet("color: #d9c28b;")
+        layout.addStretch()
+        self._selection_summary_text = ""
+        scroll = QScrollArea()
+        scroll.setAccessibleName("Jev selection summary")
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(panel)
+        return scroll
+
+    def _clear_selection_summary(self):
+        self.selection_choice.setText("No current selected action")
+        self.selection_reason.clear()
+        self.selection_reason.hide()
+        for label in self.selection_metrics.values():
+            label.setText("--")
+        self.selection_buckets.setText("Classification totals appear after a preview.")
+        self.selection_coverage.setText("Counts refer to options captured in the observed window.")
+        self._selection_summary_text = ""
+        self.selection_copy_button.setEnabled(False)
+
+    def _show_selection_summary(self, result):
+        def count(value):
+            return f"{value:,}" if type(value) is int and value >= 0 else "--"
+
+        found = count(result.get("observed_options"))
+        evaluated = count(result.get("considered_options"))
+        requests = count(result.get("request_count"))
+        self.selection_metrics["observed_options"].setText(found)
+        self.selection_metrics["considered_options"].setText(f"{evaluated} of {found}")
+        self.selection_metrics["request_count"].setText(requests)
+        option = result["selected_option"]
+        if option:
+            element = self._elements.get(option["element_id"], {})
+            name = option.get("label") or _name(element)
+            choice = f"{option['operation'].replace('_', ' ').capitalize()} → {name}"
+        else:
+            statuses = {"no_match": "No suitable action found", "budget_exhausted": "Request or round limit reached",
+                        "cancelled": "Selection cancelled"}
+            choice = "No action selected · " + statuses.get(result["status"], "Selection stopped")
+        self.selection_choice.setText(choice)
+        reason = str(result.get("reason") or "")[:1000] if not option else ""
+        self.selection_reason.setText(reason)
+        self.selection_reason.setVisible(bool(reason))
+        buckets = result.get("classification_counts")
+        bucket_text = "Classification totals unavailable."
+        if isinstance(buckets, dict):
+            bucket_text = " · ".join(f"{count(buckets.get(key))} {key}" for key in ("promising", "uncertain", "unlikely"))
+        self.selection_buckets.setText(bucket_text)
+        incomplete = result.get("incomplete_observation")
+        if self.snapshot is not None:
+            incomplete = (incomplete is True or self.snapshot.get("status") != "complete"
+                          or self.snapshot.get("truncated") is True)
+        coverage = ("Incomplete capture: some controls may be missing, even if every captured option was evaluated."
+                    if incomplete is True else "Counts cover the captured options, not every possible action in the app.")
+        self.selection_coverage.setText(coverage)
+        lines = [f"Goal: {result['goal']}", f"Model choice: {choice}", "Preview only · 0 actions performed",
+                 f"Options found: {found}", f"Options evaluated: {evaluated} of {found}",
+                 bucket_text, f"Model requests: {requests}", coverage]
+        if reason:
+            lines.append("Reason: " + reason)
+        self._selection_summary_text = "\n".join(lines)
+        self.selection_copy_button.setEnabled(True)
+        self.selection_tabs.setCurrentWidget(self.selection_summary)
+        self.selection_panel_scroll.ensureWidgetVisible(self.selection_tabs)
+
+    def copy_selection_summary(self):
+        if self.selection_result is not None and self._selection_summary_text:
+            QApplication.clipboard().setText(self._selection_summary_text)
 
     def _request_panel(self):
         panel = QWidget()
@@ -419,9 +536,9 @@ class UIAViewer(QMainWindow):
         reopen.clicked.connect(self.open_request_inspector)
         placeholder_layout.addWidget(reopen)
         placeholder_layout.addStretch()
-        self.selection_tabs.removeTab(1)
-        self.selection_tabs.insertTab(1, placeholder, "Request JSON")
-        self.selection_tabs.setCurrentIndex(1)
+        self.selection_tabs.removeTab(self._request_tab_index)
+        self.selection_tabs.insertTab(self._request_tab_index, placeholder, "Request JSON")
+        self.selection_tabs.setCurrentIndex(self._request_tab_index)
         dialog = QDialog(self)
         dialog.setWindowTitle("Jev request JSON — local inspector")
         dialog.resize(1100, 800)
@@ -434,9 +551,9 @@ class UIAViewer(QMainWindow):
         self.request_expand.setVisible(False)
 
         def restore_panel(*_):
-            self.selection_tabs.removeTab(1)
-            self.selection_tabs.insertTab(1, self.request_panel, "Request JSON")
-            self.selection_tabs.setCurrentIndex(1)
+            self.selection_tabs.removeTab(self._request_tab_index)
+            self.selection_tabs.insertTab(self._request_tab_index, self.request_panel, "Request JSON")
+            self.selection_tabs.setCurrentIndex(self._request_tab_index)
             self.request_expand.setVisible(True)
             self.request_dialog = None
             placeholder.deleteLater()
@@ -498,9 +615,9 @@ class UIAViewer(QMainWindow):
                 self._add_request_body(record, "Planned — not sent")
         except SelectionError as error:
             self.request_summary.setText(str(error))
-            self.selection_tabs.setCurrentIndex(1)
+            self.selection_tabs.setCurrentIndex(self._request_tab_index)
             return False
-        self.selection_tabs.setCurrentIndex(1)
+        self.selection_tabs.setCurrentIndex(self._request_tab_index)
         self.open_request_inspector()
         return True
 
@@ -857,7 +974,7 @@ class UIAViewer(QMainWindow):
     def _invalidate_selection(self, reason):
         self.selection_result = None
         self._selection_pending_result = None
-        self.selection_choice.setText("No current selected action")
+        self._clear_selection_summary()
         self.selection_json.clear()
         self.selection_trace.clear()
         self._clear_request_bodies()
@@ -872,6 +989,7 @@ class UIAViewer(QMainWindow):
                 or self.snapshot is None or not self.snapshot.get("options") or not goal or len(goal) > 4000):
             return
         self._invalidate_selection("Starting Jev selection preview…")
+        self.selection_tabs.setCurrentWidget(self.selection_trace)
         request = {"snapshot": copy.deepcopy(self.snapshot), "goal": goal, "run_id": uuid.uuid4().hex}
         payload = (json.dumps(request, ensure_ascii=False) + "\n").encode("utf-8")
         if len(payload) > MAX_OUTPUT_BYTES:
@@ -916,7 +1034,7 @@ class UIAViewer(QMainWindow):
         self._selection_abort_reason = reason
         self._selection_pending_result = None
         self.selection_result = None
-        self.selection_choice.setText("No current selected action")
+        self._clear_selection_summary()
         self.selection_json.clear()
         self._selection_buffer.clear()
         self._selection_deadline.stop()
@@ -1086,12 +1204,7 @@ class UIAViewer(QMainWindow):
                 f"{status.replace('_', ' ').capitalize()} · {result.get('request_count', '?')} model requests · "
                 f"{result.get('considered_options', '?')} of {result.get('observed_options', '?')} options considered · Input actions: 0"
             )
-            option = result["selected_option"]
-            if option:
-                element = self._elements.get(option["element_id"], {})
-                self.selection_choice.setText(f"Selected preview: {option['operation'].replace('_', ' ')} → {_name(element)} ({element.get('role', 'role unavailable')})")
-            else:
-                self.selection_choice.setText("No action selected · " + str(result.get("reason") or status.replace("_", " "))[:1000])
+            self._show_selection_summary(result)
             if not self._selection_events or self.selection_trace.blockCount() <= 1:
                 for entry in result["trace"][:2000]:
                     if isinstance(entry, dict):
