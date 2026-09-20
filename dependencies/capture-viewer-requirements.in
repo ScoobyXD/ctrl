@@ -1,0 +1,6 @@
+# Windows x64 / CPython 3.12.13. Keep the evaluated inference stack unchanged.
+-r windowsml-requirements.in
+-c windowsml-requirements.lock
+PySide6==6.11.2
+# Supported v1 maintenance line; do not silently upgrade to the v2 API.
+mcp==1.30.0
