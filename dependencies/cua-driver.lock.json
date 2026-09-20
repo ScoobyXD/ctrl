@@ -1,0 +1,10 @@
+{
+  "version": "0.28.2",
+  "tag": "cua-driver-rs-v0.28.2",
+  "revision": "fc188250b4ca8549b8e61f937fdb1fb560770e86",
+  "target": "windows-x86_64",
+  "releaseUrl": "https://github.com/trycua/cua/releases/tag/cua-driver-rs-v0.28.2",
+  "asset": "cua-driver-rs-0.28.2-windows-x86_64.zip",
+  "sha256": "3c1fcf10ff9513b94e4af78ad6a216ab62aa95b2c9a3b70dfbdba9f04e021533",
+  "executableSha256": "dbbd52d75759900155fbf3d5f0a13c759a12d06ef17338b88b3f2b8b9c1ef8dc"
+}

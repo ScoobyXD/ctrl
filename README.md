@@ -12,4 +12,11 @@ The intended loop is:
 4. Online JEV chooses among those actions.
 5. Application code validates the target, sends the action through CUA Driver, and observes the result.
 
-Application code is not implemented yet. There are no install or run commands at this stage. The first milestone is read-only window capture with verified coordinates.
+Native Windows CUA Driver **0.28.2** is the first dependency. Install it locally and run the read-only fixture capture with PowerShell 7.2+:
+
+```powershell
+pwsh -NoProfile -File ./scripts/install-cua-driver.ps1
+pwsh -NoProfile -File ./scripts/test-cua-driver.ps1
+```
+
+See [CUA Driver setup](docs/CUA_DRIVER.md) and [verification results](docs/CUA_DRIVER_VERIFICATION.md). Runtime files and captures stay under Git-ignored `.runtime/`. The application, perception components, JEV integration, and input delivery are not implemented or validated yet.
