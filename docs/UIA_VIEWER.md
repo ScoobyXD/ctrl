@@ -12,6 +12,8 @@ This is a manual, fixed-snapshot viewer, with no screenshot capture, OCR, action
 4. Optionally enter a goal on **Jev selection preview**, then click **Preview selection with Jev**. This explicitly starts remote selection. A selected preview is a recommendation to inspect, with **Input actions: 0**.
 5. After the target changes, click **Observe / Refresh** again. There is no continuous monitoring or automatic refresh.
 
+The whole page scrolls using the scrollbar at the far right. Scroll down to move the window picker and goal out of the way when reading results. The Jev result tabs keep a large reading area even in a small window; the JSON pane also has its own scrollbar for moving through the full document.
+
 ### Window picker
 
 The list contains visible, titled top-level windows, sorted by title. It can include terminals, system windows, and the viewer itself. It is a list of windows, not every installed application or every browser tab. A browser's inactive tabs are not separate targets unless they have their own windows.
@@ -50,11 +52,9 @@ The live helper retrieves the OpenRouter key from the existing AWS Secrets Manag
 
 The preview evaluates **all options in the snapshot**, regardless of the highlighted row, table sorting, or search filter. It sends your goal, window title, option descriptions, control names/roles/states, readable non-password values, and limited ancestor context to OpenRouter / TypeSafe. It does not send a screenshot, desktop bounds, HWND/PID or credentials as model evidence. Ordinary UI text in those descriptions can still contain target content.
 
-Jev classifies options as promising, uncertain or unlikely, narrows large groups in bounded rounds, and compares finalists. It can return no match or stop at its request budget. The **Summary** tab, immediately after **Result JSON**, opens when a result is ready and shows the recommended action, observed and evaluated option counts, classification totals, model request count, and whether the observation was incomplete. **Copy summary** copies the readable result. Evaluating every captured option does not imply complete coverage of the application. The recommendation identifies one observed operation and control; it does not supply text to type, execute an action, or establish that the screen is still current.
+Jev classifies options as promising, uncertain or unlikely, narrows large groups in bounded rounds, and compares finalists. It can return no match or stop at its request budget. **Rounds and progress** shows the stages and completed requests; **Result JSON** contains the result, trace and reported usage. The recommendation identifies an observed operation and control. It does not supply text to type, execute an action, or establish that the screen is still current.
 
-**Rounds and progress** shows the stages and completed requests. **Request JSON** retains the outgoing request inspector, and **Result JSON** contains the full result, trace and reported usage for detailed inspection. The summary and full JSON both describe a preview with zero input actions.
-
-Changing the goal, refreshing windows, changing targets or observing again invalidates the preview. **Cancel selection** stops the local selection helper; already dispatched remote requests may still finish and incur charges. **Export full JSON…** explicitly saves the current result separately from the UIA snapshot. The [selection guide](JEV_SELECTION.md) covers the algorithm, data flow, budgets and offline CLI preview.
+Changing the goal, refreshing windows, changing targets or observing again invalidates the preview. **Cancel selection** stops the local selection helper; already dispatched remote requests may still finish and incur charges. **Export selection JSON** explicitly saves the current result separately from the UIA snapshot. The [selection guide](JEV_SELECTION.md) covers the algorithm, data flow, budgets and offline CLI preview.
 
 ### Search, export, counts and incomplete results
 
