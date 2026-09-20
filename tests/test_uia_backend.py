@@ -140,6 +140,15 @@ class CapabilityContractTests(unittest.TestCase):
 
 
 class PropertySafetyTests(unittest.TestCase):
+    def test_runtime_identity_uses_read_only_method_when_cache_is_unavailable(self):
+        node = FakeNode()
+        node.GetRuntimeId = lambda: (42, 10, 20)
+        data = reader_for().read(node, "snapshot", 0, None)
+        self.assertEqual(data["runtime_id"], [42, 10, 20])
+        node.cached["RuntimeId"] = (42, 11, 21)
+        node.GetRuntimeId = lambda: (_ for _ in ()).throw(AssertionError("Cache already supplied identity"))
+        self.assertEqual(reader_for().read(node, "snapshot", 0, None)["runtime_id"], [42, 11, 21])
+
     def test_initial_bulk_cache_never_prefetches_password_values(self):
         requested = []
         cache = SimpleNamespace(AddProperty=requested.append)

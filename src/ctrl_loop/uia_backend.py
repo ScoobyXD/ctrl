@@ -21,6 +21,9 @@ META = {
     "class_name": "ClassName", "framework_id": "FrameworkId", "enabled": "IsEnabled",
     "focused": "HasKeyboardFocus", "offscreen": "IsOffscreen", "is_password": "IsPassword",
     "bounds": "BoundingRectangle",
+    # Snapshot IDs are display identities only. RuntimeId lets execution match
+    # the same native control in an independently collected current snapshot.
+    "runtime_id": "RuntimeId",
 }
 STATE = {
     "value_read_only": "ValueIsReadOnly", "range_read_only": "RangeValueIsReadOnly",
@@ -83,6 +86,13 @@ def primitive(value):
 
 class UIAReader:
     def __init__(self):
+        # Match CUA's physical desktop rectangles, including mixed-DPI desktops.
+        # This helper has no windows; set awareness before COM initializes UIA.
+        if sys.platform == "win32":
+            dpi = ctypes.WinDLL("user32", use_last_error=True)
+            dpi.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+            dpi.SetProcessDpiAwarenessContext.restype = wintypes.BOOL
+            dpi.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))  # PER_MONITOR_AWARE_V2
         # comtypes initializes COM at import time. This process never owns Qt windows.
         sys.coinit_flags = 0
         import comtypes.client
@@ -123,6 +133,13 @@ class UIAReader:
                 errors.append(name + " unavailable (provider or stale element)")
                 return None
         data = {key: cached(name) for key, name in META.items()}
+        if not isinstance(data["runtime_id"], list) or not data["runtime_id"]:
+            # Some WinForms providers omit the cached RuntimeId property while
+            # exposing the read-only IUIAutomationElement.GetRuntimeId method.
+            try:
+                data["runtime_id"] = primitive(node.GetRuntimeId())
+            except Exception:
+                data["runtime_id"] = None
         role_id = data.pop("role_id")
         data["role"] = self.roles.get(role_id, "Unknown")
         data["state"] = {key: cached(name) for key, name in STATE.items()}

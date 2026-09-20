@@ -1,8 +1,8 @@
 # UIA viewer guide
 
-The viewer reads the accessibility information exposed by one Windows application window. **Controls** shows what was observed; **Options** lists operations supported by those controls; **Jev selection preview** can recommend one option for your goal. Selecting a window, table row, or recommendation never clicks, types, scrolls, focuses, or otherwise operates the target. The optional Jev button makes remote model requests; ordinary observation and table inspection stay local.
+The viewer reads the accessibility information exposed by one Windows application window. **Controls** shows what was observed; **Options** lists operations supported by those controls; **Jev selection preview** can recommend one option for your goal. **CUA execution** explicitly starts a bounded loop that can operate that window. Selecting a window, table row, or recommendation never performs input. Jev preview and execution make remote model requests; ordinary observation and table inspection stay local.
 
-This is a manual, fixed-snapshot viewer, with no screenshot capture, OCR, action executor, or automatic agent loop. The separate capture viewer, CUA adapter, and YOLO detector are unchanged.
+Manual observation and preview use fixed snapshots. The execution tab observes again after selection and after input; it uses the pinned native CUA driver. The separate capture viewer and YOLO detector are unchanged.
 
 ## Quick tour
 
@@ -10,7 +10,8 @@ This is a manual, fixed-snapshot viewer, with no screenshot capture, OCR, action
 2. Click **Observe / Refresh** to collect its current accessible controls. The previous snapshot is cleared while the helper runs. **Cancel** stops the helper and leaves no current snapshot.
 3. Inspect **Controls** and **Options**. Click a row to read its complete JSON record below the table. Resize columns, click headers to sort, and use the table's horizontal scrollbar for columns further right. Drag the divider above the details pane to give either pane more room.
 4. Optionally enter a goal on **Jev selection preview**, then click **Preview selection with Jev**. This explicitly starts remote selection. A selected preview is a recommendation to inspect, with **Input actions: 0**.
-5. After the target changes, click **Observe / Refresh** again. There is no continuous monitoring or automatic refresh.
+5. To perform input, open **CUA execution**, review the shared goal and run limits, and press **Start execution**. **Stop execution** cancels the loop. Each completed input attempt is followed by a fresh observation when possible.
+6. Outside an execution run, refresh manually after the target changes.
 
 The whole page scrolls using the scrollbar at the far right. Scroll down to move the window picker and goal out of the way when reading results. The Jev result tabs keep a large reading area even in a small window; the JSON pane also has its own scrollbar for moving through the full document.
 
@@ -38,7 +39,7 @@ Each row pairs a control with one supported operation: for example `activate`, `
 
 Options require a control to be known enabled and onscreen, plus the relevant reported pattern and state. Writable values additionally require explicit non-password status. Disabled, offscreen, read-only or unknown-state controls may still appear in Controls without a corresponding option. See [the candidate rules](#candidate-rules-and-json-interface) for the exact mapping.
 
-**Required input** describes information a future executor would need. `set value` needs explicit text; a scroll option needs a direction. This viewer has no input form or execution button for those operations. Selecting an option only displays the option and its target element below the table, marked `preview_only: true`. Even an unexpected provider-reported setter is only a capability description; no test action is attempted.
+**Required input** describes information execution needs. `set value` needs explicit text; a scroll option needs a direction. Supply these as target-specific argument bindings on **CUA execution**. Selecting an option only displays the option and its target element below the table, marked `preview_only: true`; it does not run a test action.
 
 ### Jev selection preview tab: a recommendation for your goal
 
@@ -62,7 +63,7 @@ Changing the goal, refreshing windows, changing targets or observing again inval
 
 **Export snapshot JSON** saves the complete current snapshot, including both elements and options, even when search hides rows. It does not include the separately exported Jev result. Normal observations stay in memory; exports can include ordinary target text. The backend never requests password values.
 
-**Element limit** caps the next observation: the viewer defaults to 1,000 and allows 100–5,000. A higher limit does not discover content that the application does not expose, and the observation still has a time budget. **PARTIAL / TRUNCATED** means controls may be missing; warnings describe the available cause. **COMPLETE** means traversal finished within its limits, not that every visual item or hidden page control was found. Collapsed/virtualized content, inactive tabs, custom canvas widgets and inaccessible or elevated targets can be absent or incomplete. The viewer never scrolls or expands the target to reveal more.
+**Element limit** caps each observation: the viewer defaults to 1,000 and allows 100–5,000. A higher limit does not discover content that the application does not expose, and the observation still has a time budget. **PARTIAL / TRUNCATED** means controls may be missing; warnings describe the available cause. **COMPLETE** means traversal finished within its limits, not that every visual item or hidden page control was found. Collapsed/virtualized content, inactive tabs, custom canvas widgets and inaccessible or elevated targets can be absent or incomplete. Observation itself never scrolls or expands the target.
 
 The snapshot is a point-in-time approximation: providers can change or report stale information during reads. Observe again after manually switching browser tabs, expanding content or changing target values. More [coverage and validation limits](#validation-and-limits) appear below.
 
@@ -87,7 +88,35 @@ pwsh -NoProfile -File 'C:\Users\Jonat\ctrl\worktrees\uia-control-options\scripts
 
 Each launcher loads the source and runtime from its own checkout. Merging a change into `main` does not automatically update another worktree; update that worktree to the desired commit too. To launch directly from the main checkout after its one-time installation above, use `pwsh -NoProfile -File 'C:\Users\Jonat\ctrl\scripts\start-uia-viewer.ps1'`. Runtime directories are local to each checkout and are not included in Git merges.
 
-The viewer never calls Invoke, SetValue, Toggle, Select, Expand, Scroll, ScrollIntoView, Realize, or input APIs. The option list is descriptive, with no dispatch endpoint or executable command stored in it.
+Observation, table inspection and preview never call action APIs. **Start execution** launches the separate execution helper and uses the pinned CUA driver for supported operations. The option list itself remains descriptive.
+
+### CUA execution tab
+
+Install the existing UIA and [Jev runtime](JEV_SELECTION.md#setup-and-use), plus the [pinned CUA driver](CUA_DRIVER.md), in this checkout. Run on the logged-in interactive Windows desktop. The execution helper uses the local Jev Python runtime and launches the local UIA observation runtime separately.
+
+Choose a target window and enter a goal on **CUA execution**. The goal is shared with the preview tab. Opening the tab or entering a goal starts nothing. Set **Maximum steps** (1–20, default 5) and **Time limit** (5–1,200 seconds, default 300), then press **Start execution**. A prior observation or preview is unnecessary: each run obtains its own fresh snapshot.
+
+The loop asks Jev to select from the current supported options, observes again, checks the selected control's runtime identity, metadata, ancestry, state and current capability, and asks CUA to deliver the operation. It then reads another fresh UIA snapshot and continues within the limits. Runtime identities and geometry are current evidence, not durable locators. Changing the window or goal stops the active run. The tables display the latest run observation.
+
+**Stop execution (Esc)** requests cancellation; Escape also works while another viewer tab is open. The viewer kills an unresponsive owned helper after 1.5 seconds. Closing the viewer also stops its run. Already dispatched model requests can still finish and incur charges. Input already delivered cannot be undone, and interrupted delivery can have an unknown outcome; the log retains known receipts instead of claiming zero input after cancellation.
+
+The **Actions and observations** log labels a Jev choice as a **prediction**, records each driver's input outcome, and separately records the observation after input. `delivered` means the driver reported delivery. `observed_change` means the fresh UIA state differs; neither means the requested goal is complete. Runs can stop at limits, no match, no observed progress, a stale target, missing arguments, cancellation, or a failure. No-match is not a success signal. **Action / result JSON** shows the concrete receipts and results; **Export execution JSON** saves the request, events, observations and final result explicitly. These can contain target text and any supplied argument values.
+
+**Explicit arguments** is optional JSON, defaulting to `{}`. Every binding needs an operation and an exact accessible `name` or `automation_id`; optionally add `role`. A selected argument-taking operation must match exactly one binding. Names and AutomationIds can be duplicated, so use enough fields to describe the intended control and inspect the current observation. Missing/ambiguous bindings stop with `needs_arguments`; Jev does not invent text, numbers or directions.
+
+```json
+{
+  "bindings": [
+    {"operation": "set_value", "name": "Draft", "value": "My explicit draft text"},
+    {"operation": "set_range_value", "automation_id": "volume", "value": 25},
+    {"operation": "scroll_vertical", "name": "Results", "direction": "down"}
+  ]
+}
+```
+
+Text is limited to 4,000 characters. Range values must be finite numbers within the current reported range. Vertical directions are `up`/`down`; horizontal directions are `left`/`right`. Bindings are local execution arguments, not generated model output. A browser-tab goal can progress when the browser exposes the tab as a supported option, then exposes the destination's next control after selection. Controls absent from the accessibility tree cannot be selected by this loop.
+
+See [CUA execution](CUA_EXECUTION.md) for the driver operation mapping, helper protocol, limitations and live verification.
 
 ## Repeatable owned demo
 
@@ -119,7 +148,7 @@ Explicit Observe -> asynchronous Qt QProcess -> one Python MTA process
   -> JSON pipe -> searchable GUI / explicit export
 ```
 
-`uia_backend.UIAReader` reads controls; `uia_contract.build_options` derives candidates; `scripts/uia-observe.py` is the supported process boundary; `uia_viewer.UIAViewer` owns each helper. Windows listing uses read-only EnumWindows/caption/PID APIs in its own helper. No native element pointer, RuntimeId or durable locator escapes the observation process. Element IDs are generated from a UUID snapshot ID and traversal ordinal. Labels and AutomationId are metadata, never uniqueness or persistence guarantees.
+`uia_backend.UIAReader` reads controls; `uia_contract.build_options` derives candidates; `scripts/uia-observe.py` is the supported observation process boundary; `uia_viewer.UIAViewer` owns each helper. Windows listing uses read-only EnumWindows/caption/PID APIs in its own helper. No native element pointer escapes the observation process. Serialized runtime IDs support comparison against fresh observations during execution; they are not durable locators. Snapshot element IDs are generated from a UUID and traversal ordinal. Labels and AutomationId are metadata, never uniqueness or persistence guarantees.
 
 The helper initializes COM as MTA and owns no GUI windows. A `TreeScope_Element` cache contains metadata, pattern-availability flags and non-content state. Cached traversal fetches one node's metadata at a time; it never calls subtree-wide FindAll. Value/RangeValue text is absent from that cache and is read only after cached and fresh `IsPassword` are explicitly false. Unknown password status withholds values and setters. TextPattern document text, legacy values, selected text and password content are never requested. Missing properties are `null`, not default false. Text fields are capped at 512 characters, with explicit warnings.
 
@@ -141,7 +170,7 @@ Options require `enabled=true` and `offscreen=false`, plus the provider's actual
 | RangeValue, explicitly writable and non-password | set_range_value with reported range |
 | Scroll with known scrollable axis | scroll_horizontal / scroll_vertical |
 
-Text, VirtualizedItem, ScrollItem and other reported patterns do not create guessed input options. Setter options require explicit future user-supplied values. Pattern support is the provider's claim; it does not prove a future action would succeed or be appropriate. Some providers expose unexpected writable Value patterns on title bars or checkboxes; these are displayed as reported, with no test action attempted.
+Text, VirtualizedItem, ScrollItem and other reported patterns do not create guessed input options. Setter options require explicit user-supplied values during execution. Pattern support is the provider's claim; it does not prove an action would succeed or be appropriate. Some providers expose unexpected writable Value patterns on title bars or checkboxes; inspection displays them without attempting a test action.
 
 ```powershell
 & ./.runtime/uia-venv/Scripts/python.exe -I ./scripts/uia-observe.py windows
@@ -156,9 +185,15 @@ Each command writes exactly one UTF-8 JSON object to stdout. The caller should p
 - `elements`: snapshot-scoped `id`, `parent_id`, `depth`, `name`, `role`, AutomationId/class/framework metadata, `value`, `is_password`, enabled/focused/offscreen, bounds `[x,y,width,height]`, pattern names, raw state and per-property errors.
 - `options`: snapshot-scoped `id`, `element_id`, `operation`, `label`, and a descriptive `requires` object. No native references or execution methods.
 
-The optional [Jev selection preview](JEV_SELECTION.md) consumes this JSON and recommends an existing option. Any future executor would still need an independently designed re-observation, authorization and execution boundary; the current viewer provides no execution stage.
+The optional [Jev selection preview](JEV_SELECTION.md) consumes this JSON and recommends an existing option. The separate [execution tab](#cua-execution-tab) starts from fresh observations and uses its own validation and driver boundary; it never executes an imported preview file.
 
 ## Validation and limits
+
+### Execution viewer verification
+
+In the execution worktree, **81 offline UIA/backend/CLI/viewer tests passed**, including 13 execution-viewer process tests. The new tests use local fake helpers with no model calls or desktop input. They cover explicit start, UTF-8 requests, fresh observation updates, malformed input/events, wrong run identity, graceful and forced cancellation, goal/target changes, helper crashes, late/nonzero final results, preserving known receipts, and password-value redaction in execution exports.
+
+A native Windows Qt rendering check at 900×650 logical pixels and 150% desktop scaling verified readable execution controls, full-page scrolling, tab navigation, and the preview's three result tabs without a Summary tab. It exposed narrow-window toolbar clipping, which was fixed by placing observation controls below the window picker. Synthetic screenshots are stored under ignored `.ctrl/execution-viewer-check/`; they establish viewer layout only, not real input delivery.
 
 ### Current scrolling and guide checks
 

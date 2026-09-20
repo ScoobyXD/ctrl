@@ -1,4 +1,4 @@
-"""Start this checkout's observation-only UIA viewer without content logging."""
+"""Start this checkout's UIA preview/execution viewer without content logging."""
 from pathlib import Path
 import sys
 
