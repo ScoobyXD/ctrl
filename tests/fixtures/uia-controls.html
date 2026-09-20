@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CTRL UIA Browser Fixture</title>
+<style>
+  :root { font: 17px/1.5 system-ui, sans-serif; color: #173048; background: #edf2f7; }
+  body { max-width: 760px; margin: 36px auto; padding: 28px 36px; background: white; border-radius: 14px; }
+  h1 { margin: 0 0 8px; font-size: 30px; }
+  p { margin: 8px 0 24px; }
+  .field { display: grid; grid-template-columns: 180px 1fr; align-items: center; gap: 16px; margin: 20px 0; }
+  input:not([type=checkbox]), select, button { font: inherit; padding: 9px 12px; border: 1px solid #8495a6; border-radius: 5px; }
+  input[type=checkbox] { width: 20px; height: 20px; vertical-align: middle; margin-right: 10px; }
+  .actions { display: flex; gap: 16px; margin: 24px 0; }
+  button { color: white; background: #236bb3; cursor: pointer; }
+  button:disabled { color: #586575; background: #e8edf3; cursor: default; }
+  output { display: block; border-left: 4px solid #3a8a64; padding: 12px 16px; background: #f0f8f3; }
+  details { margin: 24px 0; padding: 14px; background: #f4f6fa; }
+  summary { cursor: pointer; }
+  small { display: block; color: #526171; margin-top: 24px; }
+</style>
+<main>
+  <h1>UIA browser observation fixture</h1>
+  <p>All data is synthetic. Reading the accessibility tree should leave these controls unchanged.</p>
+  <div class="field">
+    <label for="draft">Draft text</label>
+    <input id="draft" type="text" value="Example draft" autocomplete="off">
+  </div>
+  <div class="field">
+    <label for="theme">Theme choice</label>
+    <select id="theme">
+      <option selected>Light</option>
+      <option>Dark</option>
+      <option>System</option>
+    </select>
+  </div>
+  <label><input id="notifications" type="checkbox" checked>Enable notifications</label>
+  <div class="field">
+    <label for="password">Fixture password</label>
+    <input id="password" type="password" value="browser-secret-sentinel" autocomplete="off">
+  </div>
+  <div class="actions">
+    <button id="increment" type="button">Increment counter</button>
+    <button id="disabled" type="button" disabled>Disabled action</button>
+  </div>
+  <output id="counter" aria-label="Fixture action count">Activations: 0</output>
+  <details id="details">
+    <summary>Additional options</summary>
+    <p>Expanded fixture content. Observation should not expand this section.</p>
+    <label><input id="extra" type="checkbox">Extra option</label>
+  </details>
+  <small>No network calls, external dependencies, credentials, or automatic control actions.</small>
+</main>
+<script>
+  let activationCount = 0;
+  document.getElementById('increment').addEventListener('click', () => {
+    activationCount += 1;
+    document.getElementById('counter').textContent = `Activations: ${activationCount}`;
+  });
+</script>
+</html>

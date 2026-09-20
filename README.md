@@ -1,5 +1,20 @@
 # CTRL Loop
 
+## Separate UIA control-options viewer
+
+The observation-only UIA milestone is available through **separate** launchers. Choose an application window, click **Observe / Refresh**, and search its native accessible controls and supported operation candidates. Selecting an option only previews it. No Jev, model, screenshot detector, or action execution runs.
+
+```powershell
+pwsh -NoProfile -File ./scripts/install-uia-viewer.ps1 -Python '<CPython 3.12.13 x64 base/python.exe>'
+pwsh -NoProfile -File ./scripts/start-uia-viewer.ps1
+# Optional owned native + Chrome fixtures and viewer:
+pwsh -NoProfile -File ./scripts/start-uia-demo.ps1
+```
+
+See [UIA setup, JSON contract, demo and actual validation](docs/UIA_VIEWER.md). The existing capture implementation and its launchers below are preserved.
+
+## Existing Capture viewer
+
 CTRL now has a Windows desktop **Capture** viewer. Click once to capture the whole primary monitor, analyze that fixed screenshot with the local UI-trained YOLO detector, and display green outlines inside the app. CTRL briefly hides during acquisition, then restores. A new capture occurs only when you click again.
 
 ```powershell

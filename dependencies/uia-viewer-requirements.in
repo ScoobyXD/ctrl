@@ -1,0 +1,3 @@
+# Windows x64 / CPython 3.12.13. Independent of capture, CUA, YOLO, and Jev.
+PySide6==6.11.2
+comtypes==1.4.13

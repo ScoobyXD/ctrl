@@ -1,5 +1,11 @@
 # Windows visual assistant architecture
 
+## Separate UIA observation milestone
+
+This branch adds a second, independent viewer for the observation and candidate-list stages only. A selected HWND/PID is read through Windows UI Automation COM (`comtypes` 1.4.13), including browser content exposed by its UIA provider. A disposable MTA helper builds per-element property caches, excludes password values, and returns serializable snapshot-scoped controls and capability-backed operation options. The PySide6 GUI provides manual refresh, filtering, details, cancellation and explicit JSON export. It has no action dispatcher, Jev integration, model inference, screenshot capture or automated target input.
+
+The pinned CUA implementation was checked first. It exposes genuine UIA, but its unconditional value cache, inferred menu actions and missing serialized states do not satisfy this milestone. The dedicated reader is intentionally separate from the unchanged capture/CUA/YOLO viewer documented below. Native WinForms and ordinary Chrome page UIA were live verified. [Implementation, capability rules, measured evidence and limits](docs/UIA_VIEWER.md).
+
 Decision record · 20 September 2026 · The primary-screen capture-and-YOLO desktop viewer is implemented and live verified. OCR, JEV integration into the GUI, and action delivery remain future scope.
 
 ## Current milestone: manual capture viewer
