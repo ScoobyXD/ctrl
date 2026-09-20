@@ -1,6 +1,6 @@
 # CUA Driver: first dependency
 
-This installs **native Windows CUA Driver 0.28.2** from `trycua/cua`. It supplies local capture and, for later work, input delivery. No CUA Cloud Fleet, VM, account, API key, model API, Python SDK, or npm package is involved. YOLO, OCR, Windows ML, and JEV are not installed or integrated.
+This installs **native Windows CUA Driver 0.28.2** from `trycua/cua`. It supplies local capture and input delivery. The separate [UIA + Jev execution adapter](CUA_EXECUTION.md) now uses its pinned native action tools. This dependency installer itself uses no CUA Cloud Fleet, VM, account, API key, model API, Python SDK, or npm package, and does not install YOLO, OCR, Windows ML, or Jev.
 
 ## Reproduce
 

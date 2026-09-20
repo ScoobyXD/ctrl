@@ -1,4 +1,4 @@
-"""Manual Windows UIA observation viewer. Candidate selection never executes an action.
+"""Windows UIA inspector with separate preview and explicitly started execution.
 
 Every native observation runs in an expendable helper process. The GUI uses Qt's
 asynchronous process signals and a hard deadline; a wedged provider cannot wedge
@@ -13,17 +13,20 @@ import sys
 import uuid
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QProcess, QSortFilterProxyModel, Qt, QTimer
+from PySide6.QtGui import QShortcut
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QGridLayout, QHBoxLayout,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QHBoxLayout,
     QHeaderView, QLabel, QLineEdit, QListView, QMainWindow, QPlainTextEdit, QPushButton,
     QScrollArea, QSpinBox, QSplitter, QTableView, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from .jev import ENDPOINT, DecisionError, request_binding
+from .execution import validate_request as validate_execution_request
 from .selection import MAX_SELECTION_REQUEST_BYTES, SelectionError, SelectionSearch
 
 
 MAX_OUTPUT_BYTES = 8 * 1024 * 1024
+MAX_EXECUTION_OUTPUT_BYTES = 64 * 1024 * 1024
 ROOT = Path(__file__).resolve().parents[2]
 TAB_GUIDANCE = (
     "Controls are the accessible elements reported by this window. Select a row to read its details below; "
@@ -32,6 +35,8 @@ TAB_GUIDANCE = (
     "Select a row to inspect it below; required input is descriptive and no action runs.",
     "Enter a goal, then explicitly start Jev to suggest one option from the full snapshot, regardless of search "
     "or highlighted rows. The preview makes remote model requests and never executes the suggestion.",
+    "Start execution explicitly to observe, ask Jev, validate a current target, deliver CUA input, and observe again. "
+    "The action log distinguishes model choices, driver outcomes, and observations. Stop remains available.",
 )
 
 
@@ -52,6 +57,19 @@ def _name(element):
 def _bounds(element):
     value = element.get("bounds")
     return ", ".join(str(v) for v in value) if isinstance(value, list) else "Unavailable"
+
+
+def _redact_snapshot_values(snapshot):
+    """Do not display/export password values even from a faulty local helper."""
+    result = copy.deepcopy(snapshot)
+    for element in result.get("elements", []):
+        if not isinstance(element, dict) or not isinstance(element.get("state"), dict):
+            raise ValueError("Invalid snapshot element")
+        if element.get("is_password") is not False:
+            element["value"] = None
+            element["state"] = {key: value for key, value in element["state"].items()
+                                if key.lower() not in {"value", "text", "range_value", "legacy_value"}}
+    return result
 
 
 def _state_summary(state):
@@ -114,7 +132,8 @@ class UIAViewer(QMainWindow):
     def __init__(self, helper_path=None, *, observe_timeout=10.0,
                  deadline_slack_ms=3000, windows_timeout_ms=8000,
                  auto_discover=True, selection_helper_path=None,
-                 selection_python=None, selection_timeout_ms=300000):
+                 selection_python=None, selection_timeout_ms=300000,
+                 execution_helper_path=None, execution_python=None, execution_deadline_slack_ms=3000):
         super().__init__()
         self.helper_path = Path(helper_path) if helper_path else ROOT / "scripts" / "uia-observe.py"
         self.observe_timeout = observe_timeout
@@ -136,6 +155,20 @@ class UIAViewer(QMainWindow):
         self._selection_deadline = QTimer(self)
         self._selection_deadline.setSingleShot(True)
         self._selection_deadline.timeout.connect(lambda: self._abort_selection("Selection timed out. Already dispatched provider requests may still finish."))
+        self.execution_helper_path = Path(execution_helper_path) if execution_helper_path else ROOT / "scripts" / "cua-run.py"
+        self.execution_python = Path(execution_python) if execution_python else self.selection_python
+        self.execution_deadline_slack_ms = execution_deadline_slack_ms
+        self.execution_process = None
+        self.execution_result = None
+        self.execution_events = []
+        self._execution_request = None
+        self._execution_buffer = bytearray()
+        self._execution_bytes = 0
+        self._execution_abort_reason = None
+        self._execution_pending_result = None
+        self._execution_deadline = QTimer(self)
+        self._execution_deadline.setSingleShot(True)
+        self._execution_deadline.timeout.connect(lambda: self._abort_execution("Execution timed out. An in-flight action may have an unknown outcome."))
         self.snapshot = None
         self.process = None
         self._output = bytearray()
@@ -153,8 +186,9 @@ class UIAViewer(QMainWindow):
 
         title = QLabel("UIA control options")
         title.setObjectName("pageTitle")
-        subtitle = QLabel("Observe a window, inspect its controls, and preview supported operations.")
-        note = QLabel("Local observation · Selecting an option never performs it · Optional Jev preview uses remote model requests")
+        subtitle = QLabel("Observe a window, inspect controls, preview a selection, or explicitly run a bounded goal.")
+        subtitle.setWordWrap(True)
+        note = QLabel("Inspection never performs input · Jev uses remote requests · Start execution enables actual CUA input")
         note.setObjectName("readOnlyNote")
         note.setWordWrap(True)
         self.target_combo = QComboBox()
@@ -202,10 +236,12 @@ class UIAViewer(QMainWindow):
         toolbar.addWidget(self.window_count)
         toolbar.addWidget(self.target_combo, 1)
         toolbar.addWidget(self.refresh_windows_button)
-        toolbar.addWidget(QLabel("Element limit"))
-        toolbar.addWidget(self.max_elements)
-        toolbar.addWidget(self.observe_button)
-        toolbar.addWidget(self.cancel_button)
+        observation_toolbar = QHBoxLayout()
+        observation_toolbar.addWidget(QLabel("Element limit"))
+        observation_toolbar.addWidget(self.max_elements)
+        observation_toolbar.addWidget(self.observe_button)
+        observation_toolbar.addWidget(self.cancel_button)
+        observation_toolbar.addStretch()
 
         self.status = QLabel("Choose a target window and press Observe / Refresh.")
         self.status.setTextFormat(Qt.TextFormat.PlainText)
@@ -247,6 +283,7 @@ class UIAViewer(QMainWindow):
         self.tabs.addTab(self.controls_table, "Controls (0)")
         self.tabs.addTab(self.options_table, "Options (0)")
         self.tabs.addTab(self._selection_panel(), "Jev selection preview")
+        self.tabs.addTab(self._execution_panel(), "CUA execution")
         self.tabs.currentChanged.connect(self._tab_changed)
         self.tab_guidance = QLabel(TAB_GUIDANCE[0])
         self.tab_guidance.setWordWrap(True)
@@ -270,6 +307,7 @@ class UIAViewer(QMainWindow):
         layout.addWidget(subtitle)
         layout.addWidget(note)
         layout.addLayout(toolbar)
+        layout.addLayout(observation_toolbar)
         layout.addWidget(self.status)
         layout.addWidget(self.summary)
         layout.addLayout(filter_bar)
@@ -277,7 +315,12 @@ class UIAViewer(QMainWindow):
         layout.addWidget(splitter, 1)
         central = QWidget()
         central.setLayout(layout)
-        self.setCentralWidget(central)
+        self.page_scroll = QScrollArea()
+        self.page_scroll.setAccessibleName("Scrollable UIA viewer page")
+        self.page_scroll.setWidgetResizable(True)
+        self.page_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        self.page_scroll.setWidget(central)
+        self.setCentralWidget(self.page_scroll)
         self.setStyleSheet("""
             QMainWindow, QWidget { background: #182027; color: #e7eef3; font: 13px 'Segoe UI'; }
             QLabel#pageTitle { font-size: 25px; font-weight: 650; }
@@ -314,6 +357,76 @@ class UIAViewer(QMainWindow):
     def _window_count_changed(self, *_):
         self.window_count.setText(f"Window ({self.target_combo.count()})")
 
+    def _execution_panel(self):
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        note = QLabel("Start execution performs real input in the selected window and makes remote Jev requests. "
+                      "It starts with a fresh observation. A model choice or delivered input does not prove the goal is complete.")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        self.execution_goal = QPlainTextEdit()
+        self.execution_goal.setPlaceholderText("Goal, shared with the preview: select the existing X tab, then open Bookmarks.")
+        self.execution_goal.setAccessibleName("Goal for CUA execution")
+        self.execution_goal.setMaximumHeight(90)
+        self.execution_goal.textChanged.connect(
+            lambda: self.selection_goal.setPlainText(self.execution_goal.toPlainText())
+            if self.selection_goal.toPlainText() != self.execution_goal.toPlainText() else None)
+        layout.addWidget(self.execution_goal)
+        limits = QHBoxLayout()
+        self.execution_steps = QSpinBox()
+        self.execution_steps.setRange(1, 20)
+        self.execution_steps.setValue(5)
+        self.execution_steps.setAccessibleName("Maximum execution steps")
+        self.execution_seconds = QSpinBox()
+        self.execution_seconds.setRange(5, 1200)
+        self.execution_seconds.setValue(300)
+        self.execution_seconds.setAccessibleName("Maximum execution seconds")
+        limits.addWidget(QLabel("Maximum steps"))
+        limits.addWidget(self.execution_steps)
+        limits.addWidget(QLabel("Time limit (seconds)"))
+        limits.addWidget(self.execution_seconds)
+        limits.addStretch()
+        layout.addLayout(limits)
+        label = QLabel("Explicit arguments (optional JSON). Match each value or direction to its control. Missing arguments stop the run.")
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        self.execution_arguments = QPlainTextEdit()
+        self.execution_arguments.setAccessibleName("Explicit execution arguments JSON")
+        self.execution_arguments.setMaximumHeight(100)
+        self.execution_arguments.setPlaceholderText(
+            '{"bindings":[{"operation":"set_value","name":"Draft","value":"My text"}]}')
+        buttons = QHBoxLayout()
+        self.execution_button = QPushButton("Start execution")
+        self.execution_button.clicked.connect(self.start_execution)
+        self.execution_stop_button = QPushButton("Stop execution (Esc)")
+        self.execution_stop_button.clicked.connect(self.stop_execution)
+        self.execution_stop_shortcut = QShortcut("Esc", self)
+        self.execution_stop_shortcut.activated.connect(self.stop_execution)
+        self.execution_export_button = QPushButton("Export execution JSON…")
+        self.execution_export_button.clicked.connect(self.export_execution_json)
+        for button in (self.execution_button, self.execution_stop_button, self.execution_export_button):
+            buttons.addWidget(button)
+        buttons.addStretch()
+        layout.addWidget(self.execution_arguments)
+        layout.addLayout(buttons)
+        self.execution_status = QLabel("Ready for an explicit start. No execution has been requested.")
+        self.execution_status.setTextFormat(Qt.TextFormat.PlainText)
+        self.execution_status.setWordWrap(True)
+        layout.addWidget(self.execution_status)
+        self.execution_trace = QPlainTextEdit()
+        self.execution_trace.setReadOnly(True)
+        self.execution_trace.setMaximumBlockCount(4000)
+        self.execution_trace.setAccessibleName("CUA action outcomes and fresh observations")
+        self.execution_json = QPlainTextEdit()
+        self.execution_json.setReadOnly(True)
+        self.execution_json.setMaximumBlockCount(20000)
+        self.execution_json.setAccessibleName("CUA action and result JSON")
+        self.execution_tabs = QTabWidget()
+        self.execution_tabs.addTab(self.execution_trace, "Actions and observations")
+        self.execution_tabs.addTab(self.execution_json, "Action / result JSON")
+        layout.addWidget(self.execution_tabs, 1)
+        return panel
+
     def _selection_panel(self):
         panel = QWidget()
         layout = QVBoxLayout(panel)
@@ -334,7 +447,7 @@ class UIAViewer(QMainWindow):
         self.selection_button.clicked.connect(self.preview_selection)
         self.selection_cancel_button = QPushButton("Cancel selection")
         self.selection_cancel_button.clicked.connect(self.cancel_selection)
-        self.selection_export_button = QPushButton("Export full JSON…")
+        self.selection_export_button = QPushButton("Export selection JSON…")
         self.selection_export_button.clicked.connect(self.export_selection_json)
         buttons.addWidget(self.selection_inspect_button)
         buttons.addWidget(self.selection_button)
@@ -346,6 +459,11 @@ class UIAViewer(QMainWindow):
         self.selection_status.setTextFormat(Qt.TextFormat.PlainText)
         self.selection_status.setWordWrap(True)
         layout.addWidget(self.selection_status)
+        self.selection_choice = QLabel("No current selected action")
+        self.selection_choice.setTextFormat(Qt.TextFormat.PlainText)
+        self.selection_choice.setWordWrap(True)
+        self.selection_choice.setStyleSheet("font-weight: 600; color: #7edeb5; padding: 6px 0;")
+        layout.addWidget(self.selection_choice)
         self.selection_trace = QPlainTextEdit()
         self.selection_trace.setReadOnly(True)
         self.selection_trace.setMaximumBlockCount(2000)
@@ -355,134 +473,12 @@ class UIAViewer(QMainWindow):
         self.selection_json.setReadOnly(True)
         self.selection_json.setAccessibleName("Complete Jev selection result JSON")
         self.selection_tabs = QTabWidget()
-        self.selection_tabs.setMinimumHeight(300)
-        self.selection_summary = self._selection_summary_panel()
         self.selection_tabs.addTab(self.selection_trace, "Rounds and progress")
         self.request_panel = self._request_panel()
-        self._request_tab_index = self.selection_tabs.addTab(self.request_panel, "Request JSON")
+        self.selection_tabs.addTab(self.request_panel, "Request JSON")
         self.selection_tabs.addTab(self.selection_json, "Result JSON")
-        self.selection_tabs.addTab(self.selection_summary, "Summary")
         layout.addWidget(self.selection_tabs, 1)
-        self.selection_panel_scroll = QScrollArea()
-        self.selection_panel_scroll.setWidgetResizable(True)
-        self.selection_panel_scroll.setWidget(panel)
-        return self.selection_panel_scroll
-
-    def _selection_summary_panel(self):
-        panel = QWidget()
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(18, 16, 18, 16)
-        layout.setSpacing(10)
-
-        def label(text, parent_layout):
-            widget = QLabel(text)
-            widget.setTextFormat(Qt.TextFormat.PlainText)
-            widget.setWordWrap(True)
-            widget.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            parent_layout.addWidget(widget)
-            return widget
-
-        heading = QHBoxLayout()
-        label("MODEL CHOICE", heading)
-        heading.addStretch()
-        self.selection_copy_button = QPushButton("Copy summary")
-        self.selection_copy_button.setEnabled(False)
-        self.selection_copy_button.clicked.connect(self.copy_selection_summary)
-        heading.addWidget(self.selection_copy_button)
-        layout.addLayout(heading)
-        self.selection_choice = label("No current selected action", layout)
-        self.selection_choice.setAccessibleName("Jev selected action")
-        self.selection_choice.setStyleSheet("font-size: 22px; font-weight: 600; color: #7edeb5;")
-        self.selection_reason = label("", layout)
-        self.selection_reason.hide()
-        label("Preview only · 0 actions performed", layout)
-        metrics = QGridLayout()
-        metrics.setHorizontalSpacing(16)
-        self.selection_metrics = {}
-        for column, (key, title) in enumerate((("observed_options", "Options found"),
-                                               ("considered_options", "Options evaluated"),
-                                               ("request_count", "Model requests"))):
-            card = QWidget()
-            card.setStyleSheet("background: #24323d; border-radius: 5px;")
-            card_layout = QVBoxLayout(card)
-            label(title, card_layout)
-            value = label("--", card_layout)
-            value.setAccessibleName(title)
-            value.setStyleSheet("font-size: 24px; font-weight: 600;")
-            self.selection_metrics[key] = value
-            metrics.addWidget(card, 0, column)
-            metrics.setColumnStretch(column, 1)
-        layout.addLayout(metrics)
-        self.selection_buckets = label("Classification totals appear after a preview.", layout)
-        self.selection_coverage = label("Counts refer to options captured in the observed window.", layout)
-        self.selection_coverage.setStyleSheet("color: #d9c28b;")
-        layout.addStretch()
-        self._selection_summary_text = ""
-        scroll = QScrollArea()
-        scroll.setAccessibleName("Jev selection summary")
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(panel)
-        return scroll
-
-    def _clear_selection_summary(self):
-        self.selection_choice.setText("No current selected action")
-        self.selection_reason.clear()
-        self.selection_reason.hide()
-        for label in self.selection_metrics.values():
-            label.setText("--")
-        self.selection_buckets.setText("Classification totals appear after a preview.")
-        self.selection_coverage.setText("Counts refer to options captured in the observed window.")
-        self._selection_summary_text = ""
-        self.selection_copy_button.setEnabled(False)
-
-    def _show_selection_summary(self, result):
-        def count(value):
-            return f"{value:,}" if type(value) is int and value >= 0 else "--"
-
-        found = count(result.get("observed_options"))
-        evaluated = count(result.get("considered_options"))
-        requests = count(result.get("request_count"))
-        self.selection_metrics["observed_options"].setText(found)
-        self.selection_metrics["considered_options"].setText(f"{evaluated} of {found}")
-        self.selection_metrics["request_count"].setText(requests)
-        option = result["selected_option"]
-        if option:
-            element = self._elements.get(option["element_id"], {})
-            name = option.get("label") or _name(element)
-            choice = f"{option['operation'].replace('_', ' ').capitalize()} → {name}"
-        else:
-            statuses = {"no_match": "No suitable action found", "budget_exhausted": "Request or round limit reached",
-                        "cancelled": "Selection cancelled"}
-            choice = "No action selected · " + statuses.get(result["status"], "Selection stopped")
-        self.selection_choice.setText(choice)
-        reason = str(result.get("reason") or "")[:1000] if not option else ""
-        self.selection_reason.setText(reason)
-        self.selection_reason.setVisible(bool(reason))
-        buckets = result.get("classification_counts")
-        bucket_text = "Classification totals unavailable."
-        if isinstance(buckets, dict):
-            bucket_text = " · ".join(f"{count(buckets.get(key))} {key}" for key in ("promising", "uncertain", "unlikely"))
-        self.selection_buckets.setText(bucket_text)
-        incomplete = result.get("incomplete_observation")
-        if self.snapshot is not None:
-            incomplete = (incomplete is True or self.snapshot.get("status") != "complete"
-                          or self.snapshot.get("truncated") is True)
-        coverage = ("Incomplete capture: some controls may be missing, even if every captured option was evaluated."
-                    if incomplete is True else "Counts cover the captured options, not every possible action in the app.")
-        self.selection_coverage.setText(coverage)
-        lines = [f"Goal: {result['goal']}", f"Model choice: {choice}", "Preview only · 0 actions performed",
-                 f"Options found: {found}", f"Options evaluated: {evaluated} of {found}",
-                 bucket_text, f"Model requests: {requests}", coverage]
-        if reason:
-            lines.append("Reason: " + reason)
-        self._selection_summary_text = "\n".join(lines)
-        self.selection_copy_button.setEnabled(True)
-        self.selection_tabs.setCurrentWidget(self.selection_summary)
-        self.selection_panel_scroll.ensureWidgetVisible(self.selection_tabs)
-
-    def copy_selection_summary(self):
-        if self.selection_result is not None and self._selection_summary_text:
-            QApplication.clipboard().setText(self._selection_summary_text)
+        return panel
 
     def _request_panel(self):
         panel = QWidget()
@@ -536,9 +532,9 @@ class UIAViewer(QMainWindow):
         reopen.clicked.connect(self.open_request_inspector)
         placeholder_layout.addWidget(reopen)
         placeholder_layout.addStretch()
-        self.selection_tabs.removeTab(self._request_tab_index)
-        self.selection_tabs.insertTab(self._request_tab_index, placeholder, "Request JSON")
-        self.selection_tabs.setCurrentIndex(self._request_tab_index)
+        self.selection_tabs.removeTab(1)
+        self.selection_tabs.insertTab(1, placeholder, "Request JSON")
+        self.selection_tabs.setCurrentIndex(1)
         dialog = QDialog(self)
         dialog.setWindowTitle("Jev request JSON — local inspector")
         dialog.resize(1100, 800)
@@ -551,9 +547,9 @@ class UIAViewer(QMainWindow):
         self.request_expand.setVisible(False)
 
         def restore_panel(*_):
-            self.selection_tabs.removeTab(self._request_tab_index)
-            self.selection_tabs.insertTab(self._request_tab_index, self.request_panel, "Request JSON")
-            self.selection_tabs.setCurrentIndex(self._request_tab_index)
+            self.selection_tabs.removeTab(1)
+            self.selection_tabs.insertTab(1, self.request_panel, "Request JSON")
+            self.selection_tabs.setCurrentIndex(1)
             self.request_expand.setVisible(True)
             self.request_dialog = None
             placeholder.deleteLater()
@@ -615,9 +611,9 @@ class UIAViewer(QMainWindow):
                 self._add_request_body(record, "Planned — not sent")
         except SelectionError as error:
             self.request_summary.setText(str(error))
-            self.selection_tabs.setCurrentIndex(self._request_tab_index)
+            self.selection_tabs.setCurrentIndex(1)
             return False
-        self.selection_tabs.setCurrentIndex(self._request_tab_index)
+        self.selection_tabs.setCurrentIndex(1)
         self.open_request_inspector()
         return True
 
@@ -657,13 +653,20 @@ class UIAViewer(QMainWindow):
         return True
 
     def _tab_changed(self, index):
+        # Keep results readable below the page header without constraining
+        # the resizable Controls/Options split when this tab is hidden.
+        self.selection_tabs.setMinimumHeight(600 if index == 2 else 0)
+        self.execution_tabs.setMinimumHeight(600 if index == 3 else 0)
         self.tab_guidance.setText(TAB_GUIDANCE[index])
         self.details.clear()
-        self.details.setVisible(index != 2)
+        self.details.setVisible(index < 2)
         if index == 0:
             self._show_selection(self.controls_table, self.controls_proxy, self.controls_model)
         elif index == 1:
             self._show_selection(self.options_table, self.options_proxy, self.options_model)
+        # A previously scrolled result should not hide the next tab's controls.
+        QTimer.singleShot(0, lambda: self.page_scroll.ensureWidgetVisible(self.tabs.tabBar(), 0, 12)
+                          if not self._closing else None)
 
     def _table(self, model):
         proxy = QSortFilterProxyModel(self)
@@ -715,20 +718,27 @@ class UIAViewer(QMainWindow):
 
     def _sync_buttons(self):
         active = self.process is not None
+        executing = self.execution_process is not None
         self.target_combo.setEnabled(not active)
-        self.refresh_windows_button.setEnabled(not active)
-        self.observe_button.setEnabled(not active and self.target_combo.currentData() is not None)
-        self.max_elements.setEnabled(not active)
+        self.refresh_windows_button.setEnabled(not active and not executing)
+        self.observe_button.setEnabled(not active and not executing and self.target_combo.currentData() is not None)
+        self.max_elements.setEnabled(not active and not executing)
         self.cancel_button.setEnabled(active)
         self.export_button.setEnabled(not active and self.snapshot is not None)
         selection_active = self.selection_process is not None
         goal = self.selection_goal.toPlainText().strip()
-        self.selection_button.setEnabled(not active and not selection_active and not self._closing
+        self.selection_button.setEnabled(not active and not executing and not selection_active and not self._closing
                                          and self.snapshot is not None and bool(self.snapshot.get("options"))
                                          and bool(goal) and len(goal) <= 4000)
         self.selection_cancel_button.setEnabled(selection_active)
         self.selection_inspect_button.setEnabled(self.selection_button.isEnabled())
         self.selection_export_button.setEnabled(not selection_active and self.selection_result is not None)
+        self.execution_button.setEnabled(not active and not executing and not selection_active and not self._closing
+                                         and self.target_combo.currentData() is not None and bool(goal) and len(goal) <= 4000)
+        self.execution_stop_button.setEnabled(executing and not self._execution_abort_reason)
+        self.execution_export_button.setEnabled(not executing and bool(self.execution_events or self.execution_result))
+        for widget in (self.execution_steps, self.execution_seconds, self.execution_arguments):
+            widget.setEnabled(not executing)
 
     def _clear_snapshot(self):
         self._invalidate_selection("Snapshot changed. Run a new selection preview after observation.")
@@ -742,6 +752,7 @@ class UIAViewer(QMainWindow):
         self._sync_buttons()
 
     def _target_changed(self, *_):
+        self._abort_execution("Target changed. Execution stopped; an in-flight action may have an unknown outcome.")
         # Even a programmatic target change invalidates an in-flight observation.
         if self.process is not None and self._job == "observe":
             self._abort("Target changed. Observe the selected window again.")
@@ -749,14 +760,14 @@ class UIAViewer(QMainWindow):
         self.status.setText("Choose a target window and press Observe / Refresh.")
 
     def refresh_windows(self):
-        if self.process is None and not self._closing:
+        if self.process is None and self.execution_process is None and not self._closing:
             self._clear_snapshot()
             self.status.setText("Reading top-level windows…")
             self._start("windows", ["windows"], self.windows_timeout_ms)
 
     def observe(self):
         target = self.target_combo.currentData()
-        if self.process is not None or not target or self._closing:
+        if self.process is not None or self.execution_process is not None or not target or self._closing:
             return
         self._clear_snapshot()
         self._job_target = dict(target)
@@ -911,14 +922,9 @@ class UIAViewer(QMainWindow):
             self._clear_snapshot()
             self.status.setText(f"Observation failed: {result.get('error') or 'The provider could not produce a current snapshot.'} No current snapshot; refresh or choose another window.")
             return
-        result = copy.deepcopy(result)
         # Defense in depth: password values are never shown or exported, even if
         # a buggy helper returned them. The backend is responsible for not reading them.
-        for element in result["elements"]:
-            if element.get("is_password") is not False:
-                element["value"] = None
-                element["state"] = {key: value for key, value in element["state"].items()
-                                    if key.lower() not in {"value", "text", "range_value", "legacy_value"}}
+        result = _redact_snapshot_values(result)
         self._invalidate_selection("New snapshot ready. Enter a goal and explicitly start a selection preview.")
         self.snapshot = result
         self._elements = {element["id"]: element for element in result["elements"]}
@@ -966,6 +972,11 @@ class UIAViewer(QMainWindow):
         self._sync_buttons()
 
     def _selection_goal_changed(self):
+        if self.execution_goal.toPlainText() != self.selection_goal.toPlainText():
+            self.execution_goal.blockSignals(True)
+            self.execution_goal.setPlainText(self.selection_goal.toPlainText())
+            self.execution_goal.blockSignals(False)
+        self._abort_execution("Goal changed. Execution stopped; an in-flight action may have an unknown outcome.")
         self._invalidate_selection("Goal changed. Start a new preview for this goal.")
         if len(self.selection_goal.toPlainText().strip()) > 4000:
             self.selection_status.setText("Use a goal of at most 4,000 characters.")
@@ -974,7 +985,7 @@ class UIAViewer(QMainWindow):
     def _invalidate_selection(self, reason):
         self.selection_result = None
         self._selection_pending_result = None
-        self._clear_selection_summary()
+        self.selection_choice.setText("No current selected action")
         self.selection_json.clear()
         self.selection_trace.clear()
         self._clear_request_bodies()
@@ -985,11 +996,10 @@ class UIAViewer(QMainWindow):
 
     def preview_selection(self):
         goal = self.selection_goal.toPlainText().strip()
-        if (self.process is not None or self.selection_process is not None or self._closing
+        if (self.process is not None or self.selection_process is not None or self.execution_process is not None or self._closing
                 or self.snapshot is None or not self.snapshot.get("options") or not goal or len(goal) > 4000):
             return
         self._invalidate_selection("Starting Jev selection preview…")
-        self.selection_tabs.setCurrentWidget(self.selection_trace)
         request = {"snapshot": copy.deepcopy(self.snapshot), "goal": goal, "run_id": uuid.uuid4().hex}
         payload = (json.dumps(request, ensure_ascii=False) + "\n").encode("utf-8")
         if len(payload) > MAX_OUTPUT_BYTES:
@@ -1034,7 +1044,7 @@ class UIAViewer(QMainWindow):
         self._selection_abort_reason = reason
         self._selection_pending_result = None
         self.selection_result = None
-        self._clear_selection_summary()
+        self.selection_choice.setText("No current selected action")
         self.selection_json.clear()
         self._selection_buffer.clear()
         self._selection_deadline.stop()
@@ -1204,7 +1214,12 @@ class UIAViewer(QMainWindow):
                 f"{status.replace('_', ' ').capitalize()} · {result.get('request_count', '?')} model requests · "
                 f"{result.get('considered_options', '?')} of {result.get('observed_options', '?')} options considered · Input actions: 0"
             )
-            self._show_selection_summary(result)
+            option = result["selected_option"]
+            if option:
+                element = self._elements.get(option["element_id"], {})
+                self.selection_choice.setText(f"Selected preview: {option['operation'].replace('_', ' ')} → {_name(element)} ({element.get('role', 'role unavailable')})")
+            else:
+                self.selection_choice.setText("No action selected · " + str(result.get("reason") or status.replace("_", " "))[:1000])
             if not self._selection_events or self.selection_trace.blockCount() <= 1:
                 for entry in result["trace"][:2000]:
                     if isinstance(entry, dict):
@@ -1244,18 +1259,244 @@ class UIAViewer(QMainWindow):
         self.status.setText("Snapshot exported locally. Observe / Refresh to collect a new snapshot.")
         return True
 
+    def start_execution(self):
+        goal = self.selection_goal.toPlainText().strip()
+        target = self.target_combo.currentData()
+        if (self._closing or self.process is not None or self.selection_process is not None
+                or self.execution_process is not None or not target or not goal or len(goal) > 4000):
+            return
+        try:
+            raw = self.execution_arguments.toPlainText().strip() or "{}"
+            if len(raw.encode("utf-8")) > 65536:
+                raise ValueError("Arguments exceed 64 KiB")
+            arguments = json.loads(raw, parse_constant=lambda _: (_ for _ in ()).throw(ValueError("Non-finite number")))
+            if not isinstance(arguments, dict):
+                raise ValueError("Arguments must be an object")
+            request = validate_execution_request({
+                "target": {key: target[key] for key in ("hwnd", "pid")}, "goal": goal,
+                "run_id": uuid.uuid4().hex, "max_steps": self.execution_steps.value(),
+                "max_seconds": self.execution_seconds.value(), "max_elements": self.max_elements.value(),
+                "arguments": arguments,
+            })
+            # Validate the entire wire payload before changing run state or
+            # creating a QProcess: JSON can decode overflowing exponents and
+            # escaped lone surrogates that cannot be sent as valid UTF-8.
+            payload = (json.dumps(request, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
+        except (ValueError, TypeError, KeyError, UnicodeError, RecursionError):
+            self.execution_status.setText("Use a valid goal, window, limits and arguments JSON object (at most 64 KiB), "
+                                          "with finite numbers and valid Unicode. No execution started.")
+            return
+        self._clear_snapshot()
+        self.execution_result = None
+        self.execution_events = []
+        self._execution_abort_reason = None
+        self._execution_pending_result = None
+        self._execution_buffer.clear()
+        self._execution_bytes = 0
+        self.execution_trace.clear()
+        self.execution_json.clear()
+        self._execution_request = request
+        process = QProcess(self)
+        self.execution_process = process
+        process.setWorkingDirectory(str(self.execution_helper_path.parent.parent))
+        executable = self.execution_python
+        if executable.name.lower() == "pythonw.exe":
+            executable = executable.with_name("python.exe")
+        process.setProgram(str(executable))
+        process.setArguments(["-I", str(self.execution_helper_path), "--stdin"])
+        process.started.connect(lambda: self._execution_started(process, payload))
+        process.readyReadStandardOutput.connect(lambda: self._read_execution_output(process))
+        process.readyReadStandardError.connect(lambda: process.readAllStandardError())
+        process.finished.connect(lambda code, status: self._execution_finished(process, code, status))
+        process.errorOccurred.connect(lambda error: self._execution_process_error(process, error))
+        self.execution_status.setText("Starting execution with a fresh observation… Stop remains available.")
+        self.tabs.setCurrentIndex(3)
+        self._sync_buttons()
+        self._execution_deadline.start(request["max_seconds"] * 1000 + self.execution_deadline_slack_ms)
+        process.start()
+
+    def _execution_started(self, process, payload):
+        if process is not self.execution_process:
+            return
+        if self._execution_abort_reason:
+            process.kill()
+        else:
+            process.write(payload)
+            # Keep stdin open: the helper listens for a separate cancellation line.
+
+    def stop_execution(self):
+        self._abort_execution("Execution stopped by you. An in-flight action may have an unknown outcome.")
+
+    def _abort_execution(self, reason):
+        process = self.execution_process
+        if process is None or self._execution_abort_reason:
+            return
+        self._execution_abort_reason = reason
+        self._execution_deadline.stop()
+        self.execution_status.setText("Stopping… " + reason)
+        if process.state() == QProcess.ProcessState.Running:
+            cancel = {"cancel": True, "run_id": self._execution_request["run_id"]}
+            process.write((json.dumps(cancel) + "\n").encode("utf-8"))
+        QTimer.singleShot(1500, lambda: process.kill() if process is self.execution_process else None)
+        self._sync_buttons()
+
+    def _execution_process_error(self, process, error):
+        if process is self.execution_process and error == QProcess.ProcessError.FailedToStart:
+            self._execution_abort_reason = "Could not start execution. Install the Jev, UIA and pinned CUA runtimes."
+            self._execution_finished(process, -1, QProcess.ExitStatus.CrashExit)
+
+    def _execution_is_current(self):
+        request = self._execution_request
+        target = self.target_combo.currentData()
+        return bool(request and target and self.selection_goal.toPlainText().strip() == request["goal"]
+                    and all(target.get(key) == request["target"][key] for key in ("hwnd", "pid")))
+
+    def _read_execution_output(self, process):
+        chunk = bytes(process.readAllStandardOutput())
+        if process is not self.execution_process:
+            return
+        self._execution_bytes += len(chunk)
+        if self._execution_bytes > MAX_EXECUTION_OUTPUT_BYTES:
+            self._abort_execution("Execution exceeded the 64 MiB output limit. An in-flight action may have an unknown outcome.")
+            self._execution_buffer.clear()
+            return
+        self._execution_buffer.extend(chunk)
+        while b"\n" in self._execution_buffer:
+            line, _, rest = self._execution_buffer.partition(b"\n")
+            self._execution_buffer = bytearray(rest)
+            if line.strip():
+                self._execution_event(line)
+        if len(self._execution_buffer) > MAX_OUTPUT_BYTES:
+            self._abort_execution("Execution returned an oversized event. An in-flight action may have an unknown outcome.")
+            self._execution_buffer.clear()
+
+    def _execution_event(self, line):
+        try:
+            if len(line) > MAX_OUTPUT_BYTES or len(self.execution_events) >= 20000:
+                raise ValueError("Oversized execution event stream")
+            event = json.loads(line.decode("utf-8"))
+            request = self._execution_request
+            if (not isinstance(event, dict) or not request or event.get("run_id") != request["run_id"]
+                    or not isinstance(event.get("data"), dict) or self._execution_pending_result is not None):
+                raise ValueError("Invalid execution event binding or sequence")
+            data, kind = event["data"], event.get("event")
+            if kind not in {"progress", "observation", "selection", "action", "result", "error"}:
+                raise ValueError("Unknown execution event")
+            step = data.get("step", "?")
+            if kind == "observation":
+                snapshot = data["snapshot"]
+                if not isinstance(snapshot, dict):
+                    raise ValueError("Invalid execution observation")
+                snapshot = data["snapshot"] = _redact_snapshot_values(snapshot)
+                if self._execution_is_current() and not self._execution_abort_reason:
+                    self._show_snapshot(snapshot, request["target"])
+                message = (f"Step {step} · Fresh observation {snapshot.get('snapshot_id', '?')} · "
+                           f"{snapshot.get('status', '?')} · {len(snapshot.get('options', []))} options")
+            elif kind == "selection":
+                selected = data["selection"]
+                if not isinstance(selected, dict):
+                    raise ValueError("Invalid selection event")
+                option = selected.get("selected_option")
+                if option is not None and not isinstance(option, dict):
+                    raise ValueError("Invalid selected option")
+                if self._execution_is_current() and not self._execution_abort_reason:
+                    if (not self.snapshot or selected.get("snapshot_id") != self.snapshot["snapshot_id"]
+                            or selected.get("goal") != request["goal"] or selected.get("input_actions") != 0
+                            or option is not None and option not in self.snapshot["options"]):
+                        raise ValueError("Selection does not match the current observation")
+                message = f"Step {step} · Jev choice (prediction): " + (
+                    f"{option.get('operation', '?')} → {option.get('label', option.get('id', '?'))}"
+                    if option else str(selected.get("status", "No selected option")))
+            elif kind == "action":
+                if (data.get("status") not in {"delivered", "failed", "unknown", "cancelled"}
+                        or type(step) is not int or not 1 <= step <= request["max_steps"]
+                        or not isinstance(data.get("receipt", {}), dict)):
+                    raise ValueError("Invalid action receipt")
+                label = "Observed after input" if "observed_change" in data else "Input outcome"
+                message = (f"Step {step} · {label}: {data['status']} · "
+                           f"{data.get('operation', '?')} → {data.get('name', '')} · "
+                           f"{data.get('reason', data.get('message', data.get('receipt', {}).get('error', '')))}")
+                if "observed_change" in data:
+                    message += f" · Observed change: {_text(data['observed_change'])} (not proof of goal completion)"
+            elif kind == "result":
+                if (data.get("status") not in {"stopped", "cancelled", "limit_reached", "no_match", "needs_arguments", "stale_target", "failed", "no_progress"}
+                        or data.get("goal_completed") is not False
+                        or any(type(data.get(key)) is not int or data[key] < 0 for key in ("input_actions", "attempted_actions"))):
+                    raise ValueError("Invalid execution result")
+                self._execution_pending_result = data
+                message = f"Run result received: {data['status']} · {data.get('reason', '')}"
+            elif kind == "error":
+                message = "Execution error: " + str(data.get("message", data.get("reason", "Unknown helper error")))
+            else:
+                message = f"Step {step} · " + str(data.get("message", data.get("stage", data.get("status", "Progress"))))
+            self.execution_events.append(event)
+            self.execution_trace.appendPlainText(message[:4000])
+            if kind in {"selection", "action", "result", "error"}:
+                self.execution_json.appendPlainText(json.dumps(event, ensure_ascii=False, indent=2))
+            if not self._execution_abort_reason:
+                self.execution_status.setText(message[:2000])
+        except (ValueError, TypeError, KeyError, UnicodeError, RecursionError):
+            self._abort_execution("Execution returned an invalid or stale event. An in-flight action may have an unknown outcome.")
+
+    def _execution_finished(self, process, exit_code, exit_status):
+        if process is not self.execution_process:
+            return
+        self._read_execution_output(process)
+        if self._execution_buffer.strip():
+            self._execution_event(bytes(self._execution_buffer))
+        self._execution_buffer.clear()
+        self._execution_deadline.stop()
+        reason, result = self._execution_abort_reason, self._execution_pending_result
+        self.execution_process = None
+        self._execution_pending_result = None
+        process.deleteLater()
+        receipts = {event["data"].get("step"): event["data"]
+                    for event in self.execution_events if event["event"] == "action"}.values()
+        if result is None:
+            reason = reason or "Execution helper stopped without a complete result. An in-flight action may have an unknown outcome."
+            result = {"status": "stopped", "reason": reason, "goal_completed": False,
+                      "input_actions": sum(item["status"] == "delivered" for item in receipts),
+                      "attempted_actions": sum(item.get("receipt", {}).get("attempted") is not False for item in receipts),
+                      "unreported_outcome_possible": True,
+                      "source": "viewer_receipts_only"}
+        self.execution_result = result
+        self.execution_status.setText(
+            f"{reason or result.get('reason') or result['status'].replace('_', ' ').capitalize()} · "
+            f"Delivered input actions: {result['input_actions']} · Goal completion is not established.")
+        self.execution_json.appendPlainText(json.dumps({"final_result": result}, ensure_ascii=False, indent=2))
+        self._sync_buttons()
+        if self._closing:
+            QTimer.singleShot(0, self.close)
+
+    def export_execution_json(self, checked=False, *, path=None):
+        if self.execution_process is not None or not (self.execution_events or self.execution_result):
+            return False
+        if path is None:
+            path, _ = QFileDialog.getSaveFileName(self, "Export CUA execution log", "cua-execution.json", "JSON files (*.json)")
+        if not path:
+            return False
+        archive = {"request": self._execution_request, "events": self.execution_events, "result": self.execution_result}
+        try:
+            Path(path).write_text(json.dumps(archive, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+        except (OSError, ValueError):
+            self.execution_status.setText("Could not save the execution log. Choose a writable destination.")
+            return False
+        return True
+
     def closeEvent(self, event):
         self._closing = True
         if self.request_dialog is not None:
             self.request_dialog.close()
-        if self.process is not None or self.selection_process is not None:
+        if self.process is not None or self.selection_process is not None or self.execution_process is not None:
             event.ignore()
             self.hide()
             self._abort("Closing…")
             self._abort_selection("Closing selection preview… Already dispatched provider requests may still finish.")
+            self._abort_execution("Closing execution. An in-flight action may have an unknown outcome.")
             return
         self._deadline.stop()
         self._selection_deadline.stop()
+        self._execution_deadline.stop()
         event.accept()
 
 

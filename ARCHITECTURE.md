@@ -1,12 +1,12 @@
 # Windows visual assistant architecture
 
-## Separate UIA observation milestone
+## UIA selection and execution
 
-This branch adds a second, independent viewer for the observation and candidate-list stages only. A selected HWND/PID is read through Windows UI Automation COM (`comtypes` 1.4.13), including browser content exposed by its UIA provider. A disposable MTA helper builds per-element property caches, excludes password values, and returns serializable snapshot-scoped controls and capability-backed operation options. The PySide6 GUI provides manual refresh, filtering, details, cancellation and explicit JSON export. It has no action dispatcher, Jev integration, model inference, screenshot capture or automated target input.
+The second viewer reads a selected HWND/PID through Windows UI Automation COM (`comtypes` 1.4.13). Disposable MTA helpers build per-element caches, exclude password values, and return serializable controls and capability-backed options. The GUI offers observation/inspection, a Jev selection preview, and a separately started bounded CUA execution loop. The existing selector algorithm and provider route are reused. Execution validates a new UIA snapshot and a fresh native CUA element token before each input, then observes again. Stop/cancel, step/time limits, argument binding, uncertain receipts and no-progress detection bound each run. [Execution implementation and limits](docs/CUA_EXECUTION.md).
 
 The pinned CUA implementation was checked first. It exposes genuine UIA, but its unconditional value cache, inferred menu actions and missing serialized states do not satisfy this milestone. The dedicated reader is intentionally separate from the unchanged capture/CUA/YOLO viewer documented below. Native WinForms and ordinary Chrome page UIA were live verified. [Implementation, capability rules, measured evidence and limits](docs/UIA_VIEWER.md).
 
-Decision record · 20 September 2026 · The primary-screen capture-and-YOLO desktop viewer is implemented and live verified. OCR, JEV integration into the GUI, and action delivery remain future scope.
+Decision record · 20 September 2026 · The primary-screen capture-and-YOLO viewer remains separate. UIA + Jev + CUA execution is implemented with conservative native mappings; OCR, general goal-completion verification and unrestricted operation coverage remain future scope. The remainder of this document preserves the earlier capture milestone and future perception design; the execution guide above is authoritative for the implemented UIA loop.
 
 ## Current milestone: manual capture viewer
 

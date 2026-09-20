@@ -1,4 +1,4 @@
-"""Serializable, observation-scoped UIA contracts. There is no action dispatcher."""
+"""Serializable UIA candidates scoped to observations; execution lives separately."""
 from datetime import datetime, timezone
 import uuid
 
