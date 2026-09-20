@@ -1,21 +1,29 @@
+# Local credentials
+.env
+.env.*
+!.env.example
+
+# Python environments and caches
 .venv/
-.upstream/
-node_modules/
+venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
-.env
-.env.*
-!.env.example
-.ctrl/
-.runtime/
-pytest-cache-files-*/
-artifacts/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Generated dependencies, builds, and diagnostics
+node_modules/
 dist/
+build/
 *.egg-info/
 *.log
-*.port
-*.pid
-*.pem
-*.key
+.runtime/
+.ctrl/
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
