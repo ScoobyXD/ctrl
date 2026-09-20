@@ -130,6 +130,9 @@ def main():
         def progress(data):
             _emit("progress", data={**data, "client_run_id": client_run_id})
 
+        def request(data):
+            _emit("request", data={**data, "client_run_id": client_run_id})
+
         if args.live:
             # Key lookup happens once, only after local validation. Neither the
             # search nor subprocess messages carry the credential.
@@ -142,7 +145,7 @@ def main():
                 def remote(payload, *, request_id, capture_id):
                     return decide(payload, key, request_id=request_id, capture_id=capture_id)
 
-                result = search.run(remote, on_progress=progress)
+                result = search.run(remote, on_progress=progress, on_request=request)
             finally:
                 del key
         else:

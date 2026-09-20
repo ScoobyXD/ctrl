@@ -13,16 +13,19 @@ import sys
 import time
 import unittest
 import uuid
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QTextCursor
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from ctrl_loop.uia_viewer import UIAViewer
+from ctrl_loop.selection import SelectionSearch
 
 
 APP = QApplication.instance() or QApplication([])
@@ -92,6 +95,19 @@ def emit(event, data=None, message=None):
 progress = {"stage": "classify", "round": 1, "batch": 1, "request_count": 1,
             "input_ids": ["option-save"], "retained_ids": ["option-save"],
             "answers": {"option-save": "high relevance"}, "client_run_id": request["run_id"]}
+payload = {"model": "typesafe/jev-1.13",
+    "provider": {"only": ["typesafe"], "order": ["typesafe"], "allow_fallbacks": False},
+    "state": {"goal": request["goal"], "snapshot_id": request["snapshot"]["snapshot_id"],
+              "stage": "classify", "round": 1, "batch": 1, "candidates": [{"id": "option-save"}]},
+    "questions": {"classify_0": {"type": "choice", "criteria": {"promising": "Relevant", "unlikely": "Unrelated"}, "instructions": "Classify"}}}
+wire = {"request_id": "fixture-request", "capture_id": request["snapshot"]["snapshot_id"],
+        "stage": "classify", "round": 1, "batch": 1, "input_ids": ["option-save"],
+        "payload": payload, "body_bytes": len(json.dumps(payload, allow_nan=False, separators=(",", ":")).encode()),
+        "request_count": 1, "client_run_id": request["run_id"]}
+if mode == "wrong_request_size": wire["body_bytes"] += 1
+if mode == "wrong_request_goal": payload["state"]["goal"] = "different goal"
+emit("request", wire)
+progress.update(request_id="fixture-request", usage={"input_tokens": 10, "output_tokens": 3, "cost": 0.0})
 emit("progress", progress)
 if mode == "hang": time.sleep(60)
 if mode == "error": emit("error", message="Fixture provider rejected the request."); sys.exit(1)
@@ -140,6 +156,93 @@ if mode == "result_then_hang": time.sleep(60)
         output = self.folder / "selection.json"
         self.assertTrue(self.window.export_selection_json(path=output))
         self.assertEqual(json.loads(output.read_text(encoding="utf-8")), self.window.selection_result)
+
+    def test_offline_inspection_uses_actual_builder_without_aws_or_subprocess(self):
+        # The real selector requires snapshot-scoped IDs; old helper fixtures
+        # above deliberately exercise only the viewer boundary.
+        observed = copy.deepcopy(self.data)
+        element_id = observed["snapshot_id"] + ":e0"
+        option_id = element_id + ":activate"
+        observed["elements"][0]["id"] = element_id
+        observed["options"][0].update(id=option_id, element_id=element_id)
+        self.window._show_snapshot(observed, observed["target"])
+        with patch("ctrl_loop.credentials.get_openrouter_key", side_effect=AssertionError("AWS forbidden")):
+            QTest.mouseClick(self.window.selection_inspect_button, Qt.MouseButton.LeftButton)
+        self.assertIsNone(self.window.selection_process)
+        self.assertEqual(self.window.selection_tabs.currentIndex(), 1)
+        record = self.window.selection_requests[0]
+        expected = SelectionSearch(observed, self.window.selection_goal.toPlainText()).preview()["initial_requests"][0]["payload"]
+        self.assertEqual(record["payload"], expected)
+        self.assertEqual(json.loads(self.window.request_json.toPlainText()), expected)
+        self.assertEqual(record["status"], "Planned — not sent")
+        self.assertIn("bytes are not tokens", self.window.request_summary.text())
+        self.window.request_wire.setChecked(True)
+        wire = json.dumps(expected, allow_nan=False, separators=(",", ":")).encode()
+        self.assertEqual(self.window.request_json.toPlainText().encode(), wire)
+        output = self.folder / "request.json"
+        self.assertTrue(self.window.export_request_body(path=output))
+        self.assertEqual(output.read_bytes(), wire)
+        self.window.copy_request_body()
+        self.assertEqual(APP.clipboard().text().encode(), wire)
+        self.assertIsNotNone(self.window.request_dialog)
+        self.window.request_dialog.close()
+        self.assertIsNone(self.window.request_dialog)
+        self.assertIs(self.window.selection_tabs.widget(1), self.window.request_panel)
+        self.window.open_request_inspector()
+        self.assertIsNotNone(self.window.request_dialog)
+        self.assertEqual(self.window.request_json.toPlainText().encode(), wire)
+        self.window.selection_goal.setPlainText("Another goal")
+        self.assertEqual(self.window.selection_requests, [])
+        self.assertEqual(self.window.request_json.toPlainText(), "")
+
+    def test_request_records_survive_failure_and_cancellation_and_export_all(self):
+        for mode in ("error", "hang"):
+            with self.subTest(mode=mode):
+                self.write_helper(mode)
+                self.start()
+                eventually(lambda: bool(self.window.selection_requests))
+                if mode == "hang":
+                    self.window.cancel_selection()
+                eventually(lambda: self.window.selection_process is None)
+                self.assertIsNone(self.window.selection_result)
+                self.assertEqual(len(self.window.selection_requests), 1)
+                record = self.window.selection_requests[0]
+                self.assertEqual(record["status"], "Dispatch attempted")
+                self.assertEqual(record["payload"]["state"]["goal"], self.window.selection_goal.toPlainText())
+                self.assertIn("10 input tokens", self.window.request_summary.text())
+                output = self.folder / "requests.json"
+                self.assertTrue(self.window.export_requests_json(path=output))
+                archive = json.loads(output.read_text(encoding="utf-8"))
+                self.assertEqual(archive["requests"], self.window.selection_requests)
+                self.assertNotIn("Authorization", output.read_text(encoding="utf-8"))
+
+    def test_invalid_request_records_are_rejected_before_display(self):
+        for mode in ("wrong_request_size", "wrong_request_goal"):
+            self.write_helper(mode)
+            self.finish()
+            self.assertEqual(self.window.selection_requests, [])
+            self.assertEqual(self.window.request_json.toPlainText(), "")
+            self.assertIn("invalid or stale", self.window.selection_status.text())
+
+    def test_request_usage_refresh_preserves_text_selection(self):
+        self.write_helper("hang")
+        self.start()
+        eventually(lambda: bool(self.window.selection_requests))
+        editor = self.window.request_json
+        cursor = editor.textCursor()
+        cursor.setPosition(5)
+        cursor.setPosition(11, QTextCursor.MoveMode.KeepAnchor)
+        editor.setTextCursor(cursor)
+        selected = cursor.selectedText()
+        event = {"event": "progress", "data": {"request_id": "fixture-request",
+                 "client_run_id": self.window._selection_request["run_id"],
+                 "usage": {"input_tokens": 20, "output_tokens": 4, "cost": 0.0}}}
+        self.window._selection_event(json.dumps(event).encode())
+        self.assertEqual(editor.textCursor().selectedText(), selected)
+        self.assertEqual(editor.textCursor().position(), 11)
+        self.assertIn("20 input tokens", self.window.request_summary.text())
+        self.window.cancel_selection()
+        eventually(lambda: self.window.selection_process is None)
 
     def test_progress_responsive_and_cancel_releases_process(self):
         self.write_helper("hang")

@@ -277,23 +277,31 @@ class SelectionSearch:
                 "initial_requests": deepcopy(self._initial),
                 "reduction": "Every option is classified; promising and uncertain survive. Groups retain alternatives using probabilities only within that group. A shared final choice includes none. One recovery pass can examine omitted options."}
 
-    def run(self, decider, *, on_progress=None, cancelled=None):
-        if not callable(decider) or on_progress is not None and not callable(on_progress) or cancelled is not None and not callable(cancelled):
+    def run(self, decider, *, on_progress=None, cancelled=None, on_request=None):
+        """Run the search, optionally exposing each request just before dispatch.
+
+        Request callbacks receive independent payload copies on the scheduler
+        thread. They describe attempts, including failures, not successful sends.
+        """
+        if (not callable(decider)
+                or any(callback is not None and not callable(callback)
+                       for callback in (on_progress, cancelled, on_request))):
             raise SelectionError("Invalid selection callback.")
         with self._lock:
             if self._used:
                 raise SelectionError("A selection run can only be dispatched once.")
             self._used = True
-        runner = _Run(self, decider, on_progress, cancelled)
+        runner = _Run(self, decider, on_progress, cancelled, on_request)
         return runner.run()
 
 
 class _Run:
-    def __init__(self, search, decider, progress, cancelled):
+    def __init__(self, search, decider, progress, cancelled, request_callback):
         self.search = search
         self.config = search.config
         self.decider = decider
         self.progress = progress
+        self.request_callback = request_callback
         self.cancelled = cancelled or (lambda: False)
         self.trace = []
         self.request_count = 0
@@ -338,9 +346,17 @@ class _Run:
                 if self._check_cancelled():
                     return None
                 while cursor < len(requests) and len(pending) < self.config.parallelism:
+                    if self._check_cancelled():
+                        return None
                     request = requests[cursor]
                     cursor += 1
                     self.request_count += 1
+                    if self.request_callback:
+                        record = {key: deepcopy(request[key]) for key in
+                                  ("request_id", "capture_id", "stage", "round", "batch", "input_ids", "payload")}
+                        record.update(body_bytes=self.search._payload_size(request["payload"]),
+                                      request_count=self.request_count)
+                        self.request_callback(record)
                     pending[self.executor.submit(self._call, request)] = request
                 done, _ = wait(pending, timeout=0.05, return_when=FIRST_COMPLETED)
                 if self._check_cancelled():

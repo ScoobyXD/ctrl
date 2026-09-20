@@ -38,7 +38,23 @@ The GUI selection button uses live mode. For an exported snapshot, inspect the i
   --snapshot ./.ctrl/uia/browser-viewer-export.json --goal 'Save the draft'
 ```
 
-Add `--live` to run the remote selection process. Optional `--output <path>` explicitly saves its plan/result, which can contain supplied UI text. The command emits newline-delimited JSON events: `progress`, `result`, or a sanitized `error`. Stdin mode accepts an object with `snapshot` and `goal`, plus an optional caller `run_id` echoed as `client_run_id`.
+Add `--live` to run the remote selection process. Optional `--output <path>` explicitly saves its plan/result, which can contain supplied UI text. The command emits newline-delimited JSON events: `request` with a body about to be dispatched, `progress`, `result`, or a sanitized `error`. Stdin mode accepts an object with `snapshot` and `goal`, plus an optional caller `run_id` echoed as `client_run_id`.
+
+## Inspect and export request bodies
+
+After observing a window and entering a goal, click **Inspect request JSON**. This builds the initial classification bodies locally and opens a resizable inspector window, with no AWS lookup or model call. Closing that window returns its contents to the **Request JSON** tab; **Open larger view** opens it again. The dropdown identifies each request's stage, round, batch, option count and exact serialized byte count. These records are marked **Planned — not sent**. Later reduction/final requests depend on model answers and are not available in this initial plan.
+
+Starting **Preview selection with Jev** replaces that plan with records for the live run, including adaptive rounds. **Dispatch attempted** means the helper was about to call the provider; it does not establish successful delivery. Input/output token counts appear only when the provider reports usage. Request records remain available after failure or cancellation. Changing the goal or snapshot, or starting another inspection/run, clears them.
+
+The default body view is indented for reading. **Exact wire JSON** shows the compact serialization. **Copy body** always copies that compact body; **Export body JSON…** writes its exact UTF-8 bytes with no trailing newline. **Export all requests…** writes a local archive containing request metadata and each `payload`; the archive itself is not one provider request. Bodies can contain ordinary observation text. They remain in memory until you explicitly copy or export them, and never include the Authorization header or API key.
+
+## Request format and size
+
+The outgoing body is JSON with four top-level fields: `model`, `provider`, `state` and `questions`. **The goal is `state.goal`; this application does not send a `problem` field.** `state` also contains the window title, stage/round/batch, snapshot ID, recent history, observation-coverage warning and candidate descriptions. Each candidate includes its operation/label, element description and up to four ancestors. `questions` contains typed Choice questions: classification uses one question per candidate with `promising`, `uncertain` and `unlikely` criteria; reduction/final comparison uses one question with candidate IDs and `__none__` as criteria. The OpenRouter key is an HTTP Authorization header and is excluded from the body and exports.
+
+JSON structures the API request; it does not make the text free of model tokens. In an offline reconstruction of the earlier synthetic 64-option/four-ancestor diagnostic, the compact body was **115,213 bytes**, although the goal itself was only **25 bytes**. Its `state` object occupied **78,879 bytes** and its 64-question object **36,205 bytes**. Repeating four ancestors for each option produced 256 ancestor descriptors using **52,224 bytes**, and each classification question repeated criteria/instructions using about 550 bytes. The current first batch for that same synthetic fixture contains 13 candidates and uses **23,719 bytes**. This is a reconstructed example, not the original failed screen request or captured provider traffic.
+
+**Bytes are not tokens.** The exact provider token count cannot be recovered from serialized size alone; the provider's interpretation of the structured questions also matters. The local byte cap is conservative, not a tokenizer. Reported usage summed across many requests can exceed the model's per-request context limit without any individual request exceeding it. Offline plans expose the exact initial `payload` objects; later reduction/final bodies depend on model answers and cannot all be planned in advance.
 
 ## Budgets, trace and validation
 

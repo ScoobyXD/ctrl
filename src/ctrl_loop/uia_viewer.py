@@ -14,10 +14,13 @@ import uuid
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QProcess, QSortFilterProxyModel, Qt, QTimer
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QComboBox, QFileDialog, QHBoxLayout,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QHBoxLayout,
     QHeaderView, QLabel, QLineEdit, QListView, QMainWindow, QPlainTextEdit, QPushButton,
     QSpinBox, QSplitter, QTableView, QTabWidget, QVBoxLayout, QWidget,
 )
+
+from .jev import ENDPOINT, DecisionError, request_binding
+from .selection import MAX_SELECTION_REQUEST_BYTES, SelectionError, SelectionSearch
 
 
 MAX_OUTPUT_BYTES = 8 * 1024 * 1024
@@ -122,6 +125,8 @@ class UIAViewer(QMainWindow):
         self.selection_timeout_ms = max(1, min(300000, selection_timeout_ms))
         self.selection_process = None
         self.selection_result = None
+        self.selection_requests = []
+        self.request_dialog = None
         self._selection_request = None
         self._selection_buffer = bytearray()
         self._selection_bytes = 0
@@ -323,12 +328,15 @@ class UIAViewer(QMainWindow):
         self.selection_goal.textChanged.connect(self._selection_goal_changed)
         layout.addWidget(self.selection_goal)
         buttons = QHBoxLayout()
+        self.selection_inspect_button = QPushButton("Inspect request JSON")
+        self.selection_inspect_button.clicked.connect(self.inspect_selection_requests)
         self.selection_button = QPushButton("Preview selection with Jev")
         self.selection_button.clicked.connect(self.preview_selection)
         self.selection_cancel_button = QPushButton("Cancel selection")
         self.selection_cancel_button.clicked.connect(self.cancel_selection)
         self.selection_export_button = QPushButton("Export selection JSON…")
         self.selection_export_button.clicked.connect(self.export_selection_json)
+        buttons.addWidget(self.selection_inspect_button)
         buttons.addWidget(self.selection_button)
         buttons.addWidget(self.selection_cancel_button)
         buttons.addStretch()
@@ -351,11 +359,185 @@ class UIAViewer(QMainWindow):
         self.selection_json = QPlainTextEdit()
         self.selection_json.setReadOnly(True)
         self.selection_json.setAccessibleName("Complete Jev selection result JSON")
-        traces = QTabWidget()
-        traces.addTab(self.selection_trace, "Rounds and progress")
-        traces.addTab(self.selection_json, "Result JSON")
-        layout.addWidget(traces, 1)
+        self.selection_tabs = QTabWidget()
+        self.selection_tabs.addTab(self.selection_trace, "Rounds and progress")
+        self.request_panel = self._request_panel()
+        self.selection_tabs.addTab(self.request_panel, "Request JSON")
+        self.selection_tabs.addTab(self.selection_json, "Result JSON")
+        layout.addWidget(self.selection_tabs, 1)
         return panel
+
+    def _request_panel(self):
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        note = QLabel("Inspect is offline. Live runs record dispatch attempts, including later rounds.")
+        note.setToolTip("Bodies stay available after failure or cancellation until the goal, snapshot, or run changes. Dispatch attempted does not confirm delivery. The API key is an authorization header, never part of these bodies.")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        self.request_list = QComboBox()
+        self.request_list.setAccessibleName("Jev request bodies")
+        self.request_list.currentIndexChanged.connect(self._show_request_body)
+        layout.addWidget(self.request_list)
+        self.request_summary = QLabel("No requests inspected or dispatched yet.")
+        self.request_summary.setTextFormat(Qt.TextFormat.PlainText)
+        self.request_summary.setWordWrap(True)
+        layout.addWidget(self.request_summary)
+        actions = QHBoxLayout()
+        self.request_expand = QPushButton("Open larger view")
+        self.request_expand.clicked.connect(self.open_request_inspector)
+        self.request_wire = QCheckBox("Exact wire JSON")
+        self.request_wire.toggled.connect(self._show_request_body)
+        self.request_copy = QPushButton("Copy body")
+        self.request_copy.clicked.connect(self.copy_request_body)
+        self.request_export = QPushButton("Export body JSON…")
+        self.request_export.clicked.connect(self.export_request_body)
+        self.requests_export = QPushButton("Export all requests…")
+        self.requests_export.clicked.connect(self.export_requests_json)
+        actions.addWidget(self.request_wire)
+        actions.addStretch()
+        actions.addWidget(self.request_expand)
+        for button in (self.request_copy, self.request_export, self.requests_export):
+            actions.addWidget(button)
+            button.setEnabled(False)
+        layout.addLayout(actions)
+        self.request_json = QPlainTextEdit()
+        self.request_json.setReadOnly(True)
+        self.request_json.setAccessibleName("Outgoing Jev request JSON body")
+        self.request_json.setPlaceholderText("Use Inspect request JSON before a run, or start a preview to see each dispatch attempt. Authentication headers are not part of the JSON body.")
+        layout.addWidget(self.request_json, 1)
+        return panel
+
+    def open_request_inspector(self):
+        if self.request_dialog is not None:
+            self.request_dialog.show()
+            self.request_dialog.raise_()
+            return
+        placeholder = QWidget()
+        placeholder_layout = QVBoxLayout(placeholder)
+        placeholder_layout.addWidget(QLabel("Request bodies are open in the inspector window."))
+        reopen = QPushButton("Show request inspector")
+        reopen.clicked.connect(self.open_request_inspector)
+        placeholder_layout.addWidget(reopen)
+        placeholder_layout.addStretch()
+        self.selection_tabs.removeTab(1)
+        self.selection_tabs.insertTab(1, placeholder, "Request JSON")
+        self.selection_tabs.setCurrentIndex(1)
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Jev request JSON — local inspector")
+        dialog.resize(1100, 800)
+        dialog.setMinimumSize(760, 500)
+        dialog.setModal(False)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(self.request_panel)
+        self.request_panel.show()
+        self.request_dialog = dialog
+        self.request_expand.setVisible(False)
+
+        def restore_panel(*_):
+            self.selection_tabs.removeTab(1)
+            self.selection_tabs.insertTab(1, self.request_panel, "Request JSON")
+            self.selection_tabs.setCurrentIndex(1)
+            self.request_expand.setVisible(True)
+            self.request_dialog = None
+            placeholder.deleteLater()
+            dialog.deleteLater()
+
+        dialog.finished.connect(restore_panel)
+        dialog.show()
+
+    @staticmethod
+    def _request_body(record):
+        return json.dumps(record["payload"], allow_nan=False, separators=(",", ":")).encode("utf-8")
+
+    def _clear_request_bodies(self):
+        self.selection_requests.clear()
+        self.request_list.clear()
+        self._show_request_body()
+
+    def _add_request_body(self, record, status):
+        copied = copy.deepcopy(record)
+        copied["status"] = status
+        copied["body_bytes"] = len(self._request_body(copied))
+        self.selection_requests.append(copied)
+        self.request_list.addItem(f"{len(self.selection_requests)} · {status} · {copied['stage']} · round {copied['round']} · batch {copied['batch']} · {len(copied['input_ids'])} options · {copied['body_bytes']:,} bytes")
+        self.requests_export.setEnabled(True)
+
+    def _show_request_body(self, *_):
+        index = self.request_list.currentIndex()
+        exists = 0 <= index < len(self.selection_requests)
+        self.request_copy.setEnabled(exists)
+        self.request_export.setEnabled(exists)
+        self.requests_export.setEnabled(bool(self.selection_requests))
+        if not exists:
+            self.request_json.clear()
+            self.request_summary.setText("No requests inspected or dispatched yet.")
+            return
+        record = self.selection_requests[index]
+        payload = record["payload"]
+        usage = record.get("usage")
+        tokens = (f"Provider reported: {usage['input_tokens']:,} input tokens, {usage['output_tokens']:,} output tokens."
+                  if usage else "Token count unavailable before a provider response; bytes are not tokens.")
+        self.request_summary.setText(
+            f"{record['body_bytes']:,} body bytes · {len(payload['questions'])} questions · "
+            f"{len(record['input_ids'])} options. {tokens}\nPOST {ENDPOINT}")
+        self.request_json.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap if self.request_wire.isChecked()
+                                         else QPlainTextEdit.LineWrapMode.WidgetWidth)
+        body_text = (self._request_body(record).decode("utf-8") if self.request_wire.isChecked()
+                     else json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False))
+        # Usage updates must not reset the user's scroll position or text selection.
+        if self.request_json.toPlainText() != body_text:
+            self.request_json.setPlainText(body_text)
+
+    def inspect_selection_requests(self):
+        if not self.selection_inspect_button.isEnabled():
+            return False
+        self._clear_request_bodies()
+        try:
+            plan = SelectionSearch(self.snapshot, self.selection_goal.toPlainText().strip()).preview()
+            for record in plan["initial_requests"]:
+                self._add_request_body(record, "Planned — not sent")
+        except SelectionError as error:
+            self.request_summary.setText(str(error))
+            self.selection_tabs.setCurrentIndex(1)
+            return False
+        self.selection_tabs.setCurrentIndex(1)
+        self.open_request_inspector()
+        return True
+
+    def copy_request_body(self):
+        index = self.request_list.currentIndex()
+        if 0 <= index < len(self.selection_requests):
+            QApplication.clipboard().setText(self._request_body(self.selection_requests[index]).decode("utf-8"))
+
+    def export_request_body(self, checked=False, *, path=None):
+        index = self.request_list.currentIndex()
+        if not 0 <= index < len(self.selection_requests):
+            return False
+        if path is None:
+            path, _ = QFileDialog.getSaveFileName(self, "Export exact Jev request body", "jev-request.json", "JSON files (*.json)")
+        if not path:
+            return False
+        try:
+            Path(path).write_bytes(self._request_body(self.selection_requests[index]))
+        except OSError:
+            self.request_summary.setText("Could not save the request body. Choose a writable destination.")
+            return False
+        return True
+
+    def export_requests_json(self, checked=False, *, path=None):
+        if not self.selection_requests:
+            return False
+        if path is None:
+            path, _ = QFileDialog.getSaveFileName(self, "Export Jev request records", "jev-requests.json", "JSON files (*.json)")
+        if not path:
+            return False
+        archive = {"endpoint": ENDPOINT, "method": "POST", "requests": self.selection_requests}
+        try:
+            Path(path).write_text(json.dumps(archive, indent=2, ensure_ascii=False, allow_nan=False) + "\n", encoding="utf-8")
+        except OSError:
+            self.request_summary.setText("Could not save the request records. Choose a writable destination.")
+            return False
+        return True
 
     def _tab_changed(self, index):
         self.tab_guidance.setText(TAB_GUIDANCE[index])
@@ -428,6 +610,7 @@ class UIAViewer(QMainWindow):
                                          and self.snapshot is not None and bool(self.snapshot.get("options"))
                                          and bool(goal) and len(goal) <= 4000)
         self.selection_cancel_button.setEnabled(selection_active)
+        self.selection_inspect_button.setEnabled(self.selection_button.isEnabled())
         self.selection_export_button.setEnabled(not selection_active and self.selection_result is not None)
 
     def _clear_snapshot(self):
@@ -677,6 +860,7 @@ class UIAViewer(QMainWindow):
         self.selection_choice.setText("No current selected action")
         self.selection_json.clear()
         self.selection_trace.clear()
+        self._clear_request_bodies()
         if self.selection_process is not None:
             self._abort_selection(reason + " Already dispatched provider requests may still finish.")
         else:
@@ -786,18 +970,53 @@ class UIAViewer(QMainWindow):
                 raise ValueError("Invalid event data")
             if data.get("client_run_id", self._selection_request["run_id"]) != self._selection_request["run_id"]:
                 raise ValueError("Wrong run")
-            if kind == "progress":
+            if kind == "request":
+                self._validate_request_record(data)
+                self._add_request_body(data, "Dispatch attempted")
+            elif kind == "progress":
+                for record in self.selection_requests:
+                    if record["request_id"] == data.get("request_id"):
+                        usage = data.get("usage")
+                        if (isinstance(usage, dict) and all(type(usage.get(key)) is int and usage[key] >= 0
+                                                          for key in ("input_tokens", "output_tokens"))):
+                            record["usage"] = copy.deepcopy(usage)
+                            self._show_request_body()
+                        break
                 self.selection_trace.appendPlainText(self._progress_summary(data))
                 count = data.get("request_count")
                 if count is not None:
-                    self.selection_status.setText(f"Selection in progress · {count} model requests completed · No input actions executed")
+                    self.selection_status.setText(f"Selection in progress · {count} model requests started · No input actions executed")
             elif kind == "result" and self._selection_pending_result is None:
                 self._validate_selection_result(data)
                 self._selection_pending_result = data
             else:
                 raise ValueError("Invalid event sequence")
-        except (ValueError, TypeError, KeyError, UnicodeError, RecursionError):
+        except (DecisionError, ValueError, TypeError, KeyError, UnicodeError, RecursionError):
             self._abort_selection("The Jev helper returned an invalid or stale response. No action was selected.")
+
+    def _validate_request_record(self, data):
+        request = self._selection_request
+        payload = data["payload"]
+        request_binding(payload, request_id=data["request_id"], capture_id=data["capture_id"])
+        state = payload["state"]
+        if (len(self.selection_requests) >= 64 or data["capture_id"] != request["snapshot"]["snapshot_id"]
+                or not isinstance(state, dict) or state.get("snapshot_id") != data["capture_id"]
+                or state.get("goal") != request["goal"]
+                or data.get("stage") not in {"classify", "reduce", "final", "recovery_reduce", "recovery_final"}
+                or any(type(data.get(key)) is not int or data[key] < 0 or data[key] != state.get(key)
+                       for key in ("round", "batch"))
+                or data["stage"] != state.get("stage")
+                or not isinstance(data.get("input_ids"), list)
+                or not isinstance(state.get("candidates"), list)
+                or data["input_ids"] != [candidate["id"] for candidate in state["candidates"]]
+                or any(record["request_id"] == data["request_id"] for record in self.selection_requests)
+                or type(data.get("body_bytes")) is not int
+                or data["body_bytes"] != len(self._request_body(data))
+                or data["body_bytes"] > MAX_SELECTION_REQUEST_BYTES):
+            raise ValueError("Invalid request record")
+        observed = {option["id"] for option in request["snapshot"]["options"]}
+        if not set(data["input_ids"]).issubset(observed):
+            raise ValueError("Unobserved request candidate")
 
     @staticmethod
     def _progress_summary(data):
@@ -914,6 +1133,8 @@ class UIAViewer(QMainWindow):
 
     def closeEvent(self, event):
         self._closing = True
+        if self.request_dialog is not None:
+            self.request_dialog.close()
         if self.process is not None or self.selection_process is not None:
             event.ignore()
             self.hide()

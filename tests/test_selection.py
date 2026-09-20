@@ -273,11 +273,13 @@ class SelectionTests(unittest.TestCase):
         observed = browser_snapshot(132)
         target = observed["options"][-1]["id"]
         dispatched = []
+        request_events = []
 
         def open_request(request, *, timeout):
             self.assertLessEqual(len(request.data), MAX_SELECTION_REQUEST_BYTES)
             payload = json.loads(request.data)
             self.assertEqual(request.data, request_body(payload))
+            self.assertTrue(any(request_body(event["payload"]) == request.data for event in request_events))
             dispatched.append(payload)
             answers = {}
             for question_id, question in payload["questions"].items():
@@ -301,7 +303,7 @@ class SelectionTests(unittest.TestCase):
         with patch.object(jev, "build_opener") as build, \
              patch("socket.socket", side_effect=AssertionError("Unexpected network")):
             build.return_value.open.side_effect = open_request
-            result = SelectionSearch(observed, "Open a new YouTube video").run(remote)
+            result = SelectionSearch(observed, "Open a new YouTube video").run(remote, on_request=request_events.append)
         self.assertEqual(result["status"], "selected")
         self.assertEqual(result["selected_option"]["id"], target)
         classified = [candidate for payload in dispatched if payload["state"]["stage"] == "classify"
@@ -314,6 +316,10 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(len(finals), 1)
         self.assertIn(target, finals[0]["questions"]["action"]["criteria"])
         self.assertLessEqual(result["request_count"], SelectionConfig().max_requests)
+        self.assertCountEqual([request_body(event["payload"]) for event in request_events],
+                              [request_body(payload) for payload in dispatched])
+        self.assertTrue(all(event["body_bytes"] == len(request_body(event["payload"]))
+                            for event in request_events))
 
     def test_unicode_context_uses_escaped_wire_bytes_and_preserves_every_option(self):
         observed = snapshot(40)
@@ -403,13 +409,87 @@ class SelectionTests(unittest.TestCase):
         observed = browser_snapshot(132)
         needed = SelectionSearch(observed, "Choose safely").preview()["initial_request_count"]
         decider = FakeDecider()
+        requests = []
         result = SelectionSearch(observed, "Choose safely", config=SelectionConfig(
-            max_requests=needed + 1)).run(decider)
+            max_requests=needed + 1)).run(decider, on_request=requests.append)
         self.assertEqual(result["status"], "budget_exhausted")
         self.assertIsNone(result["selected_option"])
         self.assertEqual(len(decider.calls), needed)
         self.assertEqual(len(decider.classified_ids()), 132)
         self.assertEqual(decider.action_calls(), [])
+        self.assertEqual(len(requests), needed)
+        self.assertTrue(all(request["stage"] == "classify" for request in requests))
+
+    def test_request_callbacks_precede_dispatch_in_scheduler_order(self):
+        requests, ordering, callback_threads = [], [], []
+        scheduler_thread = threading.get_ident()
+        honest = FakeDecider()
+
+        def on_request(record):
+            requests.append(record)
+            ordering.append(("request", record["request_id"]))
+            callback_threads.append(threading.get_ident())
+
+        def decider(payload, *, request_id, capture_id):
+            ordering.append(("call", request_id))
+            return honest(payload, request_id=request_id, capture_id=capture_id)
+
+        result = SelectionSearch(snapshot(100), "Choose safely").run(decider, on_request=on_request)
+        self.assertEqual(result["status"], "selected")
+        self.assertEqual([record["request_count"] for record in requests], list(range(1, len(requests) + 1)))
+        self.assertEqual(callback_threads, [scheduler_thread] * len(requests))
+        self.assertEqual(len(requests), len(honest.calls))
+        calls_by_id = {call["request_id"]: call for call in honest.calls}
+        for record in requests:
+            self.assertEqual(record["payload"], calls_by_id[record["request_id"]]["payload"])
+            self.assertEqual(record["capture_id"], calls_by_id[record["request_id"]]["capture_id"])
+            self.assertEqual(record["input_ids"], [candidate["id"] for candidate in record["payload"]["state"]["candidates"]])
+            self.assertLess(ordering.index(("request", record["request_id"])),
+                            ordering.index(("call", record["request_id"])))
+        self.assertTrue(all("payload" not in entry for entry in result["trace"]))
+
+    def test_request_callback_mutation_cannot_change_provider_payload(self):
+        honest = FakeDecider()
+
+        def on_request(record):
+            record["payload"]["state"]["goal"] = "MUTATED_BY_INSPECTOR"
+            record["payload"]["questions"].clear()
+            record["input_ids"].append("FOREIGN_INSPECTOR_ID")
+            record["request_id"] = "INSPECTOR_REQUEST"
+
+        result = SelectionSearch(snapshot(4), "Choose safely").run(honest, on_request=on_request)
+        self.assertEqual(result["status"], "selected")
+        self.assertNotIn("INSPECTOR", json.dumps(honest.calls))
+
+    def test_failed_request_is_exposed_before_error_without_future_stage_payloads(self):
+        requests = []
+
+        def failed(payload, *, request_id, capture_id):
+            self.assertEqual(len(requests), 1)
+            self.assertEqual(requests[0]["request_id"], request_id)
+            self.assertEqual(requests[0]["payload"], payload)
+            raise jev.DecisionError("transport", "Synthetic transport failure")
+
+        with self.assertRaises(jev.DecisionError):
+            SelectionSearch(snapshot(4), "Choose safely").run(failed, on_request=requests.append)
+        self.assertEqual([request["stage"] for request in requests], ["classify"])
+
+    def test_initial_budget_exhaustion_has_no_dispatch_attempts(self):
+        requests = []
+        decider = FakeDecider()
+        result = SelectionSearch(snapshot(100), "Choose safely", config=SelectionConfig(
+            max_requests=1)).run(decider, on_request=requests.append)
+        self.assertEqual(result["status"], "budget_exhausted")
+        self.assertEqual(requests, [])
+        self.assertEqual(decider.calls, [])
+
+    def test_invalid_request_callback_is_rejected_before_dispatch(self):
+        decider = FakeDecider()
+        search = SelectionSearch(snapshot(1), "Choose safely")
+        with self.assertRaises(SelectionError):
+            search.run(decider, on_request={})
+        self.assertEqual(decider.calls, [])
+        self.assertEqual(search.run(decider)["status"], "selected")
 
     def test_invalid_or_foreign_responses_never_select(self):
         mutations = {
@@ -484,23 +564,30 @@ class SelectionTests(unittest.TestCase):
 
     def test_precancelled_search_dispatches_nothing(self):
         decider = FakeDecider()
-        result = SelectionSearch(snapshot(100), "Cancelled goal").run(decider, cancelled=lambda: True)
+        requests = []
+        result = SelectionSearch(snapshot(100), "Cancelled goal").run(
+            decider, cancelled=lambda: True, on_request=requests.append)
         self.assertEqual(result["status"], "cancelled")
         self.assertIsNone(result["selected_option"])
         self.assertEqual(decider.calls, [])
+        self.assertEqual(requests, [])
 
     def test_cancellation_during_classification_does_not_reach_final_choice(self):
         cancel = threading.Event()
         honest = FakeDecider()
+        requests = []
         def cancel_after_response(payload, *, request_id, capture_id):
             result = honest(payload, request_id=request_id, capture_id=capture_id)
             cancel.set()
             return result
         result = SelectionSearch(snapshot(300), "Cancelled midway", config=SelectionConfig(
-            parallelism=1)).run(cancel_after_response, cancelled=cancel.is_set)
+            parallelism=1)).run(cancel_after_response, cancelled=cancel.is_set, on_request=requests.append)
         self.assertEqual(result["status"], "cancelled")
         self.assertIsNone(result["selected_option"])
         self.assertEqual(honest.action_calls(), [])
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(len(honest.calls), 1)
+        self.assertEqual(requests[0]["request_id"], honest.calls[0]["request_id"])
 
     def test_cancellation_returns_before_a_blocked_provider_finishes(self):
         started, release, cancel, finished = (threading.Event() for _ in range(4))

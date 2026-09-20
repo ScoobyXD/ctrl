@@ -75,12 +75,44 @@ class SelectionCliTests(unittest.TestCase):
         self.assertGreaterEqual(remote.call_count, 2)
         self.assertNotIn(secret, output)
         self.assertTrue(any(r["event"] == "progress" for r in records))
+        requests = [record["data"] for record in records if record["event"] == "request"]
+        self.assertEqual(len(requests), remote.call_count)
+        self.assertEqual([request["stage"] for request in requests], ["classify", "final"])
+        for request, call in zip(requests, remote.call_args_list):
+            self.assertEqual(request["client_run_id"], "test-client")
+            self.assertEqual(request["payload"], call.args[0])
+            self.assertEqual(request["request_id"], call.kwargs["request_id"])
+            self.assertEqual(request["capture_id"], call.kwargs["capture_id"])
+            self.assertEqual(request["body_bytes"], len(json.dumps(
+                request["payload"], allow_nan=False, separators=(",", ":")).encode("utf-8")))
+            self.assertNotIn("headers", request)
         result = records[-1]["data"]
         self.assertEqual(result["status"], "selected")
         self.assertTrue(result["preview_only"])
         self.assertEqual(result["input_actions"], 0)
         self.assertEqual(result["client_run_id"], "test-client")
         self.assertEqual(result["selected_option"]["id"], "cli-snapshot:e1:activate")
+
+    def test_aws_lookup_failure_has_no_request_events(self):
+        with patch.object(cli, "get_openrouter_key", side_effect=cli.CredentialError()), \
+             patch.object(cli, "decide") as remote:
+            code, _, records = self.invoke(None, "--live")
+        self.assertEqual(code, 1)
+        self.assertFalse(any(record["event"] == "request" for record in records))
+        remote.assert_not_called()
+
+    def test_failed_provider_request_is_available_before_error(self):
+        with patch.object(cli, "get_openrouter_key", return_value="sk-or-KEY-SENTINEL"), \
+             patch.object(cli, "decide", side_effect=jev.DecisionError("transport", "private")) as remote:
+            code, output, records = self.invoke(None, "--live")
+        self.assertEqual(code, 1)
+        request_records = [record for record in records if record["event"] == "request"]
+        self.assertEqual(len(request_records), 1)
+        self.assertEqual(request_records[0]["data"]["stage"], "classify")
+        self.assertEqual(request_records[0]["data"]["payload"], remote.call_args.args[0])
+        self.assertLess(records.index(request_records[0]), len(records) - 1)
+        self.assertEqual(records[-1]["event"], "error")
+        self.assertNotIn("SENTINEL", output)
 
     def test_invalid_input_fails_before_credential_lookup(self):
         with patch.object(cli, "get_openrouter_key") as key:
