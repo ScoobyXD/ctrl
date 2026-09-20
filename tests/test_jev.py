@@ -220,6 +220,32 @@ class DecisionAdapterTests(unittest.TestCase):
         self.assertEqual(caught.exception.category, "authentication")
         self.assertNotIn("test-credential", str(caught.exception))
 
+    def test_context_limit_rejection_is_specific_bounded_and_sanitized(self):
+        for status in (400, 413):
+            body = io.BytesIO(b'{"error":{"message":"tokens_exceeded test-credential"}}')
+            failure = HTTPError("https://test-credential.invalid", status, TEST_CREDENTIAL, {}, body)
+            with self.subTest(status=status), self.assertRaises(jev.DecisionError) as caught:
+                self.call(side_effect=failure)
+            self.assertEqual(caught.exception.category, "context_limit")
+            self.assertEqual(caught.exception.status_code, status)
+            self.assertNotIn(TEST_CREDENTIAL, "".join(traceback.format_exception(caught.exception)))
+            self.assertTrue(body.closed)
+        # Text beyond the diagnostic bound must not influence classification.
+        self.assertFalse(jev._context_limit_error(b"x" * 8192 + b"tokens_exceeded"))
+        self.assertFalse(jev._context_limit_error(b"Invalid model test-credential"))
+
+    def test_unreadable_rejection_body_retains_safe_http_status(self):
+        body = MagicMock()
+        body.read.side_effect = OSError(TEST_CREDENTIAL)
+        failure = HTTPError("https://test-credential.invalid", 400, TEST_CREDENTIAL, {}, body)
+        with self.assertRaises(jev.DecisionError) as caught:
+            self.call(side_effect=failure)
+        self.assertEqual(caught.exception.category, "provider")
+        self.assertEqual(caught.exception.status_code, 400)
+        body.read.assert_called_once_with(8192)
+        body.close.assert_called_once()
+        self.assertNotIn(TEST_CREDENTIAL, "".join(traceback.format_exception(caught.exception)))
+
     def test_invalid_input_fails_without_network(self):
         bad_requests = []
         for field, value in (("questions", {}), ("state", float("nan")), ("state", {"value": float("nan")})):

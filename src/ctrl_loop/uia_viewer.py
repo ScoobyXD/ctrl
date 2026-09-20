@@ -708,7 +708,7 @@ class UIAViewer(QMainWindow):
         process.readyReadStandardError.connect(lambda: process.readAllStandardError())
         process.finished.connect(lambda code, status: self._selection_finished(process, code, status))
         process.errorOccurred.connect(lambda error: self._selection_process_error(process, error))
-        self.selection_status.setText("Jev is making model requests to classify and narrow the observed options. Cancel remains available.")
+        self.selection_status.setText("Reading the OpenRouter key from AWS Secrets Manager, then asking Jev to compare options. Cancel remains available.")
         self.selection_trace.appendPlainText(f"Started with {len(request['snapshot']['options'])} observed options. Selection preview only; input actions: 0.")
         self._selection_deadline.start(self.selection_timeout_ms)
         self._sync_buttons()

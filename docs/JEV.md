@@ -50,6 +50,8 @@ The existing defaults are profile `mangorts-dev`, region `us-west-1`, and secret
 aws sso login --profile mangorts-dev
 ```
 
+The UIA viewer's **Preview selection with Jev** button uses this same AWS Secrets Manager lookup in its helper process. It does not require a separately configured key. A successful secret lookup is followed by the OpenRouter model request; AWS errors and model errors are separate stages. For request-size and other preview failures, see [selection troubleshooting](JEV_SELECTION.md#if-selection-fails).
+
 Setup and offline preview do not contact AWS. Live mode prints the outgoing request, makes a runtime secret lookup, and makes one OpenRouter request without retries or redirects. Only validated, whitelisted response fields are displayed. Authentication error bodies and SDK exception text are never printed. During secret lookup, process logging through CRITICAL is temporarily suppressed because botocore DEBUG logging includes secret response bodies; a lock serializes lookups and the prior threshold is restored on success or failure. This also suppresses unrelated thread logs during that scope, an intentional limitation of this small CLI. The adapter has a 20-second network-operation timeout and a 1 MiB response limit. Python does not guarantee secure zeroing of immutable strings; the process uses no credential cache and terminates after the CLI completes.
 
 ## Provider route and decision semantics

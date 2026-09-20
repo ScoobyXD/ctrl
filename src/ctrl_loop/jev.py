@@ -43,10 +43,21 @@ def _response_error():
     return DecisionError("response", "JEV returned an invalid or unexpected decision response.")
 
 
-def _http_error(status):
+def _context_limit_error(raw):
+    """Recognize an upstream size rejection without exposing its error body."""
+    if type(raw) is not bytes:
+        return False
+    text = raw[:8192].decode("utf-8", errors="replace").lower()
+    return (any(term in text for term in ("token", "context"))
+            and any(term in text for term in ("exceed", "too long", "too large", "maximum context")))
+
+
+def _http_error(status, *, context_limit=False):
     if type(status) is not int or not 100 <= status <= 599:
         return DecisionError("provider", "JEV provider request failed.")
-    if status in (401, 403):
+    if status in (400, 413) and context_limit:
+        category, message = "context_limit", "The Jev request exceeds the model's input context limit."
+    elif status in (401, 403):
         category, message = "authentication", "JEV authentication or access was rejected."
     elif status == 402:
         category, message = "credits", "OpenRouter credits are insufficient for this request."
@@ -278,8 +289,15 @@ def decide(payload: dict, api_key: str, *, request_id: str, capture_id: str) -> 
             raw = response.read(MAX_RESPONSE_BYTES + 1)
     except HTTPError as error:
         status = error.code
-        error.close()
-        raise _http_error(status) from None
+        try:
+            # Inspect only a bounded error body for a known failure class. Its
+            # text may contain credentials or UI content and never leaves here.
+            diagnostic = error.read(8192) if status in (400, 413) else b""
+        except (OSError, HTTPException, ValueError):
+            diagnostic = b""
+        finally:
+            error.close()
+        raise _http_error(status, context_limit=_context_limit_error(diagnostic)) from None
     except (URLError, OSError, HTTPException, ValueError):
         raise DecisionError("transport", "JEV transport failed or timed out.") from None
     if len(raw) > MAX_RESPONSE_BYTES:

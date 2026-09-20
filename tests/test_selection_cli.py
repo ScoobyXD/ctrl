@@ -99,6 +99,113 @@ class SelectionCliTests(unittest.TestCase):
         self.assertNotIn("Traceback", output)
         self.assertEqual(records[-1]["event"], "error")
 
+    def test_provider_statuses_are_distinguished_without_provider_text(self):
+        cases = (
+            (401, "authentication", "credential"),
+            (403, "authentication", "access"),
+            (402, "credits", "credits"),
+            (429, "rate_limit", "rate limited"),
+            (400, "provider", "request format"),
+            (413, "provider", "too large"),
+            (502, "provider", "could not complete"),
+        )
+        for status, category, text in cases:
+            error = jev._http_error(status)
+            error.args = ("sk-or-PROVIDER-MESSAGE-SENTINEL",)
+            with self.subTest(status=status), \
+                 patch.object(cli, "get_openrouter_key", return_value="sk-or-KEY-SENTINEL"), \
+                 patch.object(cli, "decide", side_effect=error), \
+                 patch("socket.socket", side_effect=AssertionError("Unexpected network")):
+                code, output, records = self.invoke(None, "--live")
+            self.assertEqual(code, 1)
+            record = records[-1]
+            self.assertEqual(record["event"], "error")
+            self.assertEqual(record["input_actions"], 0)
+            self.assertEqual(record["category"], category)
+            self.assertEqual(record["http_status"], status)
+            self.assertIn(f"HTTP {status}", record["message"])
+            self.assertIn(text, record["message"])
+            self.assertNotIn("SENTINEL", output)
+            self.assertNotIn("Traceback", output)
+
+    def test_local_response_and_transport_errors_explain_the_failed_boundary(self):
+        cases = (("request", "local validation"), ("response", "response failed validation"),
+                 ("transport", "connection failed or timed out"))
+        for category, text in cases:
+            error = jev.DecisionError(category, "sk-or-ERROR-SENTINEL")
+            with self.subTest(category=category), \
+                 patch.object(cli, "get_openrouter_key", return_value="sk-or-KEY-SENTINEL"), \
+                 patch.object(cli, "decide", side_effect=error):
+                code, output, records = self.invoke(None, "--live")
+            self.assertEqual(code, 1)
+            self.assertEqual(records[-1]["category"], category)
+            self.assertIn(text, records[-1]["message"])
+            self.assertNotIn("http_status", records[-1])
+            self.assertNotIn("SENTINEL", output)
+
+    def test_request_failure_before_credentials_does_not_claim_aws_succeeded(self):
+        with patch.object(cli, "SelectionSearch", side_effect=jev.DecisionError("request", "private")), \
+             patch.object(cli, "get_openrouter_key") as key:
+            code, _, records = self.invoke(None, "--live")
+        self.assertEqual(code, 1)
+        key.assert_not_called()
+        self.assertEqual(records[-1]["category"], "request")
+        self.assertIn("before it could be sent", records[-1]["message"])
+        self.assertNotIn("AWS", records[-1]["message"])
+
+    def test_provider_context_limit_has_a_specific_safe_diagnostic(self):
+        error = jev._http_error(400, context_limit=True)
+        error.args = ("sk-or-ERROR-SENTINEL",)
+        with patch.object(cli, "get_openrouter_key", return_value="sk-or-KEY-SENTINEL"), \
+             patch.object(cli, "decide", side_effect=error):
+            code, output, records = self.invoke(None, "--live")
+        self.assertEqual(code, 1)
+        self.assertEqual(records[-1]["category"], "context_limit")
+        self.assertEqual(records[-1]["http_status"], 400)
+        self.assertIn("context limit", records[-1]["message"])
+        self.assertNotIn("SENTINEL", output)
+
+    def test_oversized_shared_context_is_rejected_before_aws_lookup(self):
+        request = fixture()
+        request["goal"] = "\U0001f600" * 4000
+        with patch.object(cli, "get_openrouter_key") as key, patch.object(cli, "decide") as remote:
+            code, _, records = self.invoke(request, "--live")
+        self.assertEqual(code, 1)
+        self.assertEqual(records[-1]["category"], "context_limit")
+        self.assertIn("Shorten the goal", records[-1]["message"])
+        key.assert_not_called()
+        remote.assert_not_called()
+
+    def test_untrusted_error_fields_are_not_formatted_or_emitted(self):
+        class HostileText(str):
+            def __hash__(self):
+                raise AssertionError("Untrusted category was hashed")
+
+            def __str__(self):
+                raise AssertionError("Untrusted text was formatted")
+
+        class HostileStatus(int):
+            def __str__(self):
+                raise AssertionError("Untrusted status was formatted")
+
+        fields = (
+            ("sk-or-CATEGORY-SENTINEL", "sk-or-STATUS-SENTINEL"),
+            ({"key": "sk-or-CATEGORY-SENTINEL"}, ["sk-or-STATUS-SENTINEL"]),
+            (HostileText("provider"), HostileStatus(500)),
+            (None, True), ([], 10**100), (False, -1),
+        )
+        for category, status in fields:
+            error = jev.DecisionError(category, "sk-or-MESSAGE-SENTINEL", status_code=status)
+            with self.subTest(category_type=type(category), status_type=type(status)), \
+                 patch.object(cli, "get_openrouter_key", return_value="sk-or-KEY-SENTINEL"), \
+                 patch.object(cli, "decide", side_effect=error):
+                code, output, records = self.invoke(None, "--live")
+            self.assertEqual(code, 1)
+            self.assertEqual(records[-1]["category"], "provider")
+            self.assertNotIn("http_status", records[-1])
+            self.assertNotIn("SENTINEL", output)
+            self.assertNotIn("Traceback", output)
+
 
 if __name__ == "__main__":
     unittest.main()

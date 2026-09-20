@@ -11,11 +11,13 @@ import sys
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from ctrl_loop import jev
-from ctrl_loop.selection import SelectionConfig, SelectionError, SelectionSearch
+from ctrl_loop import selection
+from ctrl_loop.selection import (MAX_SELECTION_REQUEST_BYTES, SelectionConfig,
+                                 SelectionContextError, SelectionError, SelectionSearch)
 
 
 def snapshot(count, *, snapshot_id="selection_fixture"):
@@ -51,6 +53,25 @@ def choice_answer(criteria, choice, probabilities=None):
         probabilities = {key: (.8 if key == choice else other_probability) for key in criteria}
     return {"type": "choice", "choice": choice, "confidence": probabilities[choice],
             "probabilities": probabilities}
+
+
+def request_body(payload):
+    return json.dumps(payload, allow_nan=False, separators=(",", ":")).encode("utf-8")
+
+
+def browser_snapshot(count):
+    observed = snapshot(count, snapshot_id="e0fb0105a5a1480d96043d7dfefc5263")
+    parent = None
+    for index in range(4):
+        ancestor = deepcopy(observed["elements"][0])
+        ancestor.update(id=f"{observed['snapshot_id']}:ancestor{index}", parent_id=parent,
+                        name="Synthetic browser page and document context " * 4,
+                        role="Pane", patterns=[], value="Synthetic document value " * 4)
+        observed["elements"].append(ancestor)
+        parent = ancestor["id"]
+    for element in observed["elements"][:count]:
+        element["parent_id"] = parent
+    return observed
 
 
 class FakeDecider:
@@ -129,6 +150,7 @@ class SelectionTests(unittest.TestCase):
             self.assertEqual(request["stage"], "classify")
             self.assertEqual(request["capture_id"], observed["snapshot_id"])
             self.assertLessEqual(len(request["input_ids"]), 64)
+            self.assertLessEqual(len(request_body(request["payload"])), MAX_SELECTION_REQUEST_BYTES)
             binding = jev.request_binding(request["payload"], request_id=request["request_id"],
                                           capture_id=request["capture_id"])
             self.assertEqual(binding["capture_id"], observed["snapshot_id"])
@@ -141,7 +163,8 @@ class SelectionTests(unittest.TestCase):
         target = observed["options"][-1]["id"]
         decider = FakeDecider(choose=lambda criteria, payload: target if target in criteria else next(
             key for key in criteria if key != "__none__"))
-        result = SelectionSearch(observed, "Resolve the blue bird's account").run(decider)
+        result = SelectionSearch(observed, "Resolve the blue bird's account",
+                                 config=SelectionConfig(max_requests=256)).run(decider)
         self.assertEqual(result["status"], "selected")
         self.assertEqual(result["selected_option"]["id"], target)
         self.assertCountEqual(decider.classified_ids(), [option["id"] for option in observed["options"]])
@@ -165,23 +188,26 @@ class SelectionTests(unittest.TestCase):
 
     def test_probabilities_are_compared_only_within_their_own_group(self):
         observed = snapshot(320)
+        search = SelectionSearch(observed, "Select by model judgment", config=SelectionConfig(
+            batch_size=64, keep_per_group=1))
+        groups = search._make_requests(search._ids, "reduce", 1)
+        self.assertGreater(len(groups), 1)
         first_group_winner = observed["options"][0]["id"]
-        later_group_winner = observed["options"][64]["id"]
+        later_group_winner = groups[1]["input_ids"][0]
         def choose(criteria, payload):
             ids = [key for key in criteria if key != "__none__"]
             if payload["state"]["stage"] == "reduce":
                 chosen = ids[0]
                 # First group's winner has lower probability than many options in
                 # another group. It still gets that group's retained slot.
-                confidence = .04 if chosen == first_group_winner else .90
+                confidence = max(.04, 1 / len(criteria) + .01) if chosen == first_group_winner else .90
                 remainder = (1 - confidence) / (len(criteria) - 1)
                 return chosen, {key: confidence if key == chosen else remainder for key in criteria}
             self.assertIn(first_group_winner, criteria)
             self.assertIn(later_group_winner, criteria)
             return first_group_winner
         decider = FakeDecider(choose=choose)
-        result = SelectionSearch(observed, "Select by model judgment", config=SelectionConfig(
-            batch_size=64, keep_per_group=1)).run(decider)
+        result = search.run(decider)
         self.assertEqual(result["selected_option"]["id"], first_group_winner)
 
     def test_final_none_recovers_a_candidate_classified_unlikely(self):
@@ -189,7 +215,9 @@ class SelectionTests(unittest.TestCase):
         target = observed["options"][-1]["id"]
         decider = FakeDecider(
             classify=lambda candidate, payload: "unlikely" if candidate["id"] == target else "promising",
-            choose=lambda criteria, payload: target if target in criteria else "__none__")
+            choose=lambda criteria, payload: target if target in criteria else (
+                "__none__" if payload["state"]["stage"].endswith("final") else
+                next(key for key in criteria if key != "__none__")))
         result = SelectionSearch(observed, "Recover the omitted correct target").run(decider)
         self.assertEqual(result["status"], "selected")
         self.assertEqual(result["selected_option"]["id"], target)
@@ -234,11 +262,154 @@ class SelectionTests(unittest.TestCase):
     def test_round_budget_does_not_select_a_group_winner_without_shared_final(self):
         decider = FakeDecider()
         result = SelectionSearch(snapshot(320), "Need one comparable final decision", config=SelectionConfig(
-            batch_size=64, keep_per_group=63, max_rounds=1)).run(decider)
+            batch_size=64, keep_per_group=20, max_rounds=1)).run(decider)
         self.assertEqual(result["status"], "budget_exhausted")
+        self.assertIn("round budget", result["reason"])
         self.assertIsNone(result["selected_option"])
         self.assertNotIn("final", [call["payload"]["state"]["stage"]
                                    for call in decider.action_calls()])
+
+    def test_browser_context_is_bounded_through_real_adapter_and_shared_final(self):
+        observed = browser_snapshot(132)
+        target = observed["options"][-1]["id"]
+        dispatched = []
+
+        def open_request(request, *, timeout):
+            self.assertLessEqual(len(request.data), MAX_SELECTION_REQUEST_BYTES)
+            payload = json.loads(request.data)
+            self.assertEqual(request.data, request_body(payload))
+            dispatched.append(payload)
+            answers = {}
+            for question_id, question in payload["questions"].items():
+                criteria = question["criteria"]
+                winner = ("promising" if question_id.startswith("classify_") else
+                          target if target in criteria else next(key for key in criteria if key != "__none__"))
+                answers[question_id] = choice_answer(criteria, winner)
+            response = MagicMock()
+            response.status = 200
+            response.read.return_value = json.dumps({
+                "model": jev.RESOLVED_MODEL, "provider": jev.PROVIDER,
+                "id": "gen-synthetic-browser", "answers": answers,
+                "usage": {"input_tokens": 0, "output_tokens": 0, "cost": 0},
+            }).encode()
+            response.__enter__.return_value = response
+            return response
+
+        def remote(payload, *, request_id, capture_id):
+            return jev.decide(payload, "synthetic-test-key", request_id=request_id, capture_id=capture_id)
+
+        with patch.object(jev, "build_opener") as build, \
+             patch("socket.socket", side_effect=AssertionError("Unexpected network")):
+            build.return_value.open.side_effect = open_request
+            result = SelectionSearch(observed, "Open a new YouTube video").run(remote)
+        self.assertEqual(result["status"], "selected")
+        self.assertEqual(result["selected_option"]["id"], target)
+        classified = [candidate for payload in dispatched if payload["state"]["stage"] == "classify"
+                      for candidate in payload["state"]["candidates"]]
+        self.assertCountEqual([candidate["id"] for candidate in classified],
+                              [option["id"] for option in observed["options"]])
+        self.assertTrue(all(len(candidate["ancestors"]) == 4 for candidate in classified))
+        self.assertTrue(any(payload["state"]["stage"] == "reduce" for payload in dispatched))
+        finals = [payload for payload in dispatched if payload["state"]["stage"] == "final"]
+        self.assertEqual(len(finals), 1)
+        self.assertIn(target, finals[0]["questions"]["action"]["criteria"])
+        self.assertLessEqual(result["request_count"], SelectionConfig().max_requests)
+
+    def test_unicode_context_uses_escaped_wire_bytes_and_preserves_every_option(self):
+        observed = snapshot(40)
+        for element, option in zip(observed["elements"], observed["options"]):
+            element["name"] = "\U0001f4fa" * 180
+            option["label"] = element["name"]
+        preview = SelectionSearch(observed, "\u6253\u5f00\u65b0\u89c6\u9891", history=["\u4e0a\u4e00\u6b65" * 40]).preview()
+        requests = preview["initial_requests"]
+        self.assertEqual([key for request in requests for key in request["input_ids"]],
+                         [option["id"] for option in observed["options"]])
+        for request in requests:
+            body = request_body(request["payload"])
+            self.assertLessEqual(len(body), MAX_SELECTION_REQUEST_BYTES)
+            self.assertIn(b"\\ud83d\\udcfa", body)
+            self.assertGreater(len(body), len(json.dumps(request["payload"], ensure_ascii=False).encode("utf-8")))
+
+    def test_oversized_single_candidate_or_shared_goal_fails_before_dispatch(self):
+        observed = browser_snapshot(1)
+        for element in observed["elements"]:
+            element["name"] = "\U0001f4fa" * 512
+        cases = ((observed, "Choose safely", None),
+                 (snapshot(1), "\U0001f4fa" * 4000, None),
+                 (snapshot(1), "Choose safely", ["\U0001f4fa" * 512] * 8))
+        for candidate_snapshot, goal, history in cases:
+            with self.subTest(goal_length=len(goal), history=history is not None), \
+                 self.assertRaises(SelectionContextError) as caught:
+                SelectionSearch(candidate_snapshot, goal, history=history)
+            self.assertNotIn("\U0001f4fa", str(caught.exception))
+
+    def test_action_context_is_preflighted_when_classification_alone_would_fit(self):
+        observed = snapshot(1)
+        observed["options"][0]["label"] = "\U0001f4fa" * 512
+        goal = "g" * 4000
+        history = [{"action": "a" * 512, "result": "r" * 512}] * 8
+        with patch.object(selection, "MAX_SELECTION_REQUEST_BYTES", 100_000):
+            search = SelectionSearch(observed, goal, history=history)
+            classify = search.preview()["initial_requests"][0]["payload"]
+            final = search._make_requests(search._ids, "final", 0)[0]["payload"]
+        self.assertLessEqual(len(request_body(classify)), MAX_SELECTION_REQUEST_BYTES)
+        self.assertGreater(len(request_body(final)), MAX_SELECTION_REQUEST_BYTES)
+        with self.assertRaises(SelectionContextError):
+            SelectionSearch(observed, goal, history=history)
+
+    def test_small_context_groups_shrink_under_default_retention(self):
+        for label_size in (400, 512):
+            with self.subTest(label_size=label_size):
+                observed = browser_snapshot(20)
+                for ancestor in observed["elements"][20:]:
+                    ancestor.update(name="n" * label_size, value="v" * label_size)
+                target = observed["options"][-1]["id"]
+                decider = FakeDecider(choose=lambda criteria, payload: target if target in criteria else
+                                      next(key for key in criteria if key != "__none__"))
+                search = SelectionSearch(observed, "Select the known synthetic target")
+                groups = search._make_requests(search._ids, "reduce", 1)
+                self.assertTrue(any(1 < len(group["input_ids"]) <= search.config.keep_per_group + 1
+                                    for group in groups))
+                if label_size == 512:
+                    self.assertTrue(any(len(group["input_ids"]) <= search.config.keep_per_group
+                                        for group in groups))
+                result = search.run(decider)
+                self.assertEqual(result["status"], "selected")
+                self.assertEqual(result["selected_option"]["id"], target)
+                finals = [call for call in decider.action_calls()
+                          if call["payload"]["state"]["stage"] == "final"]
+                self.assertEqual(len(finals), 1)
+                self.assertIn(target, finals[0]["payload"]["questions"]["action"]["criteria"])
+                for call in decider.calls:
+                    self.assertLessEqual(len(request_body(call["payload"])), MAX_SELECTION_REQUEST_BYTES)
+
+    def test_singleton_only_context_groups_do_not_loop_or_select(self):
+        observed = browser_snapshot(3)
+        for ancestor in observed["elements"][3:]:
+            ancestor.update(name="\u751f" * 250, value="\u751f" * 250)
+        search = SelectionSearch(observed, "Choose safely")
+        groups = search._make_requests(search._ids, "reduce", 1)
+        self.assertEqual([len(group["input_ids"]) for group in groups], [1, 1, 1])
+        decider = FakeDecider()
+        result = search.run(decider)
+        self.assertEqual(result["status"], "budget_exhausted")
+        self.assertIsNone(result["selected_option"])
+        self.assertIn("context-size limit", result["reason"])
+        self.assertEqual({call["payload"]["state"]["round"] for call in decider.action_calls()}, {1})
+        self.assertFalse(any(call["payload"]["state"]["stage"].endswith("final")
+                             for call in decider.action_calls()))
+
+    def test_context_packing_obeys_request_budget_without_partial_winner(self):
+        observed = browser_snapshot(132)
+        needed = SelectionSearch(observed, "Choose safely").preview()["initial_request_count"]
+        decider = FakeDecider()
+        result = SelectionSearch(observed, "Choose safely", config=SelectionConfig(
+            max_requests=needed + 1)).run(decider)
+        self.assertEqual(result["status"], "budget_exhausted")
+        self.assertIsNone(result["selected_option"])
+        self.assertEqual(len(decider.calls), needed)
+        self.assertEqual(len(decider.classified_ids()), 132)
+        self.assertEqual(decider.action_calls(), [])
 
     def test_invalid_or_foreign_responses_never_select(self):
         mutations = {
