@@ -185,6 +185,67 @@ class SelectionCliTests(unittest.TestCase):
         self.assertIn("before it could be sent", records[-1]["message"])
         self.assertNotIn("AWS", records[-1]["message"])
 
+    def test_response_validation_codes_have_specific_safe_diagnostics(self):
+        expected = {
+            "envelope": "decision object", "model": "pinned version",
+            "provider": "pinned TypeSafe", "question_ids": "question IDs",
+            "answer_type": "question type", "choice_id": "not offered",
+            "probability_ids": "offered option IDs", "probability_value": "finite number",
+            "probability_sum": "rounding allowance", "choice_maximum": "highest returned probability",
+            "confidence": "valid confidence", "noul": "yes-probability",
+            "provider_request_id": "provider request ID", "usage": "usage data",
+            "json": "decision JSON", "response_size": "response size limit",
+            "binding": "observation identifiers", "latency": "timing data",
+        }
+        self.assertEqual(set(cli._RESPONSE_VALIDATION_MESSAGES), set(expected))
+        for validation_code, text in expected.items():
+            error = jev.DecisionError("response", "sk-or-ERROR-SENTINEL")
+            error.validation_code = validation_code
+            with self.subTest(validation_code=validation_code), \
+                 patch.object(cli, "get_openrouter_key", return_value="sk-or-KEY-SENTINEL"), \
+                 patch.object(cli, "decide", side_effect=error):
+                code, output, records = self.invoke(None, "--live")
+            self.assertEqual(code, 1)
+            self.assertEqual(records[-1]["category"], "response")
+            self.assertEqual(records[-1]["input_actions"], 0)
+            self.assertIn(text, records[-1]["message"])
+            self.assertTrue(records[-1]["message"].endswith(f"[{validation_code}]"))
+            self.assertNotIn("http_status", records[-1])
+            self.assertNotIn("SENTINEL", output)
+
+    def test_untrusted_validation_codes_use_generic_response_diagnostic(self):
+        class HostileCode(str):
+            def __hash__(self):
+                raise AssertionError("Untrusted validation code was hashed")
+
+            def __str__(self):
+                raise AssertionError("Untrusted validation code was formatted")
+
+        for validation_code in (None, "sk-or-VALIDATION-SENTINEL", "probability_sum\nSENTINEL",
+                                {"code": "SENTINEL"}, ["SENTINEL"], True, 1,
+                                HostileCode("probability_sum")):
+            error = jev.DecisionError("response", "sk-or-ERROR-SENTINEL")
+            error.validation_code = validation_code
+            with self.subTest(code_type=type(validation_code)), \
+                 patch.object(cli, "get_openrouter_key", return_value="sk-or-KEY-SENTINEL"), \
+                 patch.object(cli, "decide", side_effect=error):
+                code, output, records = self.invoke(None, "--live")
+            self.assertEqual(code, 1)
+            self.assertEqual(records[-1]["category"], "response")
+            self.assertIn("response failed validation", records[-1]["message"])
+            self.assertNotIn("[", records[-1]["message"])
+            self.assertNotIn("SENTINEL", output)
+            self.assertNotIn("Traceback", output)
+
+    def test_response_validation_code_does_not_override_http_failure(self):
+        error = jev.DecisionError("response", "SENTINEL", status_code=429)
+        error.validation_code = "probability_sum"
+        result = cli._decision_diagnostic(error)
+        self.assertEqual(result["category"], "rate_limit")
+        self.assertIn("HTTP 429", result["message"])
+        self.assertNotIn("probability_sum", result["message"])
+        self.assertNotIn("SENTINEL", result["message"])
+
     def test_provider_context_limit_has_a_specific_safe_diagnostic(self):
         error = jev._http_error(400, context_limit=True)
         error.args = ("sk-or-ERROR-SENTINEL",)

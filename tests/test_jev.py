@@ -164,6 +164,103 @@ class DecisionAdapterTests(unittest.TestCase):
         envelope["answers"]["action"]["probabilities"] = {"capture-1:c1:click": .8, "no_target": .2000005}
         self.call(envelope)
 
+    def test_complete_hundredth_rounded_distribution_keeps_original_values(self):
+        # A live synthetic 48-option request returned a maximum of
+        # .18000000000000002 and total .99. Exercise both rounding directions
+        # through the HTTP adapter and the selector's revalidation boundary.
+        payload = request_payload()
+        payload["questions"]["action"]["criteria"] = {
+            f"option_{index}": f"Synthetic option {index}" for index in range(48)}
+        for tail in (.06, .08):
+            values = [.18000000000000002, .17, .16, .15, .10, .09, .08, tail] + [0] * 40
+            probabilities = dict(zip(payload["questions"]["action"]["criteria"], values))
+            envelope = response_payload()
+            envelope["answers"]["action"].update(choice="option_0", probabilities=probabilities)
+            with self.subTest(total=sum(values)):
+                result, _, _ = self.call(envelope, payload=payload)
+                revalidated = jev.validate_decision(result, payload["questions"])
+                self.assertEqual(revalidated["answers"]["action"], envelope["answers"]["action"])
+                self.assertEqual(revalidated["answers"]["action"]["probabilities"], probabilities)
+
+    def test_rounded_sum_allowance_stays_bounded_and_requires_hundredths(self):
+        for values in ((.8, .18), (.8, .22), (0, 0), (1, 1),
+                       (.8001, .1899), (.7999, .2101), (.8, .21000001)):
+            envelope = response_payload()
+            envelope["answers"]["action"]["probabilities"] = dict(zip(
+                request_payload()["questions"]["action"]["criteria"], values))
+            with self.subTest(values=values), self.assertRaises(jev.DecisionError) as caught:
+                self.call(envelope)
+            self.assertEqual(caught.exception.validation_code, "probability_sum")
+        envelope = response_payload()
+        envelope["answers"]["action"]["probabilities"] = {"capture-1:c1:click": .19, "no_target": .8}
+        with self.assertRaises(jev.DecisionError) as caught:
+            self.call(envelope)
+        self.assertEqual(caught.exception.validation_code, "choice_maximum")
+
+    def test_rounding_allowance_does_not_grow_with_option_count(self):
+        payload = request_payload()
+        payload["questions"]["action"]["criteria"] = {
+            f"option_{index}": f"Synthetic option {index}" for index in range(255)}
+        envelope = response_payload()
+        envelope["answers"]["action"].update(
+            choice="option_0", probabilities={f"option_{index}": .01 if index < 98 else 0
+                                               for index in range(255)})
+        with self.assertRaises(jev.DecisionError) as caught:
+            self.call(envelope, payload=payload)
+        self.assertEqual(caught.exception.validation_code, "probability_sum")
+        envelope["answers"]["action"]["probabilities"]["option_98"] = .01
+        self.call(envelope, payload=payload)
+        del envelope["answers"]["action"]["probabilities"]["option_254"]
+        with self.assertRaises(jev.DecisionError) as caught:
+            self.call(envelope, payload=payload)
+        self.assertEqual(caught.exception.validation_code, "probability_ids")
+
+    def test_response_failures_identify_the_boundary_without_raw_data(self):
+        cases = (
+            ("model", lambda e: e.update(model="different-model")),
+            ("provider", lambda e: e.update(provider="different-provider")),
+            ("question_ids", lambda e: e["answers"].pop("complete")),
+            ("answer_type", lambda e: e["answers"]["action"].update(type="noul")),
+            ("choice_id", lambda e: e["answers"]["action"].update(choice="unknown")),
+            ("probability_ids", lambda e: e["answers"]["action"]["probabilities"].pop("no_target")),
+            ("probability_value", lambda e: e["answers"]["action"]["probabilities"].update(no_target=-.1)),
+            ("probability_sum", lambda e: e["answers"]["action"]["probabilities"].update(no_target=.1)),
+            ("choice_maximum", lambda e: e["answers"]["action"].update(choice="no_target")),
+            ("confidence", lambda e: e["answers"]["action"].update(confidence=None)),
+            ("noul", lambda e: e["answers"]["complete"].update(noul=2)),
+            ("provider_request_id", lambda e: e.update(id="PRIVATE-ID-SENTINEL")),
+            ("usage", lambda e: e.update(usage="PRIVATE-USAGE-SENTINEL")),
+        )
+        for expected, mutate in cases:
+            envelope = response_payload()
+            envelope["diagnostic"] = "PRIVATE-DIAGNOSTIC-SENTINEL"
+            mutate(envelope)
+            with self.subTest(expected=expected), self.assertRaises(jev.DecisionError) as caught:
+                self.call(envelope)
+            self.assertEqual(caught.exception.validation_code, expected)
+            self.assertNotIn("PRIVATE", str(caught.exception))
+        for raw, expected in ((b"not json", "json"), (b" " * (jev.MAX_RESPONSE_BYTES + 1), "response_size")):
+            with self.assertRaises(jev.DecisionError) as caught:
+                self.call(raw=raw)
+            self.assertEqual(caught.exception.validation_code, expected)
+
+    def test_normalized_validation_retains_exact_safe_failure_code(self):
+        result, _, _ = self.call()
+        result["local_request"]["request_id"] = "bad:id"
+        with self.assertRaises(jev.DecisionError) as caught:
+            jev.validate_decision(result, request_payload()["questions"])
+        self.assertEqual(caught.exception.validation_code, "binding")
+        result, _, _ = self.call()
+        result["latency_ms"] = -1
+        with self.assertRaises(jev.DecisionError) as caught:
+            jev.validate_decision(result, request_payload()["questions"])
+        self.assertEqual(caught.exception.validation_code, "latency")
+
+    def test_validation_codes_do_not_accept_arbitrary_provider_text(self):
+        for value in ("PRIVATE-CODE-SENTINEL", None, {}, [], True):
+            self.assertIsNone(jev.DecisionError("response", "static", validation_code=value).validation_code)
+        self.assertIsNone(jev.DecisionError("provider", "static", validation_code="model").validation_code)
+
     def test_returned_model_provider_and_envelope(self):
         for field, value in (("model", jev.MODEL), ("provider", "Other"), ("provider", None),
                              ("answers", []), ("usage", None), ("id", "not-a-request-id"),

@@ -16,18 +16,30 @@ RESOLVED_MODEL = "typesafe/jev-1.13-20260917"
 PROVIDER = "TypeSafe"
 TIMEOUT_SECONDS = 20
 MAX_RESPONSE_BYTES = 1_048_576
-# Permit serialization rounding, not a materially incomplete distribution.
+# Preserve strict sums for arbitrary precision. The pinned provider also emits
+# hundredth-rounded values whose complete distribution can total 0.99 or 1.01.
 PROBABILITY_SUM_TOLERANCE = 1e-6
+ROUNDED_PROBABILITY_SUM_TOLERANCE = .01
+PROBABILITY_GRID_TOLERANCE = 1e-12
 _ROUTE = {"only": ["typesafe"], "order": ["typesafe"], "allow_fallbacks": False}
+RESPONSE_VALIDATION_CODES = frozenset({
+    "envelope", "model", "provider", "question_ids", "answer_type", "choice_id",
+    "probability_ids", "probability_value", "probability_sum", "choice_maximum",
+    "confidence", "noul", "provider_request_id", "usage", "json", "response_size",
+    "binding", "latency",
+})
 
 
 class DecisionError(RuntimeError):
     """A safe error whose message never includes provider or credential content."""
 
-    def __init__(self, category, message, *, status_code=None):
+    def __init__(self, category, message, *, status_code=None, validation_code=None):
         super().__init__(message)
         self.category = category
         self.status_code = status_code
+        self.validation_code = (validation_code if category == "response"
+                                and type(validation_code) is str
+                                and validation_code in RESPONSE_VALIDATION_CODES else None)
 
 
 class _NoRedirects(HTTPRedirectHandler):
@@ -39,8 +51,9 @@ def _request_error():
     return DecisionError("request", "Invalid JEV decision request or pinned route.")
 
 
-def _response_error():
-    return DecisionError("response", "JEV returned an invalid or unexpected decision response.")
+def _response_error(validation_code="envelope"):
+    return DecisionError("response", "JEV returned an invalid or unexpected decision response.",
+                         validation_code=validation_code)
 
 
 def _context_limit_error(raw):
@@ -68,16 +81,28 @@ def _http_error(status, *, context_limit=False):
     return DecisionError(category, message, status_code=status)
 
 
-def _probability(value):
+def _probability(value, validation_code="probability_value"):
     if type(value) not in (int, float):
-        raise _response_error()
+        raise _response_error(validation_code)
     try:
         valid = math.isfinite(value) and 0 <= value <= 1
     except OverflowError:
         valid = False
     if not valid:
-        raise _response_error()
+        raise _response_error(validation_code)
     return value
+
+
+def _valid_probability_sum(probabilities):
+    total = math.fsum(probabilities.values())
+    if math.isclose(total, 1.0, rel_tol=0, abs_tol=PROBABILITY_SUM_TOLERANCE):
+        return True
+    # Only allow the observed one-percentage-point rounding discrepancy, even
+    # for large choices. Never normalize values or fill in missing options.
+    return (abs(total - 1.0) <= ROUNDED_PROBABILITY_SUM_TOLERANCE + PROBABILITY_GRID_TOLERANCE
+            and all(math.isclose(value, round(value, 2), rel_tol=0,
+                                 abs_tol=PROBABILITY_GRID_TOLERANCE)
+                    for value in probabilities.values()))
 
 
 def _validate_request(payload):
@@ -161,7 +186,7 @@ def _validate_binding(binding):
             or not _local_id(binding["capture_id"])
             or type(binding["payload_sha256"]) is not str
             or re.fullmatch(r"[0-9a-f]{64}", binding["payload_sha256"]) is None):
-        raise _response_error()
+        raise _response_error("binding")
     return {key: binding[key] for key in ("request_id", "capture_id", "payload_sha256")}
 
 
@@ -171,43 +196,46 @@ def _validate_response(envelope, questions, api_key=None):
     if "error" in envelope:
         error = envelope["error"]
         raise _http_error(error.get("code") if type(error) is dict else None)
-    if envelope.get("model") != RESOLVED_MODEL or envelope.get("provider") != PROVIDER:
-        raise _response_error()
+    if envelope.get("model") != RESOLVED_MODEL:
+        raise _response_error("model")
+    if envelope.get("provider") != PROVIDER:
+        raise _response_error("provider")
     answers = envelope.get("answers")
     if type(answers) is not dict or set(answers) != set(questions):
-        raise _response_error()
+        raise _response_error("question_ids")
     validated = {}
     for question_id, question in questions.items():
         answer = answers[question_id]
         if type(answer) is not dict or answer.get("type") != question["type"]:
-            raise _response_error()
+            raise _response_error("answer_type")
         if question["type"] == "choice":
             choice = answer.get("choice")
             options = question["criteria"]
             probabilities = answer.get("probabilities")
-            if (type(choice) is not str or choice not in options
-                    or type(probabilities) is not dict or set(probabilities) != set(options)):
-                raise _response_error()
+            if type(choice) is not str or choice not in options:
+                raise _response_error("choice_id")
+            if type(probabilities) is not dict or set(probabilities) != set(options):
+                raise _response_error("probability_ids")
             probabilities = {key: _probability(probabilities[key]) for key in options}
-            if (not math.isclose(math.fsum(probabilities.values()), 1.0, rel_tol=0,
-                                 abs_tol=PROBABILITY_SUM_TOLERANCE)
-                    or probabilities[choice] != max(probabilities.values())):
-                raise _response_error()
+            if not _valid_probability_sum(probabilities):
+                raise _response_error("probability_sum")
+            if probabilities[choice] != max(probabilities.values()):
+                raise _response_error("choice_maximum")
             validated[question_id] = {
                 "type": "choice", "choice": choice, "probabilities": probabilities,
-                "confidence": _probability(answer.get("confidence")),
+                "confidence": _probability(answer.get("confidence"), "confidence"),
             }
         else:
-            validated[question_id] = {"type": "noul", "noul": _probability(answer.get("noul"))}
+            validated[question_id] = {"type": "noul", "noul": _probability(answer.get("noul"), "noul")}
     provider_request_id = envelope.get("id")
     if provider_request_id is not None and (
             type(provider_request_id) is not str
             or re.fullmatch(r"gen-[A-Za-z0-9_-]{1,128}", provider_request_id) is None
             or (api_key is not None and api_key in provider_request_id)):
-        raise _response_error()
+        raise _response_error("provider_request_id")
     usage = envelope.get("usage")
     if type(usage) is not dict:
-        raise _response_error()
+        raise _response_error("usage")
     safe_usage = {}
     for key in ("input_tokens", "output_tokens", "cost"):
         if key not in usage:
@@ -219,7 +247,7 @@ def _validate_response(envelope, questions, api_key=None):
         except OverflowError:
             valid = False
         if not valid:
-            raise _response_error()
+            raise _response_error("usage")
         safe_usage[key] = value
     return {"answers": validated, "model": RESOLVED_MODEL, "provider": PROVIDER,
             "provider_request_id": provider_request_id, "usage": safe_usage}
@@ -248,7 +276,7 @@ def validate_decision(result: dict, questions: dict) -> dict:
     except OverflowError:
         valid_latency = False
     if not valid_latency:
-        raise _response_error()
+        raise _response_error("latency")
     validated = _validate_response({
         "answers": snapshot["answers"], "model": snapshot["model"],
         "provider": snapshot["provider"], "id": snapshot["provider_request_id"],
@@ -264,7 +292,8 @@ def decide(payload: dict, api_key: str, *, request_id: str, capture_id: str) -> 
 
     The caller supplies the key directly from its credential lookup. This adapter
     does not read environment variables, retrieve secrets, retry, or follow
-    redirects. Probability sums allow an absolute rounding tolerance of 1e-6.
+    redirects. Probability sums allow 1e-6 error, or at most .01 error when all
+    values are rounded to hundredths. Original probabilities remain unchanged.
     Local request/capture metadata is stamped from the dispatch snapshot, never
     accepted from the provider and never added to the outgoing request body.
     """
@@ -301,12 +330,12 @@ def decide(payload: dict, api_key: str, *, request_id: str, capture_id: str) -> 
     except (URLError, OSError, HTTPException, ValueError):
         raise DecisionError("transport", "JEV transport failed or timed out.") from None
     if len(raw) > MAX_RESPONSE_BYTES:
-        raise _response_error()
+        raise _response_error("response_size")
     try:
         envelope = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object,
                               parse_constant=_reject_constant)
     except (UnicodeError, ValueError, RecursionError):
-        raise _response_error() from None
+        raise _response_error("json") from None
     result = _validate_response(envelope, snapshot["questions"], api_key)
     result["latency_ms"] = round((time.perf_counter() - started) * 1000, 3)
     result["local_request"] = local_request

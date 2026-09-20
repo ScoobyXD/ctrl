@@ -116,7 +116,7 @@ def main():
         run_id = request["run_id"]
         from ctrl_loop.cua_driver import NativeCuaExecutor
         from ctrl_loop.credentials import CredentialError, get_openrouter_key
-        from ctrl_loop.jev import DecisionError, decide
+        from ctrl_loop.jev import DecisionError, RESPONSE_VALIDATION_CODES, decide
         from ctrl_loop.selection import SelectionError, SelectionSearch
 
         threading.Thread(target=read_cancel, daemon=True).start()
@@ -140,7 +140,10 @@ def main():
             except CredentialError as error:
                 raise ExecutionError(str(error)) from None
             except DecisionError as error:
-                raise ExecutionError("Jev selection failed (" + error.category + "). No action was dispatched for this selection.") from None
+                code = getattr(error, "validation_code", None)
+                detail = (" [" + code + "]" if type(code) is str and code in RESPONSE_VALIDATION_CODES else "")
+                raise ExecutionError("Jev selection failed (" + error.category + ")" + detail
+                                     + ". No action was dispatched for this selection.") from None
             except SelectionError:
                 raise ExecutionError("Jev selection rejected the current snapshot or request bounds.") from None
 

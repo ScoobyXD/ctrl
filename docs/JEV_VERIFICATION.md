@@ -4,6 +4,16 @@ Live route verified **19 September 2026, 18:22 PDT** (`2026-09-20T01:22:06.60133
 
 Worktree: `C:/Users/Jonat/.codex/worktrees/875a/[CTRL] Loop`; branch `codex/jev-decision-preview`. See [setup and reproducible commands](JEV.md).
 
+## Rounded-probability regression
+
+The 20 September 2026 investigation of a UIA viewer response-validation failure made a live synthetic Choice request with **48 options** through the existing pinned OpenRouter/TypeSafe route. The returned model/provider and question/option IDs matched the request. All probabilities were finite and in `[0,1]`, and the selected option was the returned maximum (`0.18000000000000002`). The complete distribution totaled **`0.99`**, so the original sum tolerance of `1e-6` rejected it. No native input was delivered. The screenshot's rejected provider response was unavailable; this establishes a synthetic reproduction of a validator failure, not a replay or confirmed diagnosis of that exact response.
+
+TypeSafe's [Choice contract](https://docs.typesafe.ai/primitives/choice) describes a full distribution summing to one and a highest-probability choice; its examples use two decimal places. It does not specify a rounding-error tolerance. The observed response therefore supplies the evidence for a narrow local compatibility rule: retain the original `1e-6` sum tolerance, but also accept totals within one percentage point of one only when every value is on the `0.01` grid within floating-point tolerance. The allowance does not grow with the number of options. Values and model confidence remain unchanged; there is no invented probability or normalization. A larger discrepancy, incomplete option set, nonfinite or out-of-range value, nonmaximum choice, or changed model/provider still fails validation.
+
+The selection helper now identifies the failed check using static, allowlisted diagnostics such as `[probability_sum]`. Unknown or malformed diagnostic codes fall back to the generic message; credentials, provider bodies and exception text are excluded. Offline CLI checks cover each allowed code, secret-bearing and hostile values, and HTTP-error precedence.
+
+After the fix, **235 affected Jev, selection, UIA viewer and CUA execution tests passed** using the UIA runtime. Regression cases accept complete 48-option distributions totaling `0.99` and `1.01` without changing their values and reject larger errors, off-grid values, missing IDs and a nonmaximum selection. A fresh live request with the same synthetic 48-option input also passed; that response totaled `1.0`, so the rounded-total acceptance is established by the deterministic regression cases rather than that rerun.
+
 ## Completed checks
 
 - Fresh installation and cached installer repeat passed using unpackaged CPython **3.12.13 x64** and uv **0.11.26**. All seven distributions are pinned with hashes; boto3 and botocore are **1.43.98**. Dependency consistency checks passed. No global install or machine configuration change was made.

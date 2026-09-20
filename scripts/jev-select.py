@@ -16,6 +16,29 @@ from ctrl_loop.selection import SelectionConfig, SelectionContextError, Selectio
 
 MAX_INPUT_BYTES = 8 * 1024 * 1024
 
+# Only locally authored text crosses the helper boundary. Never interpolate
+# provider fields or an arbitrary exception validation code into a diagnostic.
+_RESPONSE_VALIDATION_MESSAGES = {
+    "envelope": "The Jev response was not a valid decision object. Try again; if this repeats, check the provider response contract.",
+    "model": "The Jev response named a different model than the pinned version. Verify the provider's current model version before updating the pin.",
+    "provider": "The Jev response did not confirm the pinned TypeSafe provider. Check the provider route before retrying.",
+    "question_ids": "The Jev response did not answer exactly the requested question IDs. Try the preview again; if this repeats, check the provider response contract.",
+    "answer_type": "A Jev answer did not match its requested question type. Try the preview again; if this repeats, check the provider response contract.",
+    "choice_id": "Jev selected an option ID that was not offered. Observe again and retry the selection.",
+    "probability_ids": "The Jev probabilities did not cover exactly the offered option IDs. Retry the selection; incomplete distributions cannot be ranked.",
+    "probability_value": "A Jev probability was not a finite number between zero and one. Retry the selection; invalid probabilities cannot be ranked.",
+    "probability_sum": "The Jev probability total was outside the accepted rounding allowance. Retry the selection; if this repeats, check the provider's probability precision.",
+    "choice_maximum": "The option Jev selected did not have the highest returned probability. Retry the selection; conflicting answers cannot be accepted.",
+    "confidence": "Jev did not return a valid confidence between zero and one. Retry the selection; if this repeats, check the provider response contract.",
+    "noul": "Jev did not return a valid yes-probability between zero and one. Retry the selection; if this repeats, check the provider response contract.",
+    "provider_request_id": "The Jev response contained an invalid provider request ID. Retry the selection; if this repeats, check the provider response contract.",
+    "usage": "The Jev response contained missing or invalid usage data. Retry the selection; if this repeats, check the provider response contract.",
+    "json": "The Jev response could not be read as valid decision JSON. Retry the selection; if this repeats, check provider availability.",
+    "response_size": "The Jev response exceeded the local response size limit. Reduce the number of options per request before retrying.",
+    "binding": "The Jev result did not retain valid local request and observation identifiers. Observe again and start a new selection.",
+    "latency": "The Jev result contained invalid local timing data. Start a new selection; if this repeats, check the local adapter.",
+}
+
 
 def _unique_object(pairs):
     result = {}
@@ -88,6 +111,11 @@ def _decision_diagnostic(error):
         message = f"OpenRouter or TypeSafe could not complete the Jev request (HTTP {status}). Try again or check provider availability."
     elif status is not None:
         message = f"{message} HTTP status: {status}."
+    validation_code = getattr(error, "validation_code", None)
+    if (category == "response" and status is None
+            and type(validation_code) is str
+            and validation_code in _RESPONSE_VALIDATION_MESSAGES):
+        message = f"{_RESPONSE_VALIDATION_MESSAGES[validation_code]} [{validation_code}]"
     return {"message": message, "category": category, "http_status": status}
 
 
