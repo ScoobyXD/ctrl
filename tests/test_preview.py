@@ -71,6 +71,7 @@ class PreviewCliTests(unittest.TestCase):
         self.assertEqual(outgoing["payload"]["model"], jev.MODEL)
         self.assertEqual(outgoing["payload"]["provider"]["only"], ["typesafe"])
         self.assertFalse(outgoing["payload"]["provider"]["allow_fallbacks"])
+        self.assertNotIn("local_request", outgoing["payload"])
         self.assertEqual(stderr, "")
 
     def test_mocked_live_request_validates_and_redacts_saved_result(self):
@@ -83,6 +84,8 @@ class PreviewCliTests(unittest.TestCase):
             self.assertEqual(timeout, jev.TIMEOUT_SECONDS)
             payload = json.loads(request.data)
             self.assertNotIn(KEY, json.dumps(payload))
+            for local_field in ("local_request", "request_id", "capture_id", "payload_sha256"):
+                self.assertNotIn('"' + local_field + '"', json.dumps(payload))
             sent.append(payload)
             return FixtureResponse(payload)
 
@@ -111,6 +114,14 @@ class PreviewCliTests(unittest.TestCase):
         self.assertEqual(result["requested_model"], jev.MODEL)
         self.assertEqual(result["decision"]["answers"]["already_satisfied"]["noul"], 0.01)
         self.assertNotIn("ignored_diagnostic", result["decision"])
+        outgoing, _ = json.JSONDecoder().raw_decode(stdout)
+        outgoing = outgoing["outgoing_preview"]
+        expected_binding = jev.request_binding(sent[0], request_id=outgoing["request_id"],
+                                               capture_id=outgoing["capture_id"])
+        self.assertEqual(result["decision"]["local_request"], expected_binding)
+        self.assertEqual(result["request_id"], expected_binding["request_id"])
+        self.assertEqual(result["capture_id"], expected_binding["capture_id"])
+        self.assertEqual(sent[0], outgoing["payload"])
 
     def test_generic_secret_bearing_failures_are_redacted_and_write_no_result(self):
         for failing_stage in ("get_openrouter_key", "decide"):

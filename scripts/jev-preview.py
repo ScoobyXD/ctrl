@@ -29,7 +29,8 @@ def main():
         if args.live:
             key = get_openrouter_key()
             try:
-                decision = decide(pending.payload(), key)
+                decision = decide(pending.payload(), key,
+                                  request_id=pending.request_id, capture_id=pending.capture_id)
             finally:
                 del key
             result = registry.accept(pending, decision)

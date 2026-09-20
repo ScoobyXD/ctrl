@@ -1,5 +1,6 @@
 from copy import deepcopy
 from http.client import IncompleteRead
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -13,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from ctrl_loop import jev
 
 TEST_CREDENTIAL = "test-credential"
+LOCAL_IDS = {"request_id": "request-1", "capture_id": "capture-1"}
 
 
 def request_payload():
@@ -50,7 +52,7 @@ class DecisionAdapterTests(unittest.TestCase):
         with patch.object(jev, "build_opener") as build:
             build.return_value.open.return_value = response
             build.return_value.open.side_effect = side_effect
-            result = jev.decide(request_payload() if payload is None else payload, TEST_CREDENTIAL)
+            result = jev.decide(request_payload() if payload is None else payload, TEST_CREDENTIAL, **LOCAL_IDS)
         return result, build, response
 
     def test_pinned_request_and_whitelisted_output(self):
@@ -59,6 +61,8 @@ class DecisionAdapterTests(unittest.TestCase):
         envelope["answers"]["action"]["extra"] = "discard this text"
         envelope["answers"]["complete"]["confidence"] = "discard this text"
         envelope["usage"]["diagnostic"] = "discard this text"
+        envelope["local_request"] = {"request_id": "provider-fake", "capture_id": "provider-fake",
+                                     "payload_sha256": "a" * 64}
         result, build, response = self.call(envelope)
         sent = build.return_value.open.call_args.args[0]
         self.assertEqual(sent.full_url, jev.ENDPOINT)
@@ -67,7 +71,10 @@ class DecisionAdapterTests(unittest.TestCase):
         self.assertEqual(sent.get_header("Authorization"), "Bearer test-credential")
         self.assertEqual(build.return_value.open.call_args.kwargs["timeout"], 20)
         self.assertEqual(response.read.call_args.args, (jev.MAX_RESPONSE_BYTES + 1,))
-        self.assertEqual(set(result), {"answers", "model", "provider", "provider_request_id", "latency_ms", "usage"})
+        self.assertEqual(set(result), {"answers", "model", "provider", "provider_request_id",
+                                       "latency_ms", "usage", "local_request"})
+        self.assertEqual(result["local_request"], jev.request_binding(request_payload(), **LOCAL_IDS))
+        self.assertNotIn("local_request", json.loads(sent.data))
         self.assertEqual(result["answers"]["action"]["confidence"], .7)
         self.assertEqual(result["answers"]["action"]["probabilities"]["capture-1:c1:click"], .8)
         self.assertEqual(result["answers"]["complete"], {"type": "noul", "noul": .02})
@@ -79,6 +86,8 @@ class DecisionAdapterTests(unittest.TestCase):
 
     def test_payload_is_snapshotted_before_transport(self):
         payload = request_payload()
+        original = deepcopy(payload)
+        original_binding = jev.request_binding(payload, **LOCAL_IDS)
         def mutate(*args, **kwargs):
             payload["questions"]["action"]["criteria"].clear()
             return response
@@ -88,8 +97,10 @@ class DecisionAdapterTests(unittest.TestCase):
         response.__enter__.return_value = response
         with patch.object(jev, "build_opener") as build:
             build.return_value.open.side_effect = mutate
-            result = jev.decide(payload, "test-credential")
+            result = jev.decide(payload, TEST_CREDENTIAL, **LOCAL_IDS)
         self.assertEqual(result["answers"]["action"]["choice"], "capture-1:c1:click")
+        self.assertEqual(result["local_request"], original_binding)
+        self.assertEqual(json.loads(build.return_value.open.call_args.args[0].data), original)
 
     def test_wrong_request_routes_fail_before_network(self):
         variants = []
@@ -109,7 +120,7 @@ class DecisionAdapterTests(unittest.TestCase):
         for payload in variants:
             with self.subTest(payload=payload), patch.object(jev, "build_opener") as build:
                 with self.assertRaises(jev.DecisionError):
-                    jev.decide(payload, "test-credential")
+                    jev.decide(payload, TEST_CREDENTIAL, **LOCAL_IDS)
                 build.assert_not_called()
 
     def test_unknown_missing_and_mismatched_answer_ids(self):
@@ -223,11 +234,11 @@ class DecisionAdapterTests(unittest.TestCase):
         bad_requests.append(payload)
         for payload in bad_requests:
             with patch.object(jev, "build_opener") as build, self.assertRaises(jev.DecisionError):
-                jev.decide(payload, "test-credential")
+                jev.decide(payload, TEST_CREDENTIAL, **LOCAL_IDS)
             build.assert_not_called()
         for key in ("", None, "test\ncredential", "test credential"):
             with patch.object(jev, "build_opener") as build, self.assertRaises(jev.DecisionError):
-                jev.decide(request_payload(), key)
+                jev.decide(request_payload(), key, **LOCAL_IDS)
             build.assert_not_called()
 
     def test_normalized_validation_copies_and_whitelists_without_network(self):
@@ -243,6 +254,7 @@ class DecisionAdapterTests(unittest.TestCase):
         self.assertNotIn(TEST_CREDENTIAL, json.dumps(validated))
         result["answers"]["action"]["probabilities"].clear()
         result["usage"].clear()
+        result["local_request"]["request_id"] = "changed"
         self.assertEqual(validated, expected)
         validated["answers"]["action"]["choice"] = "no_target"
         self.assertEqual(expected["answers"]["action"]["choice"], "capture-1:c1:click")
@@ -286,6 +298,61 @@ class DecisionAdapterTests(unittest.TestCase):
         for questions in ({}, [], None, {"action": {"type": "choice"}}):
             with self.subTest(questions=questions), self.assertRaises(jev.DecisionError):
                 jev.validate_decision(original, questions)
+
+    def test_binding_hash_is_deterministic_and_covers_the_payload(self):
+        payload = request_payload()
+        expected_hash = hashlib.sha256(json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
+        binding = jev.request_binding(payload, **LOCAL_IDS)
+        self.assertEqual(binding, {**LOCAL_IDS, "payload_sha256": expected_hash})
+        reordered = dict(reversed(list(payload.items())))
+        reordered["state"] = dict(reversed(list(payload["state"].items())))
+        self.assertEqual(jev.request_binding(reordered, **LOCAL_IDS), binding)
+        for field, value in (("task", "Close Settings"), ("capture_id", "capture-2")):
+            changed = deepcopy(payload)
+            changed["state"][field] = value
+            self.assertNotEqual(jev.request_binding(changed, **LOCAL_IDS)["payload_sha256"], expected_hash)
+        other_ids = {"request_id": "request-2", "capture_id": "capture-2"}
+        other = jev.request_binding(payload, **other_ids)
+        self.assertEqual(other["payload_sha256"], expected_hash)
+        self.assertNotEqual(other, binding)
+
+    def test_local_identity_is_required_and_validated_before_dispatch(self):
+        with patch.object(jev, "build_opener") as build:
+            with self.assertRaises(TypeError):
+                jev.decide(request_payload(), TEST_CREDENTIAL)
+            build.assert_not_called()
+        for field in ("request_id", "capture_id"):
+            for value in (None, True, "", "bad:id", "x" * 81, "new\nline"):
+                identifiers = {**LOCAL_IDS, field: value}
+                with self.subTest(field=field, value=value), patch.object(jev, "build_opener") as build:
+                    with self.assertRaises(jev.DecisionError):
+                        jev.request_binding(request_payload(), **identifiers)
+                    with self.assertRaises(jev.DecisionError):
+                        jev.decide(request_payload(), TEST_CREDENTIAL, **identifiers)
+                    build.assert_not_called()
+
+    def test_normalized_binding_rejects_missing_malformed_or_extra_metadata(self):
+        original, _, _ = self.call()
+        bindings = (None, [], {}, {**original["local_request"], "extra": TEST_CREDENTIAL},
+                    {**original["local_request"], "request_id": "bad:id"},
+                    {**original["local_request"], "capture_id": "x" * 81})
+        for binding in bindings:
+            result = deepcopy(original)
+            result["local_request"] = binding
+            with self.subTest(binding=binding), self.assertRaises(jev.DecisionError) as caught:
+                jev.validate_decision(result, request_payload()["questions"])
+            self.assertNotIn(TEST_CREDENTIAL, str(caught.exception))
+        for field in original["local_request"]:
+            result = deepcopy(original)
+            del result["local_request"][field]
+            with self.subTest(missing=field), self.assertRaises(jev.DecisionError):
+                jev.validate_decision(result, request_payload()["questions"])
+        for fingerprint in (None, True, "", "f" * 63, "f" * 65, "G" * 64, "A" * 64, []):
+            result = deepcopy(original)
+            result["local_request"]["payload_sha256"] = fingerprint
+            with self.subTest(fingerprint=fingerprint), self.assertRaises(jev.DecisionError):
+                jev.validate_decision(result, request_payload()["questions"])
 
 
 if __name__ == "__main__":

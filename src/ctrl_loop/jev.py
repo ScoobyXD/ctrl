@@ -1,6 +1,7 @@
 """Pinned, decision-only OpenRouter adapter. Credentials are supplied in memory."""
 from copy import deepcopy
 from http.client import HTTPException
+import hashlib
 import json
 import math
 import re
@@ -119,6 +120,40 @@ def _reject_constant(value):
     raise ValueError("Non-finite JSON number")
 
 
+def _local_id(value):
+    return type(value) is str and re.fullmatch(r"[A-Za-z0-9_-]{1,80}", value) is not None
+
+
+def request_binding(payload: dict, *, request_id: str, capture_id: str) -> dict:
+    """Fingerprint a request for local correlation; this metadata is not sent.
+
+    This detects accidental request/result mismatches. It does not authenticate
+    model origin or prove that an observation is still current.
+    """
+    if not _local_id(request_id) or not _local_id(capture_id):
+        raise _request_error()
+    try:
+        snapshot = deepcopy(payload)
+        _validate_request(snapshot)
+        serialized = json.dumps(snapshot, sort_keys=True, separators=(",", ":"),
+                                allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError, RecursionError, OverflowError):
+        raise _request_error() from None
+    return {"request_id": request_id, "capture_id": capture_id,
+            "payload_sha256": hashlib.sha256(serialized).hexdigest()}
+
+
+def _validate_binding(binding):
+    if (type(binding) is not dict
+            or set(binding) != {"request_id", "capture_id", "payload_sha256"}
+            or not _local_id(binding["request_id"])
+            or not _local_id(binding["capture_id"])
+            or type(binding["payload_sha256"]) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", binding["payload_sha256"]) is None):
+        raise _response_error()
+    return {key: binding[key] for key in ("request_id", "capture_id", "payload_sha256")}
+
+
 def _validate_response(envelope, questions, api_key=None):
     if type(envelope) is not dict:
         raise _response_error()
@@ -192,7 +227,7 @@ def validate_decision(result: dict, questions: dict) -> dict:
         _validate_questions(question_snapshot)
     except (TypeError, ValueError, RecursionError, OverflowError):
         raise _response_error() from None
-    required = {"answers", "model", "provider", "provider_request_id", "usage", "latency_ms"}
+    required = {"answers", "model", "provider", "provider_request_id", "usage", "latency_ms", "local_request"}
     if type(snapshot) is not dict or not required <= set(snapshot) or "error" in snapshot:
         raise _response_error()
     latency_ms = snapshot["latency_ms"]
@@ -209,15 +244,18 @@ def validate_decision(result: dict, questions: dict) -> dict:
         "usage": snapshot["usage"],
     }, question_snapshot)
     validated["latency_ms"] = latency_ms
+    validated["local_request"] = _validate_binding(snapshot["local_request"])
     return validated
 
 
-def decide(payload: dict, api_key: str) -> dict:
+def decide(payload: dict, api_key: str, *, request_id: str, capture_id: str) -> dict:
     """Return validated decisions, never actions or raw provider diagnostics.
 
     The caller supplies the key directly from its credential lookup. This adapter
     does not read environment variables, retrieve secrets, retry, or follow
     redirects. Probability sums allow an absolute rounding tolerance of 1e-6.
+    Local request/capture metadata is stamped from the dispatch snapshot, never
+    accepted from the provider and never added to the outgoing request body.
     """
     if (type(api_key) is not str or not 1 <= len(api_key) <= 4096
             or any(not 33 <= ord(character) <= 126 for character in api_key)):
@@ -225,6 +263,7 @@ def decide(payload: dict, api_key: str) -> dict:
     try:
         snapshot = deepcopy(payload)
         _validate_request(snapshot)
+        local_request = request_binding(snapshot, request_id=request_id, capture_id=capture_id)
         body = json.dumps(snapshot, allow_nan=False, separators=(",", ":")).encode("utf-8")
     except (TypeError, ValueError, RecursionError, OverflowError):
         raise _request_error() from None
@@ -252,4 +291,5 @@ def decide(payload: dict, api_key: str) -> dict:
         raise _response_error() from None
     result = _validate_response(envelope, snapshot["questions"], api_key)
     result["latency_ms"] = round((time.perf_counter() - started) * 1000, 3)
+    result["local_request"] = local_request
     return result

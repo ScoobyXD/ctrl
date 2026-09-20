@@ -8,7 +8,7 @@ import math
 import re
 from uuid import uuid4
 
-from .jev import MODEL, DecisionError, validate_decision
+from .jev import MODEL, DecisionError, request_binding, validate_decision
 
 
 class RegistryError(ValueError):
@@ -176,16 +176,26 @@ class PreviewRegistry:
         return pending
 
     def accept(self, pending, decision):
-        """Bind the adapter's validated result to exactly this outstanding request."""
+        """Require both the outstanding handle and the adapter's dispatch binding.
+
+        Local correlation rejects accidental replay/mix-ups, not deliberate
+        forgery by a caller or changes to the screen since capture.
+        """
         if (not self._active or not isinstance(pending, PendingDecision)
                 or pending is not self._pending or pending.capture_id != self.capture_id):
             raise RegistryError("Stale, replaced, or unknown decision request.")
         self._pending = None  # one response only, including failures
         try:
-            decision = validate_decision(decision, pending.payload()["questions"])
+            payload = pending.payload()
+            decision = validate_decision(decision, payload["questions"])
+            expected = request_binding(payload, request_id=pending.request_id, capture_id=pending.capture_id)
+            if decision["local_request"] != expected:
+                raise RegistryError("Decision originated from a different local request or capture.")
             selected = decision["answers"]["next_action"]["choice"]
-            if selected not in pending.payload()["questions"]["next_action"]["criteria"]:
+            if selected not in payload["questions"]["next_action"]["criteria"]:
                 raise ValueError
+        except RegistryError:
+            raise
         except (DecisionError, KeyError, TypeError, ValueError):
             raise RegistryError("Decision does not identify an offered local action.") from None
         target = next((t for t in self._targets if t.action_id == selected), None)

@@ -1,17 +1,25 @@
 # JEV decision preview verification
 
-Verified **19 September 2026, 18:22 PDT** (`2026-09-20T01:22:06.601335Z`) on base **`3cbbeeef8e671049850837256326a6a9700fa8bb`**. Result: **PASS for decision-only integration**: isolated dependency setup, 50 offline checks, runtime AWS retrieval, and one live JEV Choice/Noul request. No input actions were executed.
+Live route verified **19 September 2026, 18:22 PDT** (`2026-09-20T01:22:06.601335Z`) on base **`3cbbeeef8e671049850837256326a6a9700fa8bb`**. Result: **PASS for decision-only integration**: isolated dependency setup, runtime AWS retrieval, and one live JEV Choice/Noul request. The initial 50 offline checks passed; the subsequent local response-correlation fix passes **56 offline checks** with the provider payload unchanged. No input actions were executed.
 
 Worktree: `C:/Users/Jonat/.codex/worktrees/875a/[CTRL] Loop`; branch `codex/jev-decision-preview`. See [setup and reproducible commands](JEV.md).
 
 ## Completed checks
 
 - Fresh installation and cached installer repeat passed using unpackaged CPython **3.12.13 x64** and uv **0.11.26**. All seven distributions are pinned with hashes; boto3 and botocore are **1.43.98**. Dependency consistency checks passed. No global install or machine configuration change was made.
-- **50 offline tests passed:** 12 credential checks, 16 provider-adapter checks, 17 local registry checks, and 5 CLI checks. They cover malformed/duplicate provider JSON, unknown/missing IDs, nonfinite and boolean probabilities, incomplete distributions, nonmaximum selections, wrong model/provider, stale/copied/replayed requests, copy isolation, and sanitized SDK/provider errors.
+- **56 offline tests passed:** 12 credential checks, 19 provider-adapter checks, 20 local registry checks, and 5 CLI checks. They cover malformed/duplicate provider JSON, unknown/missing IDs, nonfinite and boolean probabilities, incomplete distributions, nonmaximum selections, wrong model/provider, stale/copied/replayed requests and results, local dispatch correlation, copy isolation, and sanitized SDK/provider errors.
 - A regression reproduces SDK DEBUG/ERROR/CRITICAL logging with a synthetic credential and verifies no output escapes during lookup, including on failure; prior logging state is restored.
 - Mocked CLI integration exercises the real serializer, HTTP adapter, Choice/Noul validator, registry, and output filtering with a fake provider transport. The default CLI is checked to make no credential or network calls.
 - The actual offline CLI successfully printed the complete outgoing request and wrote ignored `.ctrl/jev/offline-preview.json`.
 - Independent review identified the SDK logging issue and the registry's initial trust of mutable adapter results; both were fixed and regression-tested. `git diff --check` passes.
+
+## Local response correlation review fix
+
+Coordinator review found that the original registry checked the pending handle but did not bind the result itself: a result accepted under `p1` could be supplied again with a fresh `p2` handle. The adapter now stamps each normalized result at dispatch with the local request ID, capture ID, and SHA-256 of its snapshotted payload. Registry acceptance validates and compares all three fields to the outstanding request. The binding is kept outside the provider body, and provider-supplied binding fields are ignored.
+
+New regression checks exercise actual adapter code with mocked HTTP: `p1` dispatch/accept followed by rejection of its old result under `p2`; a foreign response with the same capture/options but different task; missing or changed metadata; and successful acceptance after a fresh dispatch. The payload fingerprint also rejects the foreign-task result when its request ID is accidentally reassigned. This protects local correlation, not cryptographic authenticity, deliberate caller tampering, screen freshness, or grounding.
+
+The provider payload serialized by the current code is byte-for-byte equal to the preserved pre-fix offline preview (SHA-256 `fde7e5d544ec712c4aa63a37cca66cfc9fea49f925d281c2ff6a7df2e9a5bd41`). No additional AWS retrieval or live request was made for this fix. The original live artifact remains unchanged (file SHA-256 `7cdf3540fd24a18671501c83eac2e7739b4d7c27cdb7c80b580dd8a1d712f31b`); it records the earlier synchronous run and does not contain the new local binding metadata. Current acceptance rejects such an unbound historical result.
 
 ## Live verification
 
@@ -48,7 +56,7 @@ The full validated Choice distribution is preserved:
 | `reobserve` | 0.03 |
 | `no_target` | 0.35 |
 
-The distribution sums to one and the selected ID is its maximum. Local request `4a23149f-3edb-4dda-ba64-a9cd75fe39e7` resolves only to the outstanding archived capture. Sanitized response evidence is ignored at `.ctrl/jev/live.json`. No raw HTTP body or authorization header is retained.
+The distribution sums to one and the selected ID is its maximum. The original synchronous CLI run associated local request `4a23149f-3edb-4dda-ba64-a9cd75fe39e7` with the archived capture. Sanitized response evidence is ignored at `.ctrl/jev/live.json`; the later correlation fix is documented above. No raw HTTP body or authorization header is retained.
 
 The dated model is now verified as the returned canonical ID. Direct requests using that dated ID have not been tested; the documented request alias plus exact response-model check is the implemented pin. A different resolved model/provider is rejected; no fallback service/model exists. One request's duration is not a performance benchmark, and this test does not calibrate confidence or action thresholds.
 

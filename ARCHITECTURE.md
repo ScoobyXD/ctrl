@@ -1,6 +1,6 @@
 # Windows visual assistant architecture
 
-Decision record · 19 September 2026 · Fresh project baseline; CUA capture and CPU detector dependency stages verified; application loop not yet implemented.
+Decision record · 19 September 2026 · CUA capture, CPU detector, and decision-only JEV dependency stages verified; application loop not yet implemented.
 
 ## What we are building
 
@@ -8,7 +8,7 @@ We are starting a fresh Windows-only application. It will look at a selected app
 
 The local application supplies the eyes and hands. JEV supplies a structured judgment over choices that our code has already defined. Our ordinary application code connects those parts, tracks the selected window, and decides whether an action can proceed. Drawing the detected boxes and displaying probabilities are interface work; they do not require another AI model.
 
-The working codebase has been cleared for a fresh implementation. Previous application code, dependencies, build configuration, and research were moved into a recovery backup outside this project. Existing browser code, interface code, agent loops, and adapters are **not assumed reused**. The repository's Git history and configured remote are preserved. This document defines the new application; its integration and performance have not been validated.
+The working codebase was cleared for a fresh implementation. Previous application code, dependencies, build configuration, and research were moved into a recovery backup outside this project. Existing browser code, interface code, agent loops, and adapters are **not assumed reused**. The repository's Git history and configured remote are preserved. Capture, CPU detection, and the JEV decision adapter now have focused verification; the full application integration and performance remain unvalidated.
 
 The initial experience is a selected-window screenshot with numbered boxes, recognized labels, and a JEV decision preview. A transparent desktop overlay, voice interaction, and a general-purpose planning model are not prerequisites.
 
@@ -43,7 +43,7 @@ Selected Windows window
 
 **OCR is a separate local component whose backend is not selected.** It returns text, bounds, and recognition confidence. Candidate-building code associates text with detector boxes using containment, overlap, distance, and reading order. It removes duplicates without merging different controls that happen to share a label. Unlabeled icons remain explicitly unlabeled unless evidence supports a name; we do not require a new captioning model or the full OmniParser pipeline.
 
-**JEV is the online chooser.** English descriptions inside JSON are its input. Screenshots are interpreted locally. The previous project's OpenRouter route is a known integration option, not inherited implementation. Keep transport separate from decision semantics: OpenRouter and TypeSafe's direct API have different credentials and request envelopes. Validate the selected provider adapter before enabling actions. [OpenRouter JEV model](https://openrouter.ai/typesafe/jev-1.13), [TypeSafe primitives](https://docs.typesafe.ai/introduction).
+**JEV is the online chooser.** The implemented decision-only adapter uses OpenRouter's `/api/alpha/decisions`, requesting `typesafe/jev-1.13` with TypeSafe as the only provider and fallbacks disabled. A live Choice/two-Noul fixture request returned `typesafe/jev-1.13-20260917` from `TypeSafe`; the adapter requires that exact resolved model/provider. The existing AWS Secrets Manager credential is retrieved into process memory separately from the decision adapter. English task and candidate descriptions are its input; screenshots and geometry stay local. The verified fixture uses manually annotated labels on archived detector boxes, because OCR is absent. Local dispatch IDs and a payload fingerprint bind results to the originating request/capture, without proving screen freshness or grounding. No input actions run. [Setup and contracts](docs/JEV.md), [measured verification](docs/JEV_VERIFICATION.md), [OpenRouter JEV model](https://openrouter.ai/typesafe/jev-1.13), [TypeSafe primitives](https://docs.typesafe.ai/introduction).
 
 ## Internal contracts
 
@@ -99,10 +99,10 @@ After input, obtain a fresh observation. Record delivery separately from semanti
 
 Screenshots, crops, detector tensors, OCR processing, coordinate maps, and input execution stay local in this design. JEV receives task text, selected labels/descriptions, relevant textual state, and limited action history. These descriptions can still contain sensitive screen content. The request preview should show what will leave the PC. Keep credentials out of logs and source; choose diagnostic retention explicitly. Verify the selected CUA release's telemetry configuration rather than assuming every dependency is network-silent.
 
-1. **Read-only capture:** select one window and show its screenshot; validate identity, capture, resizing, and coordinates.
-2. **Local perception:** evaluate named UI-trained weights and an OCR backend; show boxes/labels; establish CPU correctness and timings before acceleration.
-3. **JEV preview:** display the outgoing descriptions, choices, distributions, and Noul judgments without input.
-4. **Single action:** enable one validated action followed by fresh observation and explicit effect assessment.
-5. **Bounded loop:** add step/time/retry limits, stop behavior, stale-target handling, and repeated-no-progress detection.
+1. **Read-only capture — fixture verified:** exact-window CUA capture and identity evidence are available. General window-selection UI and action-coordinate transforms remain unfinished.
+2. **Local perception — CPU detector verified:** pinned UI-trained YOLO11m produces original-image boxes with CPU correctness/timing evidence. OCR, readable labels, text-to-box association, and acceleration remain unverified.
+3. **JEV preview — decision-only route verified:** the CLI shows outgoing English descriptions, full Choice distributions, and two Noul judgments over manually labeled archived fixture candidates. Runtime AWS authentication, OpenRouter/TypeSafe routing, and response validation passed; no input ran. See [setup](docs/JEV.md) and [verification](docs/JEV_VERIFICATION.md).
+4. **Single action — future work:** enable one validated action followed by fresh observation and explicit effect assessment, after grounding, coordinate transforms, and target rechecks are established.
+5. **Bounded loop — future work:** add step/time/retry limits, stop behavior, stale-target handling, and repeated-no-progress detection.
 
-The local perception implementation uses Python with Windows ML's documented projection and an isolated exporter environment. The full controller and UI framework remain to be implemented. Model, Python runtime packages and CUA versions are pinned; installed Windows App Runtime and hardware-driver versions are recorded. Future provider/OCR/JEV choices still need validation. This architecture commits to component responsibilities and data flow, not unmeasured performance or a completed assistant loop.
+The local perception implementation uses Python with Windows ML's documented projection and an isolated exporter environment. The full controller and UI framework remain to be implemented. Detector, Python runtime packages and CUA versions are pinned; installed Windows App Runtime and hardware-driver versions are recorded. The OpenRouter/JEV decision route is implemented and verified with an exact resolved-model check. OCR, real-screen candidate grounding, action thresholds, target rechecks, and input/effect verification still need implementation and evaluation. This architecture commits to component responsibilities and data flow, not unmeasured performance or a completed assistant loop.
