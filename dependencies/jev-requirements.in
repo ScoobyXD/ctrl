@@ -1,0 +1,2 @@
+# AWS Secrets Manager credential retrieval only. JEV transport uses Python's standard library.
+boto3==1.43.98

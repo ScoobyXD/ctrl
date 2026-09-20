@@ -28,4 +28,11 @@ pwsh -NoProfile -File ./scripts/install-local-perception.ps1 -Python '<path to u
 pwsh -NoProfile -File ./scripts/test-local-perception.ps1
 ```
 
-Models and environments stay under ignored `.runtime/`; capture/detection evidence stays under ignored `.ctrl/`. This is a read-only fixture-to-boxes baseline. OCR, JEV, input delivery, and the full application loop are not implemented. The selected detector weights are **AGPL-3.0**, separately from this repository's MIT license.
+The third dependency stage adds a **JEV decision-only preview through OpenRouter**, using the existing AWS Secrets Manager credential at runtime. See [JEV setup and preview](docs/JEV.md) and [verification](docs/JEV_VERIFICATION.md). The default preview is offline; `--live` makes one decision request with Choice and two Noul questions. Neither mode executes input.
+
+```powershell
+pwsh -NoProfile -File ./scripts/install-jev.ps1 -Python '<path to unpackaged Python 3.12.13 x64/python.exe>'
+& ./.runtime/jev-venv/Scripts/python.exe ./scripts/jev-preview.py
+```
+
+Models and environments stay under ignored `.runtime/`; capture/detection and optional decision evidence stays under ignored `.ctrl/`. The JEV fixture uses manual labels on archived detector boxes. OCR, input delivery, and the full application loop are not implemented. The selected detector weights are **AGPL-3.0**, separately from this repository's MIT license.

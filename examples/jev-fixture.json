@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "mode": "archived_fixture_preview",
+  "task": "Choose Save settings to save the current project settings.",
+  "observed_state": "An archived Project settings fixture shows three offered buttons: Save settings, Reset defaults and Cancel. Status says Ready for read-only observation. There is no confirmation that settings have been saved. This is a decision test and no button will actually be clicked. Three manually annotated candidates are a curated subset of the detections, not a complete UI inventory.",
+  "observation": {
+    "capture_id": "b85fcb8f-80c0-422b-915d-f4af55cf1310",
+    "acquired_at_utc": "2026-09-20T00:59:24.0743418Z",
+    "target": {"pid": 32488, "window_id": 1377364},
+    "image_width": 922,
+    "image_height": 625,
+    "image_sha256": "e0aac6c2425bfb92d1909e2651d2c76e34cbfeef970837312acfac2c0624ec57",
+    "coordinate_space": "original_screenshot_pixels",
+    "action_transform_verified": false
+  },
+  "candidates": [
+    {
+      "id": "b85fcb8f-80c0-422b-915d-f4af55cf1310:d3",
+      "label": "Save settings",
+      "label_source": "manual_fixture_annotation",
+      "description": "Click the visible Save settings button at the bottom left of the fixture to save the current settings.",
+      "operation": "click",
+      "box_xyxy": [193.31083364486693, 537.4304583549499, 400.67422380447385, 585.2623913764953],
+      "detector_confidence": 0.8993717432022095,
+      "detector_model": "microsoft-omniparser-v2-icon-detect@6600256cb0f1b07651e3bc86166196307bad7e2d; onnx-sha256:8b3c5b7ae2d86ed543937d9e3b63bf23498dfafe0dee0ef5bdea3e3945d91611"
+    },
+    {
+      "id": "b85fcb8f-80c0-422b-915d-f4af55cf1310:d6",
+      "label": "Reset defaults",
+      "label_source": "manual_fixture_annotation",
+      "description": "Click the visible Reset defaults button at the bottom middle to restore default settings.",
+      "operation": "click",
+      "box_xyxy": [423.8184834480286, 537.127851486206, 629.2236998558044, 585.1570087432862],
+      "detector_confidence": 0.8567633628845215,
+      "detector_model": "microsoft-omniparser-v2-icon-detect@6600256cb0f1b07651e3bc86166196307bad7e2d; onnx-sha256:8b3c5b7ae2d86ed543937d9e3b63bf23498dfafe0dee0ef5bdea3e3945d91611"
+    },
+    {
+      "id": "b85fcb8f-80c0-422b-915d-f4af55cf1310:d8",
+      "label": "Cancel",
+      "label_source": "manual_fixture_annotation",
+      "description": "Click the visible Cancel button at the bottom right to cancel instead of saving settings.",
+      "operation": "click",
+      "box_xyxy": [665.6192211151123, 537.2526663780212, 871.0197772979736, 584.9020592689515],
+      "detector_confidence": 0.6980271935462952,
+      "detector_model": "microsoft-omniparser-v2-icon-detect@6600256cb0f1b07651e3bc86166196307bad7e2d; onnx-sha256:8b3c5b7ae2d86ed543937d9e3b63bf23498dfafe0dee0ef5bdea3e3945d91611"
+    }
+  ]
+}
