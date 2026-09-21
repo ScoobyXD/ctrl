@@ -2,7 +2,7 @@
 
 ## Separate UIA control-options viewer
 
-The UIA control-options viewer is available through **separate** launchers. Choose an application window, click **Observe / Refresh**, and search its native accessible controls and supported operation candidates. Observation and row selection run locally. The optional **Jev selection** preview recommends an action without executing it. The separate **CUA execution** tab starts a bounded observe → Jev select → validate → native input → fresh observation loop, with Stop and concrete action receipts. Remote requests start only when you explicitly start a preview or execution run.
+The UIA control-options viewer is available through **separate** launchers. Choose an application window, click **Observe / Refresh**, and search its native accessible controls and supported operation candidates. Observation and row selection run locally. The optional **Jev selection** preview recommends an action without executing it. On **CUA execution**, enter a goal and start execution: Jev first selects a relevant window from a fresh window inventory, independently of the manual picker. The bounded loop then observes its controls → selects an action → validates → delivers native input → observes again, with Stop and concrete action receipts. Remote requests start only when you explicitly start a preview or execution run.
 
 ```powershell
 pwsh -NoProfile -File ./scripts/install-uia-viewer.ps1 -Python '<CPython 3.12.13 x64 base/python.exe>'

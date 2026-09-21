@@ -3,11 +3,14 @@ from copy import deepcopy
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from ctrl_loop.execution import (ExecutionError, ExecutionLoop, NeedsArguments, StaleTarget,
                                  bind_arguments, revalidate_selection, validate_request)
+from ctrl_loop import jev
 from ctrl_loop.uia_contract import build_options, new_snapshot
+from ctrl_loop.window_selection import WindowSelectionSearch
 
 
 def observation(name="X tab", *, pattern="SelectionItem", state=None, runtime=None, value=None):
@@ -42,6 +45,223 @@ class Executor:
     def execute(self, *args, **kwargs):
         self.calls.append((args, kwargs))
         return self.receipt
+
+
+class WindowDecider:
+    """Offline Jev response using the actual question and request binding."""
+
+    def __init__(self, choose):
+        self.choose = choose
+        self.calls = []
+
+    def __call__(self, payload, *, request_id, capture_id):
+        self.calls.append(deepcopy(payload))
+        criteria = payload["questions"]["window"]["criteria"]
+        choice = self.choose(payload)
+        probabilities = {key: (.8 if key == choice else .2 / (len(criteria) - 1))
+                         for key in criteria}
+        return {"model": jev.RESOLVED_MODEL, "provider": jev.PROVIDER,
+                "provider_request_id": "gen-offline-window", "latency_ms": 1.0,
+                "usage": {"input_tokens": 20, "output_tokens": 5, "cost": 0},
+                "answers": {"window": {"type": "choice", "choice": choice,
+                                       "confidence": probabilities[choice],
+                                       "probabilities": probabilities}},
+                "local_request": jev.request_binding(payload, request_id=request_id,
+                                                     capture_id=capture_id)}
+
+
+class AutomaticWindowTests(unittest.TestCase):
+    editor = {"hwnd": 303, "pid": 404, "title": "Commands.txt - Notepad++"}
+    browser = {"hwnd": 101, "pid": 202, "title": "X - Google Chrome"}
+
+    def setUp(self):
+        network = patch.object(jev, "build_opener", side_effect=AssertionError("offline test attempted network"))
+        network.start()
+        self.addCleanup(network.stop)
+
+    def run_auto(self, *, inventory=None, choose=None, alter_selection=None, cancelled=None,
+                 clock=None, selector_cancelled=None, observation_target=None):
+        trace = {"inventories": [], "window_selections": [], "observed_targets": [],
+                 "control_selections": [], "events": []}
+        decider = WindowDecider(choose or (lambda payload: "window_1"))
+        executor = Executor()
+        raw = {"windows": [deepcopy(self.editor), deepcopy(self.browser)]}
+
+        def list_windows():
+            trace["inventories"].append(True)
+            return deepcopy(inventory(len(trace["inventories"])) if inventory else raw)
+
+        def select_window(inventory, goal):
+            trace["window_selections"].append((deepcopy(inventory), goal))
+            result = WindowSelectionSearch(inventory, goal).run(decider, cancelled=selector_cancelled)
+            if alter_selection:
+                alter_selection(result, inventory)
+            return result
+
+        def observe(target):
+            trace["observed_targets"].append(deepcopy(target))
+            snapshot = observation("Notifications" if len(trace["observed_targets"]) == 3 else "X tab")
+            snapshot["target"] = deepcopy(observation_target or self.browser)
+            return snapshot
+
+        def select_control(snapshot, goal, history):
+            trace["control_selections"].append((deepcopy(snapshot), goal, deepcopy(history)))
+            return selector(snapshot, goal, history)
+
+        kwargs = {"window_inventory": list_windows, "window_selector": select_window,
+                  "cancelled": cancelled,
+                  "emit": lambda event, data: trace["events"].append((event, deepcopy(data)))}
+        if clock is not None:
+            kwargs["clock"] = clock
+        loop = ExecutionLoop(observe, select_control, executor, **kwargs)
+        req = request(max_steps=1)
+        del req["target"]
+        result = loop.run(req)
+        trace["model_calls"] = decider.calls
+        return result, executor, trace
+
+    def assert_no_control_or_input(self, result, executor, trace):
+        self.assertEqual(trace["observed_targets"], [])
+        self.assertEqual(trace["control_selections"], [])
+        self.assertEqual(executor.calls, [])
+        self.assertEqual(result["input_actions"], 0)
+        self.assertEqual(result["attempted_actions"], 0)
+        self.assertFalse(result["goal_completed"])
+
+    def test_goal_chooses_browser_over_first_editor_and_propagates_target(self):
+        result, executor, trace = self.run_auto()
+        self.assertEqual(result["status"], "limit_reached")
+        self.assertEqual(result["input_actions"], 1)
+        self.assertEqual(result["target"], self.browser)
+        self.assertEqual(result["window_selection"]["selected_window"], self.browser)
+        self.assertEqual(len(trace["inventories"]), 2)
+        self.assertEqual(len(trace["model_calls"]), 1)
+        self.assertEqual(trace["window_selections"][0][0]["windows"], [self.editor, self.browser])
+        self.assertEqual(trace["model_calls"][0]["state"]["goal"], "Open X bookmarks")
+        self.assertEqual(trace["observed_targets"], [self.browser] * 3)
+        self.assertEqual(trace["control_selections"][0][0]["target"], self.browser)
+        self.assertEqual(trace["control_selections"][0][1:], ("Open X bookmarks", []))
+        self.assertEqual(executor.calls[0][0][0], self.browser)
+        self.assertEqual(executor.calls[0][0][2], "select")
+        events = [event for event, _ in trace["events"]]
+        self.assertLess(events.index("window_inventory"), events.index("window_selection"))
+        self.assertLess(events.index("window_selection"), events.index("observation"))
+
+    def test_no_match_and_ambiguous_windows_stop_before_observation(self):
+        for choice, expected in (("__none__", "no_window"), ("__ambiguous__", "ambiguous_window")):
+            with self.subTest(choice=choice):
+                result, executor, trace = self.run_auto(choose=lambda payload: choice)
+                self.assertEqual(result["status"], expected)
+                self.assertEqual(len(trace["inventories"]), 1)
+                self.assertEqual(len(trace["model_calls"]), 1)
+                self.assert_no_control_or_input(result, executor, trace)
+
+    def test_selected_window_disappearance_identity_or_title_change_stops(self):
+        changed_windows = [[], [self.editor],
+                           [self.editor, {**self.browser, "pid": 999}],
+                           [self.editor, {**self.browser, "hwnd": 999}],
+                           [self.editor, {**self.browser, "title": "Other page - Google Chrome"}]]
+        for windows in changed_windows:
+            with self.subTest(windows=windows):
+                result, executor, trace = self.run_auto(
+                    inventory=lambda count: {"windows": [self.editor, self.browser] if count == 1 else windows})
+                self.assertEqual(result["status"], "stale_target")
+                self.assertEqual(len(trace["inventories"]), 2)
+                self.assert_no_control_or_input(result, executor, trace)
+
+    def test_inventory_reordering_preserves_selected_native_identity(self):
+        result, executor, trace = self.run_auto(inventory=lambda count: {
+            "windows": [self.editor, self.browser] if count == 1 else [self.browser, self.editor]})
+        self.assertEqual(result["input_actions"], 1)
+        self.assertEqual(trace["observed_targets"], [self.browser] * 3)
+        self.assertEqual(executor.calls[0][0][0], self.browser)
+
+    def test_initial_observation_cannot_switch_to_another_native_identity(self):
+        for field, value in (("pid", 999), ("hwnd", 999), ("title", "Other page - Google Chrome")):
+            with self.subTest(field=field):
+                result, executor, trace = self.run_auto(observation_target={**self.browser, field: value})
+                self.assertEqual(result["status"], "stale_target")
+                self.assertEqual(len(trace["observed_targets"]), 1)
+                self.assertEqual(trace["control_selections"], [])
+                self.assertEqual(executor.calls, [])
+
+    def test_fabricated_or_unbound_window_selection_never_reaches_controls(self):
+        alterations = [
+            lambda result, inventory: result.update(inventory_id="0" * 32),
+            lambda result, inventory: result.update(goal="Another goal"),
+            lambda result, inventory: result.update(input_actions=1),
+            lambda result, inventory: result.update(request_count=2),
+            lambda result, inventory: result.update(selected_window_id="window_0"),
+            lambda result, inventory: result.update(selected_window=None),
+            lambda result, inventory: result["selected_window"].update(hwnd=999),
+            lambda result, inventory: result["selected_window"].update(pid=999),
+            lambda result, inventory: result["selected_window"].update(title="Fabricated title"),
+            lambda result, inventory: result["decision"]["local_request"].update(capture_id="0" * 32),
+        ]
+        for index, alter in enumerate(alterations):
+            with self.subTest(alteration=index):
+                result, executor, trace = self.run_auto(alter_selection=alter)
+                self.assertEqual(result["status"], "failed")
+                self.assert_no_control_or_input(result, executor, trace)
+
+    def test_selector_cannot_mutate_inventory_to_invent_native_target(self):
+        def alter(result, inventory):
+            inventory["windows"][1]["hwnd"] = 999
+            result["selected_window"]["hwnd"] = 999
+        result, executor, trace = self.run_auto(alter_selection=alter)
+        self.assertEqual(result["status"], "failed")
+        self.assert_no_control_or_input(result, executor, trace)
+
+    def test_cancellation_and_deadline_at_each_window_stage_prevent_controls(self):
+        for stop_kind in ("cancel", "deadline"):
+            for stage in ("before_inventory", "inventory", "model", "revalidation"):
+                with self.subTest(stop_kind=stop_kind, stage=stage):
+                    stopped, now = [False], [0]
+                    def stop():
+                        if stop_kind == "cancel":
+                            stopped[0] = True
+                        else:
+                            now[0] = 61
+                    def inventory(count):
+                        if stage == "inventory" or stage == "revalidation" and count == 2:
+                            stop()
+                        return {"windows": [self.editor, self.browser]}
+                    def choose(payload):
+                        if stage == "model":
+                            stop()
+                        return "window_1"
+                    if stage == "before_inventory":
+                        if stop_kind == "cancel":
+                            stopped[0] = True
+                        else:
+                            ticks = iter((0, 61))
+                    clock = (lambda: next(ticks, 61)) if stage == "before_inventory" and stop_kind == "deadline" else (lambda: now[0])
+                    result, executor, trace = self.run_auto(
+                        inventory=inventory, choose=choose, cancelled=lambda: stopped[0], clock=clock)
+                    self.assertEqual(result["status"], "cancelled" if stop_kind == "cancel" else "limit_reached")
+                    self.assert_no_control_or_input(result, executor, trace)
+
+    def test_window_selector_cancellation_and_request_byte_budget_stop(self):
+        result, executor, trace = self.run_auto(selector_cancelled=lambda: True)
+        self.assertEqual(result["status"], "cancelled")
+        self.assertEqual(trace["model_calls"], [])
+        self.assert_no_control_or_input(result, executor, trace)
+        result, executor, trace = self.run_auto(
+            inventory=lambda count: {"windows": [{**self.browser, "title": "x" * 24000}]})
+        self.assertEqual(result["status"], "limit_reached")
+        self.assertEqual(trace["model_calls"], [])
+        self.assert_no_control_or_input(result, executor, trace)
+
+    def test_empty_and_oversized_inventory_never_defaults_to_first_window(self):
+        result, executor, trace = self.run_auto(inventory=lambda count: {"windows": []})
+        self.assertEqual(result["status"], "no_window")
+        self.assertEqual(trace["model_calls"], [])
+        self.assert_no_control_or_input(result, executor, trace)
+        windows = [{"hwnd": index + 1, "pid": 202, "title": "X - Google Chrome"} for index in range(65)]
+        result, executor, trace = self.run_auto(inventory=lambda count: {"windows": windows})
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(trace["window_selections"], [])
+        self.assert_no_control_or_input(result, executor, trace)
 
 
 class FreshnessTests(unittest.TestCase):

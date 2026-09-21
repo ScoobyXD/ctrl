@@ -15,11 +15,22 @@ ROOT = Path(__file__).resolve().parents[1]
 BOOTSTRAP = r'''
 import os, runpy, sys, time
 sys.path.insert(0, str(ROOT / "src"))
-from ctrl_loop import credentials, cua_driver, execution_runtime, selection
+from ctrl_loop import credentials, cua_driver, execution_runtime, selection, jev
 from ctrl_loop.uia_contract import new_snapshot
 
+browser = {"hwnd": 321, "pid": 654, "title": "Home / X - Google Chrome"}
+editor = {"hwnd": 111, "pid": 222, "title": "Commands.txt - Notepad++"}
+
+def windows(**kwargs):
+    if MODE == "empty": return {"windows": []}
+    return {"windows": [editor, browser]}
+
 def observe(target, **kwargs):
-    return new_snapshot(target["hwnd"], target["pid"])
+    if MODE.startswith("auto"):
+        assert target == browser
+    snapshot = new_snapshot(target["hwnd"], target["pid"])
+    snapshot["target"].update(target)
+    return snapshot
 
 class Executor:
     def __init__(self, **kwargs): pass
@@ -27,6 +38,7 @@ class Executor:
     def __exit__(self, *args): pass
 
 def key():
+    if MODE == "empty": raise AssertionError("Empty inventory must not retrieve credentials")
     if MODE == "blocked_output":
         sys.stdout.write("x" * 1000000)
         sys.stdout.flush()
@@ -35,13 +47,31 @@ def key():
     return "offline-fixture-key"
 
 def run(self, *args, **kwargs):
+    if MODE in ("credentials_hang", "blocked_output"):
+        args[0]({}, request_id="blocked", capture_id="blocked")
     return {"status": "no_match", "snapshot_id": self.snapshot_id, "goal": self.goal,
             "input_actions": 0, "selected_option": None}
+
+def decide(payload, key, **ids):
+    if MODE == "auto_model_hang": time.sleep(60)
+    question_id, question = next(iter(payload["questions"].items()))
+    # Inventory order is deliberate: the unrelated editor comes first.
+    choices = [name for name in question["criteria"] if not name.startswith("__")]
+    choice = "__none__" if MODE == "auto_no_match" else choices[1]
+    if MODE == "auto_ambiguous": choice = "__ambiguous__"
+    return {"model": jev.RESOLVED_MODEL, "provider": jev.PROVIDER,
+            "provider_request_id": "gen-offline", "latency_ms": 0, "usage": {},
+            "local_request": jev.request_binding(payload, **ids),
+            "answers": {question_id: {"type": "choice", "choice": choice,
+                "probabilities": {name: float(name == choice) for name in question["criteria"]},
+                "confidence": 1}}}
 
 credentials.get_openrouter_key = key
 cua_driver.NativeCuaExecutor = Executor
 execution_runtime.observe_target = observe
+execution_runtime.observe_windows = windows
 selection.SelectionSearch.run = run
+jev.decide = decide
 sys.argv = [str(ROOT / "scripts/cua-run.py"), "--stdin"]
 runpy.run_path(sys.argv[0], run_name="__main__")
 '''
@@ -55,11 +85,12 @@ class ExecutionHelperTests(unittest.TestCase):
         self.folder.mkdir()
         wrapper = self.folder / "bootstrap.py"
         wrapper.write_text("from pathlib import Path\nROOT = Path(" + repr(str(ROOT)) + ")\nMODE = " + repr(mode) + "\n" + BOOTSTRAP)
-        self.process = subprocess.Popen([sys.executable, "-I", str(wrapper)], stdin=subprocess.PIPE,
+        self.process = subprocess.Popen([sys.executable, "-B", "-I", str(wrapper)], stdin=subprocess.PIPE,
                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         request = {"target": {"hwnd": 1, "pid": 2}, "goal": "Synthetic test", "run_id": "pipe-test",
                    "max_steps": 1, "max_seconds": seconds}
         request.update(updates)
+        if mode.startswith("auto") or mode == "empty": request.pop("target")
         self.process.stdin.write((json.dumps(request) + "\n").encode())
         self.process.stdin.flush()
         return self.process
@@ -118,6 +149,59 @@ class ExecutionHelperTests(unittest.TestCase):
         # Deliberately leave stdout undrained: terminal emission cannot be a
         # prerequisite for killing a helper that exceeded the execution limit.
         self.assertEqual(process.wait(timeout=9), 2)
+
+    def test_automatic_helper_chooses_browser_before_control_selection(self):
+        process = self.start_helper("auto")
+        output, errors = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 0, errors)
+        events = [json.loads(line) for line in output.splitlines()]
+        choice = next(e for e in events if e["event"] == "window_selection")
+        self.assertEqual(choice["data"]["selection"]["selected_window"]["hwnd"], 321)
+        observations = [e for e in events if e["event"] == "observation"]
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0]["data"]["snapshot"]["target"]["hwnd"], 321)
+        self.assertEqual(events[-1]["data"]["target"]["hwnd"], 321)
+        self.assertEqual(events[-1]["data"]["input_actions"], 0)
+
+    def test_automatic_empty_inventory_needs_no_credentials_or_observation(self):
+        process = self.start_helper("empty")
+        output, errors = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 0, errors)
+        events = [json.loads(line) for line in output.splitlines()]
+        self.assertEqual(events[-1]["data"]["status"], "no_window")
+        self.assertFalse(any(e["event"] == "observation" for e in events))
+        self.assertFalse(any(e["data"].get("stage") == "credentials" for e in events))
+
+    def test_automatic_no_match_never_inspects_controls(self):
+        process = self.start_helper("auto_no_match")
+        output, errors = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 0, errors)
+        events = [json.loads(line) for line in output.splitlines()]
+        self.assertEqual(events[-1]["data"]["status"], "no_window")
+        self.assertFalse(any(e["event"] == "observation" for e in events))
+
+    def test_automatic_ambiguity_never_inspects_controls(self):
+        process = self.start_helper("auto_ambiguous")
+        output, errors = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 0, errors)
+        events = [json.loads(line) for line in output.splitlines()]
+        self.assertEqual(events[-1]["data"]["status"], "ambiguous_window")
+        self.assertFalse(any(e["event"] == "observation" for e in events))
+
+    def test_cancel_while_window_model_is_blocked_exits_without_observation(self):
+        process = self.start_helper("auto_model_hang")
+        for _ in range(8):
+            event = json.loads(process.stdout.readline())
+            if event["event"] == "progress" and event["data"].get("stage") == "credentials":
+                break
+        else:
+            self.fail("Window decision boundary was not reached")
+        process.stdin.write(b'{"cancel":true,"run_id":"pipe-test"}\n')
+        process.stdin.flush()
+        output, _ = process.communicate(timeout=4)
+        events = [json.loads(line) for line in output.splitlines()]
+        self.assertEqual(events[-1]["data"]["status"], "cancelled")
+        self.assertFalse(any(e["event"] == "observation" for e in events))
 
 
 if __name__ == "__main__":

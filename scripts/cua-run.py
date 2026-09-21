@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from ctrl_loop.execution import ExecutionError, ExecutionLoop, validate_request
-from ctrl_loop.execution_runtime import observe_target
+from ctrl_loop.execution_runtime import observe_target, observe_windows
 
 
 def parse_json(raw):
@@ -118,39 +118,66 @@ def main():
         from ctrl_loop.credentials import CredentialError, get_openrouter_key
         from ctrl_loop.jev import DecisionError, RESPONSE_VALIDATION_CODES, decide
         from ctrl_loop.selection import SelectionError, SelectionSearch
+        from ctrl_loop.window_selection import WindowSelectionSearch
 
         threading.Thread(target=read_cancel, daemon=True).start()
         timer = threading.Timer(request["max_seconds"] + 1, lambda: hard_stop("limit_reached"))
         timer.daemon = True
         timer.start()
         key = None
+        key_lock = threading.Lock()
 
-        def select(snapshot, goal, history):
+        def get_key_for_run():
             nonlocal key
-            try:
-                search = SelectionSearch(snapshot, goal, history=history)
+            with key_lock:
+                if loop.should_stop():
+                    raise InterruptedError
                 if key is None:
-                    if loop.should_stop():
-                        raise InterruptedError
                     emit("progress", {"stage": "credentials", "status": "Reading the existing OpenRouter key from AWS Secrets Manager."})
                     key = get_openrouter_key()
-                return search.run(lambda payload, **ids: decide(payload, key, **ids),
-                                  cancelled=loop.should_stop,
+
+        def decide_for_run(payload, **ids):
+            try:
+                get_key_for_run()
+                if loop.should_stop():
+                    raise InterruptedError
+                return decide(payload, key, **ids)
+            except CredentialError as error:
+                raise DecisionError("authentication", str(error)) from None
+
+        def decision_failure(error, stage):
+            code = getattr(error, "validation_code", None)
+            detail = (" [" + code + "]" if type(code) is str and code in RESPONSE_VALIDATION_CODES else "")
+            raise ExecutionError("Jev " + stage + " failed (" + error.category + ")" + detail
+                                 + ". No action was dispatched for this selection.") from None
+
+        def select(snapshot, goal, history):
+            try:
+                search = SelectionSearch(snapshot, goal, history=history)
+                # Preserve the control selector's credential boundary outside
+                # its worker pool, including for explicit-target CLI callers.
+                get_key_for_run()
+                return search.run(decide_for_run, cancelled=loop.should_stop,
                                   on_progress=lambda data: emit("progress", data))
             except CredentialError as error:
                 raise ExecutionError(str(error)) from None
             except DecisionError as error:
-                code = getattr(error, "validation_code", None)
-                detail = (" [" + code + "]" if type(code) is str and code in RESPONSE_VALIDATION_CODES else "")
-                raise ExecutionError("Jev selection failed (" + error.category + ")" + detail
-                                     + ". No action was dispatched for this selection.") from None
+                decision_failure(error, "control selection")
             except SelectionError:
                 raise ExecutionError("Jev selection rejected the current snapshot or request bounds.") from None
+
+        def select_window(inventory, goal):
+            try:
+                return WindowSelectionSearch(inventory, goal).run(decide_for_run, cancelled=loop.should_stop)
+            except DecisionError as error:
+                decision_failure(error, "window selection")
 
         with NativeCuaExecutor(root=ROOT) as executor:
             loop = ExecutionLoop(
                 lambda target: observe_target(target, max_elements=request["max_elements"], cancelled=loop.should_stop),
-                select, executor, emit=emit, cancelled=cancel.is_set)
+                select, executor, emit=emit, cancelled=cancel.is_set,
+                window_inventory=lambda: observe_windows(cancelled=loop.should_stop),
+                window_selector=select_window)
             result = loop.run(request)
         key = None
         return 1 if result["status"] in ("failed", "stale_target") else 0

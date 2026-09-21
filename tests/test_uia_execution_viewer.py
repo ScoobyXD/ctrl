@@ -45,7 +45,7 @@ import json, sys, time
 assert sys.argv[1:] == ["--stdin"]
 request = json.loads(sys.stdin.buffer.readline().decode("utf-8"))
 assert "snapshot" not in request
-assert request["target"] == {"hwnd": 111, "pid": 222}
+assert "target" not in request
 def emit(kind, data):
     event = {"event": kind, "run_id": request["run_id"], "data": data}
     if mode == "wrong_run": event["run_id"] = "old-run"
@@ -66,7 +66,29 @@ if mode == "polite_cancel":
     cancel = json.loads(sys.stdin.buffer.readline().decode("utf-8"))
     assert cancel == {"cancel": True, "run_id": request["run_id"]}
     result("cancelled", 0); sys.exit(0)
+if mode == "browser":
+    snapshot["target"] = {"hwnd": 333, "pid": 444, "title": "X / Home - Browser"}
+inventory = {"inventory_id": "windows-fresh", "windows": [dict(snapshot["target"])]}
+emit("window_inventory", {"inventory": inventory})
+choice = {"inventory_id": inventory["inventory_id"], "goal": request["goal"], "input_actions": 0,
+          "status": "selected", "selected_window": dict(snapshot["target"])}
+if mode in {"no_match", "ambiguous", "cancelled", "budget_exhausted"}:
+    choice.update(status=mode, selected_window=None, reason="No current window was selected.")
+if mode == "wrong_inventory": choice["inventory_id"] = "stale-inventory"
+if mode == "invented_window": choice["selected_window"]["hwnd"] = 999
+if mode == "wrong_selection_goal": choice["goal"] = "Another goal"
+if mode != "missing_window_selection": emit("window_selection", {"selection": choice})
+if mode in {"no_match", "ambiguous", "cancelled", "budget_exhausted"}:
+    result({"no_match": "no_window", "ambiguous": "ambiguous_window", "cancelled": "cancelled",
+            "budget_exhausted": "limit_reached"}[mode], 0); sys.exit(0)
+if mode == "window_choice_only": sys.exit(2)
+if mode == "wrong_observation_pid": snapshot["target"]["pid"] += 1
+if mode == "wrong_observation_hwnd": snapshot["target"]["hwnd"] += 1
 observe(0)
+if mode == "observe_then_cancel":
+    cancel = json.loads(sys.stdin.buffer.readline().decode("utf-8"))
+    assert cancel == {"cancel": True, "run_id": request["run_id"]}
+    result("cancelled", 0); sys.exit(0)
 for step in range(1, 3):
     emit("selection", {"step": step, "selection": {
         "snapshot_id": snapshot["snapshot_id"], "goal": request["goal"], "status": "selected",
@@ -113,8 +135,65 @@ if mode == "result_then_hang": time.sleep(60)
         self.assertTrue(self.window.export_execution_json(path=output))
         saved = json.loads(output.read_text(encoding="utf-8"))
         self.assertEqual(saved["request"]["goal"], "Save the café draft <once>")
+        self.assertNotIn("target", saved["request"])
         self.assertEqual(saved["request"]["arguments"]["bindings"][0]["value"], "café")
         self.assertEqual(saved["events"][-1]["event"], "result")
+
+    def test_empty_manual_picker_can_start_automatic_execution(self):
+        self.window.target_combo.clear()
+        self.assertIsNone(self.window.snapshot)
+        self.assertTrue(self.window.execution_button.isEnabled())
+        self.finish()
+        self.assertEqual(self.window.execution_result["input_actions"], 2)
+        self.assertEqual(self.window.snapshot["target"], fixture_snapshot()["target"])
+
+    def test_browser_selection_ignores_initial_editor_and_exports_choice(self):
+        self.window.target_combo.setItemData(0, {"hwnd": 111, "pid": 222, "title": "Commands.txt - Notepad++"})
+        self.window.execution_goal.setPlainText("On X open my history tab, then my notifications tab")
+        self.write_helper("browser")
+        self.finish()
+        self.assertEqual(self.window.target_combo.currentData()["hwnd"], 111)
+        self.assertEqual(self.window.snapshot["target"]["hwnd"], 333)
+        self.assertIn("X / Home - Browser", self.window.execution_target_label.text())
+        self.assertIn("X / Home - Browser", self.window.summary.text())
+        self.assertIn("Jev window choice (prediction)", self.window.execution_trace.toPlainText())
+        self.assertIn("Input actions: 0", self.window.execution_trace.toPlainText())
+        output = self.folder / "browser-execution.json"
+        self.assertTrue(self.window.export_execution_json(path=output))
+        saved = json.loads(output.read_text(encoding="utf-8"))
+        choice = next(event["data"]["selection"] for event in saved["events"] if event["event"] == "window_selection")
+        self.assertEqual(choice["selected_window"], self.window.snapshot["target"])
+        self.assertTrue(any(event["event"] == "window_inventory" for event in saved["events"]))
+        self.assertNotIn("target", saved["request"])
+
+    def test_window_choice_alone_is_not_delivered_input(self):
+        self.write_helper("window_choice_only")
+        self.finish()
+        self.assertEqual(self.window.execution_result["input_actions"], 0)
+        self.assertIsNone(self.window.snapshot)
+        self.assertIn("Jev window choice (prediction)", self.window.execution_trace.toPlainText())
+
+    def test_no_window_outcomes_show_and_export_without_observation(self):
+        for mode, status in (("no_match", "no_window"), ("ambiguous", "ambiguous_window"),
+                             ("cancelled", "cancelled"), ("budget_exhausted", "limit_reached")):
+            with self.subTest(mode=mode):
+                self.write_helper(mode)
+                self.finish()
+                self.assertEqual(self.window.execution_result["status"], status)
+                self.assertEqual(self.window.execution_result["input_actions"], 0)
+                self.assertIsNone(self.window.snapshot)
+                self.assertIn("Execution window: none", self.window.execution_target_label.text())
+                self.assertFalse(any(event["event"] == "observation" for event in self.window.execution_events))
+                self.assertTrue(self.window.export_execution_json(path=self.folder / (mode + ".json")))
+
+    def test_window_choice_and_observation_bindings_are_validated(self):
+        for mode in ("wrong_inventory", "invented_window", "wrong_selection_goal", "missing_window_selection",
+                     "wrong_observation_pid", "wrong_observation_hwnd"):
+            with self.subTest(mode=mode):
+                self.write_helper(mode)
+                self.finish()
+                self.assertIn("invalid or stale", self.window.execution_status.text())
+                self.assertIsNone(self.window.snapshot)
 
     def test_invalid_arguments_do_not_start(self):
         for text in ("[1]", "{bad}", '{"value":NaN}', "x" * 65537):
@@ -205,15 +284,19 @@ if mode == "result_then_hang": time.sleep(60)
         self.assertEqual(self.window.execution_goal.toPlainText(), "Different goal")
         self.assertIn("Goal changed", self.window.execution_status.text())
 
-    def test_target_change_cancels_without_reusing_previous_observation(self):
-        self.write_helper("polite_cancel")
+    def test_manual_picker_change_cannot_rebind_automatic_execution(self):
+        self.write_helper("observe_then_cancel")
         self.start()
-        eventually(lambda: len(self.window.execution_events) > 0)
+        eventually(lambda: self.window.snapshot is not None)
+        self.assertFalse(self.window.target_combo.isEnabled())
         self.window.target_combo.addItem("Other target", {"hwnd": 333, "pid": 444, "title": "Other"})
         self.window.target_combo.setCurrentIndex(1)
+        self.assertIsNone(self.window._execution_abort_reason)
+        self.assertEqual(self.window.snapshot["target"], fixture_snapshot()["target"])
+        self.assertTrue(self.window._execution_is_current())
+        self.window.stop_execution()
         eventually(lambda: self.window.execution_process is None)
-        self.assertIsNone(self.window.snapshot)
-        self.assertIn("Target changed", self.window.execution_status.text())
+        self.assertEqual(self.window.execution_result["status"], "cancelled")
 
     def test_wrong_run_and_invalid_events_stop(self):
         for mode in ("wrong_run", "invalid"):

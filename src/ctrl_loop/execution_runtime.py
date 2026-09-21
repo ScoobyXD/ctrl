@@ -1,4 +1,4 @@
-"""Disposable UIA observation process used by the execution helper and smoke test."""
+"""Disposable, bounded window inventory and UIA observation processes."""
 from __future__ import annotations
 
 import json
@@ -14,7 +14,7 @@ from .execution import ExecutionError
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def observe_target(target, *, root=None, python=None, max_elements=1000, timeout=8, cancelled=None):
+def _read_ui_request(arguments, *, root=None, python=None, timeout=8, cancelled=None):
     root = Path(root) if root else ROOT
     python = str(python or root / ".runtime/uia-venv/Scripts/python.exe")
     if not Path(python).is_file():
@@ -27,9 +27,7 @@ def observe_target(target, *, root=None, python=None, max_elements=1000, timeout
     job = KillOnCloseJob()
     process = None
     try:
-        process = subprocess.Popen([python, "-I", str(root / "scripts/uia-observe.py"), "observe",
-                                    "--hwnd", str(target["hwnd"]), "--pid", str(target["pid"]),
-                                    "--max-elements", str(max_elements), "--timeout", str(timeout)],
+        process = subprocess.Popen([python, "-I", str(root / "scripts/uia-observe.py"), *arguments],
                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
         job.assign(process)
@@ -56,3 +54,15 @@ def observe_target(target, *, root=None, python=None, max_elements=1000, timeout
                 process.kill()
             process.communicate()
         job.close()
+
+
+def observe_target(target, *, root=None, python=None, max_elements=1000, timeout=8, cancelled=None):
+    return _read_ui_request(["observe", "--hwnd", str(target["hwnd"]), "--pid", str(target["pid"]),
+                             "--max-elements", str(max_elements), "--timeout", str(timeout)],
+                            root=root, python=python, timeout=timeout, cancelled=cancelled)
+
+
+def observe_windows(*, root=None, python=None, cancelled=None):
+    # Use the same disposable process, job ownership, output ceiling and cancel
+    # polling as control observation. This command never initializes a UIA tree.
+    return _read_ui_request(["windows"], root=root, python=python, timeout=6, cancelled=cancelled)

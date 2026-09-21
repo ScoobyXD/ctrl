@@ -1,6 +1,6 @@
 # UIA + Jev + native CUA execution
 
-The UIA viewer now has an explicitly started **CUA execution** workflow. It observes the selected window, asks the existing Jev selector for one action, observes again to validate that control, delivers a supported operation through pinned CUA Driver 0.28.2, and collects a new UIA observation before considering another step. Merely opening the viewer, inspecting requests, or running a selection preview sends no target input.
+The UIA viewer has an explicitly started **CUA execution** workflow. It first asks Jev to choose a relevant window for the goal from a fresh window inventory. It then observes that window, asks the existing Jev selector for one action, observes again to validate that control, delivers a supported operation through pinned CUA Driver 0.28.2, and collects a new UIA observation before considering another step. Merely opening the viewer, inspecting requests, or running a selection preview sends no target input.
 
 ## Start a run
 
@@ -13,9 +13,13 @@ pwsh -NoProfile -File ./scripts/install-cua-driver.ps1
 pwsh -NoProfile -File ./scripts/start-uia-viewer.ps1
 ```
 
-Select the target window, enter a goal, open **CUA execution**, choose the action/time bounds, and click **Start execution**. The goal is shared with the preview tab. Execution always takes its own initial observation; saved JSON and preview results cannot be executed. The selector uses the existing AWS Secrets Manager/OpenRouter setup and its existing classification/reduction budgets. Each new step has fresh candidate IDs and the recent delivery history. Explicit argument values stay local; observed non-password values may appear in later Jev selection evidence under the existing text projection.
+Enter a goal, open **CUA execution**, choose the action/time bounds, and click **Start execution**. The goal is shared with the preview tab. The manual Window picker controls observation and preview; execution chooses its own target and does not require a picker selection. For example, an X goal can select the browser even when the picker currently shows an unrelated editor. Execution always takes its own initial observation; saved JSON and preview results cannot be executed. The selector uses the existing AWS Secrets Manager/OpenRouter setup and its existing classification/reduction budgets. Each new step has fresh candidate IDs and the recent delivery history. Explicit argument values stay local; observed non-password values may appear in later Jev selection evidence under the existing text projection.
 
-**Stop execution** requests cancellation, then terminates an unresponsive helper. Changing the target/goal or closing the viewer also stops it. Windows job objects contain observer and driver child lifetimes. Cancellation cannot undo an input already dispatched: review the action receipt and target before starting again. Each run is bounded to 1–20 actions and 5–1200 seconds; provider requests already sent may still complete remotely. One action is in flight at a time.
+Window selection makes at most one structured model request against at most 64 current visible, titled top-level windows, under a 24,000-byte budget for the complete request. It sends the goal, observed titles and temporary candidate IDs; native HWND/PID identities stay local. It does not silently truncate the window list or choose the first alphabetical entry. The existing native reader caps each observed title at 512 characters. The model can select an observed candidate, report no match, or report ambiguity. No match stops with `no_window`; ambiguity stops with `ambiguous_window`; budget exhaustion stops before control selection or input. Window titles are untrusted evidence, never instructions. A title-only inventory cannot establish the contents of inactive browser tabs or distinguish windows whose titles provide insufficient context; clarify the goal or make the relevant page identifiable before starting another run.
+
+The returned candidate must belong to the current inventory and goal. Before reading any controls, the helper lists windows again and requires the selected HWND, PID and title to still match; the initial UIA observation checks the title again. Disappearance, identity reuse or a changed title stops with `stale_target`. Later titles may change as navigation proceeds. It does not switch to another window or retry selection automatically. This stage shares the run's cancellation and time bounds; the existing control freshness and native input checks still apply afterward.
+
+**Stop execution** requests cancellation, then terminates an unresponsive helper. Changing the goal or closing the viewer also stops it. The manual window picker is disabled during execution; programmatic picker changes neither cancel nor rebind the run. Windows job objects contain observer and driver child lifetimes. Cancellation cannot undo an input already dispatched: review the action receipt and target before starting again. Each run is bounded to 1–20 actions and 5–1200 seconds; provider requests already sent may still complete remotely. One action is in flight at a time.
 
 The action log and result JSON distinguish delivery, failure, uncertainty and observed changes. `input_actions` counts positive native delivery receipts; `attempted_actions` also includes uncertain dispatches. Neither a Jev probability, a positive receipt, nor a changed UIA tree proves the user's goal is complete. `goal_completed` remains false. No-match, no-progress, repeated state/action, argument requirements, target changes, failures and limits stop the loop. Unknown deliveries are never automatically retried.
 
@@ -64,7 +68,6 @@ The same helper is runnable directly; starting it is an explicit live execution 
 
 ```powershell
 $request = @{
-  target = @{ hwnd = 12345; pid = 6789 }
   goal = 'Select the existing X tab, then open Bookmarks'
   run_id = 'manual-run-1'
   max_steps = 2
@@ -75,12 +78,15 @@ $request = @{
 $request | ConvertTo-Json -Compress -Depth 8 | & ./.runtime/jev-venv/Scripts/python.exe -I ./scripts/cua-run.py --stdin
 ```
 
-Use a current PID/HWND from the window picker. Output is JSON-lines with a run ID: progress, observation, selection, action, result/error. The viewer keeps stdin open and sends `{"cancel":true,"run_id":"manual-run-1"}` to request cancellation. The helper has a hard lifetime guard even if credentials or UIA hang. Export is deliberate; no target snapshots or provider requests are automatically logged by this helper.
+Omitting `target` selects a window automatically, as the viewer does. For owned fixtures or an intentionally fixed CLI target, add `target = @{ hwnd = 12345; pid = 6789 }` using a current PID/HWND; this bypasses only the automatic window-selection stage. Output is JSON-lines with a run ID: progress, window_inventory, window_selection, observation, selection, action, result/error. The result includes the selected target and window-selection result when automatic selection runs. The viewer keeps stdin open and sends `{"cancel":true,"run_id":"manual-run-1"}` to request cancellation. The helper has a hard lifetime guard even if credentials or UIA hang. Export is deliberate; no target snapshots or provider requests are automatically logged by this helper.
 
-Offline tests cover execution state transitions and native mapping/transport boundaries. The benign desktop smoke uses the real observer, full selector contract with deterministic offline decisions, and real pinned driver. See [measured execution verification](CUA_EXECUTION_VERIFICATION.md) for actual outcomes and limitations.
+Offline tests cover automatic window selection, no-match and ambiguity stops, stale window identities, cancellation and budgets, selected-target propagation, execution state transitions, and native mapping/transport boundaries. These use fake model/native responses and send no target input. The earlier benign desktop smoke used the real observer, full selector contract with deterministic offline decisions, and real pinned driver. See [measured execution verification](CUA_EXECUTION_VERIFICATION.md) for those historical outcomes and limitations; they do not establish live accuracy of automatic window selection.
 
 ```powershell
 & ./.runtime/uia-venv/Scripts/python.exe -m unittest discover -s tests -p 'test_execution.py' -v
+& ./.runtime/uia-venv/Scripts/python.exe -m unittest discover -s tests -p 'test_window_selection.py' -v
+& ./.runtime/uia-venv/Scripts/python.exe -m unittest discover -s tests -p 'test_execution_runtime.py' -v
+& ./.runtime/uia-venv/Scripts/python.exe -m unittest discover -s tests -p 'test_execution_cli.py' -v
+& ./.runtime/uia-venv/Scripts/python.exe -m unittest discover -s tests -p 'test_uia_execution_viewer.py' -v
 & ./.runtime/uia-venv/Scripts/python.exe -m unittest discover -s tests -p 'test_cua_driver.py' -v
-& ./.runtime/uia-venv/Scripts/python.exe ./scripts/test-cua-execution.py
 ```

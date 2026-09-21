@@ -14,6 +14,8 @@ import re
 import time
 
 from .uia_contract import build_options
+from .window_selection import (WindowSelectionError, prepare_window_inventory,
+                               validate_window_selection)
 
 
 class ExecutionError(ValueError):
@@ -34,9 +36,11 @@ def validate_request(request):
     }:
         raise ExecutionError("Invalid execution request.")
     target = request.get("target")
-    if (type(target) is not dict or any(type(target.get(k)) is not int or target[k] <= 0
-                                       for k in ("hwnd", "pid"))):
-        raise ExecutionError("Select a current window before starting execution.")
+    # Omission requests goal-based discovery. Explicit targets remain available
+    # for callers deliberately binding an owned fixture or a particular window.
+    if "target" in request and (type(target) is not dict or any(
+            type(target.get(k)) is not int or target[k] <= 0 for k in ("hwnd", "pid"))):
+        raise ExecutionError("An explicit target needs a current positive HWND and PID.")
     goal = request.get("goal")
     if type(goal) is not str or not goal.strip() or len(goal) > 4000:
         raise ExecutionError("Supply a goal of 1–4000 characters.")
@@ -178,8 +182,10 @@ def observation_fingerprint(snapshot):
 
 
 class ExecutionLoop:
-    def __init__(self, observer, selector, executor, *, emit=None, cancelled=None, clock=time.monotonic):
+    def __init__(self, observer, selector, executor, *, window_inventory=None, window_selector=None,
+                 emit=None, cancelled=None, clock=time.monotonic):
         self.observer, self.selector, self.executor = observer, selector, executor
+        self.window_inventory, self.window_selector = window_inventory, window_selector
         self.emit = emit or (lambda event, data: None)
         self.cancelled = cancelled or (lambda: False)
         self.clock = clock
@@ -198,7 +204,8 @@ class ExecutionLoop:
     def run(self, request):
         request = validate_request(request)
         self.deadline = self.clock() + request["max_seconds"]
-        target, goal = request["target"], request["goal"]
+        target, goal = request.get("target"), request["goal"]
+        window_selection = None
         history, seen = [], set()
         step = 0
         self.actions, self.attempted_actions, self.input_actions = [], 0, 0
@@ -206,7 +213,8 @@ class ExecutionLoop:
         def finish(status, reason):
             result = dict(status=status, reason=reason, run_id=request["run_id"],
                           input_actions=self.input_actions, attempted_actions=self.attempted_actions,
-                          steps=len(self.actions), actions=deepcopy(self.actions), goal_completed=False)
+                          steps=len(self.actions), actions=deepcopy(self.actions), goal_completed=False,
+                          target=deepcopy(target), window_selection=deepcopy(window_selection))
             self.emit("result", result)
             return result
 
@@ -218,7 +226,43 @@ class ExecutionLoop:
             return snapshot
 
         try:
+            if target is None:
+                self._check()
+                if self.window_inventory is None or self.window_selector is None:
+                    raise ExecutionError("Automatic execution requires window discovery and selection.")
+                self.emit("progress", {"stage": "window_inventory", "step": 0,
+                                       "status": "Reading current visible window titles for the goal."})
+                self._check()
+                inventory = prepare_window_inventory(self.window_inventory())
+                self._check()
+                self.emit("window_inventory", {"inventory": deepcopy(inventory)})
+                self.emit("progress", {"stage": "window_select", "step": 0,
+                                       "status": "Choosing a window for the goal before inspecting its controls."})
+                self._check()
+                window_selection = self.window_selector(deepcopy(inventory), goal)
+                self._check()
+                target = validate_window_selection(window_selection, inventory, goal)
+                self.emit("window_selection", {"selection": deepcopy(window_selection)})
+                if target is None:
+                    status = window_selection["status"]
+                    outcomes = {
+                        "no_match": ("no_window", "No suitable window was identified for this goal. No controls were inspected or input sent."),
+                        "ambiguous": ("ambiguous_window", "Window evidence is ambiguous. Clarify the goal or make the intended window identifiable and start again."),
+                        "cancelled": ("cancelled", "Window selection was cancelled before any input."),
+                        "budget_exhausted": ("limit_reached", "Window selection exceeded its request budget. No window was selected or input sent."),
+                    }
+                    return finish(*outcomes[status])
+                # Window titles may change while a model request is pending.
+                # Validate the actual local choice, never an index in a new list.
+                self._check()
+                current = prepare_window_inventory(self.window_inventory())
+                self._check()
+                matches = [w for w in current["windows"] if w["hwnd"] == target["hwnd"]]
+                if len(matches) != 1 or matches[0] != target:
+                    raise StaleTarget("The chosen window disappeared or its PID or title changed during window selection. Start again from fresh evidence.")
             previous = observe("initial")
+            if window_selection is not None and previous["target"].get("title") != target["title"]:
+                raise StaleTarget("The chosen window title changed before its controls were observed. Start again from fresh evidence.")
             for step in range(1, request["max_steps"] + 1):
                 self._check()
                 self.emit("progress", {"stage": "select", "step": step, "status": "Asking Jev to select the next supported action."})
@@ -289,6 +333,8 @@ class ExecutionLoop:
         except StaleTarget as error:
             return finish("stale_target", str(error))
         except ExecutionError as error:
+            return finish("failed", str(error))
+        except WindowSelectionError as error:
             return finish("failed", str(error))
         except Exception:
             return finish("failed", "Execution stopped at an unexpected local boundary. Review the recorded outcomes before restarting.")

@@ -35,7 +35,7 @@ TAB_GUIDANCE = (
     "Select a row to inspect it below; required input is descriptive and no action runs.",
     "Enter a goal, then explicitly start Jev to suggest one option from the full snapshot, regardless of search "
     "or highlighted rows. The preview makes remote model requests and never executes the suggestion.",
-    "Start execution explicitly to observe, ask Jev, validate a current target, deliver CUA input, and observe again. "
+    "Start execution explicitly to choose a window from your goal, observe it, ask Jev, validate the target, and deliver CUA input. "
     "The action log distinguishes model choices, driver outcomes, and observations. Stop remains available.",
 )
 
@@ -57,6 +57,14 @@ def _name(element):
 def _bounds(element):
     value = element.get("bounds")
     return ", ".join(str(v) for v in value) if isinstance(value, list) else "Unavailable"
+
+
+def _window_identity(window):
+    if (not isinstance(window, dict)
+            or any(type(window.get(key)) is not int or window[key] <= 0 for key in ("hwnd", "pid"))
+            or not isinstance(window.get("title"), str)):
+        raise ValueError("Invalid execution window")
+    return {key: window[key] for key in ("hwnd", "pid", "title")}
 
 
 def _redact_snapshot_values(snapshot):
@@ -162,6 +170,9 @@ class UIAViewer(QMainWindow):
         self.execution_result = None
         self.execution_events = []
         self._execution_request = None
+        self._execution_inventory = None
+        self._execution_window_selection = None
+        self._execution_target = None
         self._execution_buffer = bytearray()
         self._execution_bytes = 0
         self._execution_abort_reason = None
@@ -208,7 +219,8 @@ class UIAViewer(QMainWindow):
         self.target_combo.setAccessibleName("Target window")
         self.target_combo.setToolTip(
             "Visible top-level windows with titles, sorted by title. PID and HWND distinguish similar names.\n"
-            "Scroll or use arrow keys to choose a target, then press Observe / Refresh. Choosing does not focus it."
+            "Choose a window for manual observation and preview, then press Observe / Refresh. Choosing does not focus it.\n"
+            "Execution chooses its own window from the goal."
         )
         self.target_combo.currentIndexChanged.connect(self._target_changed)
         self.window_count = QLabel("Window (0)")
@@ -360,8 +372,9 @@ class UIAViewer(QMainWindow):
     def _execution_panel(self):
         panel = QWidget()
         layout = QVBoxLayout(panel)
-        note = QLabel("Start execution performs real input in the selected window and makes remote Jev requests. "
-                      "It starts with a fresh observation. A model choice or delivered input does not prove the goal is complete.")
+        note = QLabel("Start execution asks Jev to choose a current window from your goal, then observes its controls and performs real input. "
+                      "The window picker is for manual inspection and preview. Execution makes remote Jev requests. "
+                      "A model choice or delivered input does not prove the goal is complete.")
         note.setWordWrap(True)
         layout.addWidget(note)
         self.execution_goal = QPlainTextEdit()
@@ -413,6 +426,10 @@ class UIAViewer(QMainWindow):
         self.execution_status.setTextFormat(Qt.TextFormat.PlainText)
         self.execution_status.setWordWrap(True)
         layout.addWidget(self.execution_status)
+        self.execution_target_label = QLabel("Execution window: chosen automatically from your goal.")
+        self.execution_target_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.execution_target_label.setWordWrap(True)
+        layout.addWidget(self.execution_target_label)
         self.execution_trace = QPlainTextEdit()
         self.execution_trace.setReadOnly(True)
         self.execution_trace.setMaximumBlockCount(4000)
@@ -719,7 +736,7 @@ class UIAViewer(QMainWindow):
     def _sync_buttons(self):
         active = self.process is not None
         executing = self.execution_process is not None
-        self.target_combo.setEnabled(not active)
+        self.target_combo.setEnabled(not active and not executing)
         self.refresh_windows_button.setEnabled(not active and not executing)
         self.observe_button.setEnabled(not active and not executing and self.target_combo.currentData() is not None)
         self.max_elements.setEnabled(not active and not executing)
@@ -734,7 +751,7 @@ class UIAViewer(QMainWindow):
         self.selection_inspect_button.setEnabled(self.selection_button.isEnabled())
         self.selection_export_button.setEnabled(not selection_active and self.selection_result is not None)
         self.execution_button.setEnabled(not active and not executing and not selection_active and not self._closing
-                                         and self.target_combo.currentData() is not None and bool(goal) and len(goal) <= 4000)
+                                         and bool(goal) and len(goal) <= 4000)
         self.execution_stop_button.setEnabled(executing and not self._execution_abort_reason)
         self.execution_export_button.setEnabled(not executing and bool(self.execution_events or self.execution_result))
         for widget in (self.execution_steps, self.execution_seconds, self.execution_arguments):
@@ -752,7 +769,10 @@ class UIAViewer(QMainWindow):
         self._sync_buttons()
 
     def _target_changed(self, *_):
-        self._abort_execution("Target changed. Execution stopped; an in-flight action may have an unknown outcome.")
+        # The picker belongs to manual inspection. Even a programmatic change
+        # cannot rebind an automatic execution or discard its fresh observation.
+        if self.execution_process is not None:
+            return
         # Even a programmatic target change invalidates an in-flight observation.
         if self.process is not None and self._job == "observe":
             self._abort("Target changed. Observe the selected window again.")
@@ -885,7 +905,7 @@ class UIAViewer(QMainWindow):
             if windows else "No eligible windows found. Open an application, then refresh windows."
         )
 
-    def _show_snapshot(self, result, expected_target):
+    def _show_snapshot(self, result, expected_target, *, execution=False):
         if (result.get("schema_version") != 1 or result.get("source") != "windows-uia"
                 or not isinstance(result.get("snapshot_id"), str)
                 or result.get("status") not in ("complete", "partial", "error")):
@@ -895,7 +915,7 @@ class UIAViewer(QMainWindow):
             target.get(key) != expected_target.get(key) for key in ("hwnd", "pid")
         ):
             raise ValueError("Wrong target")
-        current = self.target_combo.currentData()
+        current = self._execution_target if execution else self.target_combo.currentData()
         if not current or any(current.get(key) != expected_target.get(key) for key in ("hwnd", "pid")):
             raise ValueError("Stale target")
         elements, options = result["elements"], result["options"]
@@ -953,6 +973,7 @@ class UIAViewer(QMainWindow):
         state = "PARTIAL / TRUNCATED" if partial else result["status"].upper()
         self.summary.setText(
             f"{len(result['elements'])} controls · {len(result['options'])} options · {state} · "
+            f"Window: {target.get('title', '(Title unavailable)')} · "
             f"Source: windows-uia · {result.get('elapsed_ms', '?')} ms · Snapshot: {result['snapshot_id']}"
         )
         messages = []
@@ -1261,9 +1282,8 @@ class UIAViewer(QMainWindow):
 
     def start_execution(self):
         goal = self.selection_goal.toPlainText().strip()
-        target = self.target_combo.currentData()
         if (self._closing or self.process is not None or self.selection_process is not None
-                or self.execution_process is not None or not target or not goal or len(goal) > 4000):
+                or self.execution_process is not None or not goal or len(goal) > 4000):
             return
         try:
             raw = self.execution_arguments.toPlainText().strip() or "{}"
@@ -1273,7 +1293,7 @@ class UIAViewer(QMainWindow):
             if not isinstance(arguments, dict):
                 raise ValueError("Arguments must be an object")
             request = validate_execution_request({
-                "target": {key: target[key] for key in ("hwnd", "pid")}, "goal": goal,
+                "goal": goal,
                 "run_id": uuid.uuid4().hex, "max_steps": self.execution_steps.value(),
                 "max_seconds": self.execution_seconds.value(), "max_elements": self.max_elements.value(),
                 "arguments": arguments,
@@ -1283,7 +1303,7 @@ class UIAViewer(QMainWindow):
             # escaped lone surrogates that cannot be sent as valid UTF-8.
             payload = (json.dumps(request, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
         except (ValueError, TypeError, KeyError, UnicodeError, RecursionError):
-            self.execution_status.setText("Use a valid goal, window, limits and arguments JSON object (at most 64 KiB), "
+            self.execution_status.setText("Use a valid goal, limits and arguments JSON object (at most 64 KiB), "
                                           "with finite numbers and valid Unicode. No execution started.")
             return
         self._clear_snapshot()
@@ -1293,6 +1313,10 @@ class UIAViewer(QMainWindow):
         self._execution_pending_result = None
         self._execution_buffer.clear()
         self._execution_bytes = 0
+        self._execution_inventory = None
+        self._execution_window_selection = None
+        self._execution_target = None
+        self.execution_target_label.setText("Execution window: choosing from the current windows and your goal…")
         self.execution_trace.clear()
         self.execution_json.clear()
         self._execution_request = request
@@ -1309,7 +1333,7 @@ class UIAViewer(QMainWindow):
         process.readyReadStandardError.connect(lambda: process.readAllStandardError())
         process.finished.connect(lambda code, status: self._execution_finished(process, code, status))
         process.errorOccurred.connect(lambda error: self._execution_process_error(process, error))
-        self.execution_status.setText("Starting execution with a fresh observation… Stop remains available.")
+        self.execution_status.setText("Starting execution by choosing a current window for your goal… Stop remains available.")
         self.tabs.setCurrentIndex(3)
         self._sync_buttons()
         self._execution_deadline.start(request["max_seconds"] * 1000 + self.execution_deadline_slack_ms)
@@ -1347,9 +1371,7 @@ class UIAViewer(QMainWindow):
 
     def _execution_is_current(self):
         request = self._execution_request
-        target = self.target_combo.currentData()
-        return bool(request and target and self.selection_goal.toPlainText().strip() == request["goal"]
-                    and all(target.get(key) == request["target"][key] for key in ("hwnd", "pid")))
+        return bool(request and self.selection_goal.toPlainText().strip() == request["goal"])
 
     def _read_execution_output(self, process):
         chunk = bytes(process.readAllStandardOutput())
@@ -1380,16 +1402,57 @@ class UIAViewer(QMainWindow):
                     or not isinstance(event.get("data"), dict) or self._execution_pending_result is not None):
                 raise ValueError("Invalid execution event binding or sequence")
             data, kind = event["data"], event.get("event")
-            if kind not in {"progress", "observation", "selection", "action", "result", "error"}:
+            if kind not in {"progress", "window_inventory", "window_selection", "observation", "selection", "action", "result", "error"}:
                 raise ValueError("Unknown execution event")
             step = data.get("step", "?")
-            if kind == "observation":
+            if kind == "window_inventory":
+                inventory = data["inventory"]
+                if (not isinstance(inventory, dict) or self._execution_inventory is not None
+                        or self._execution_window_selection is not None
+                        or not isinstance(inventory.get("inventory_id"), str) or not inventory["inventory_id"]
+                        or not isinstance(inventory.get("windows"), list) or len(inventory["windows"]) > 10000):
+                    raise ValueError("Invalid execution window inventory")
+                windows = [_window_identity(window) for window in inventory["windows"]]
+                if len({window["hwnd"] for window in windows}) != len(windows):
+                    raise ValueError("Duplicate execution window identity")
+                self._execution_inventory = {"inventory_id": inventory["inventory_id"], "windows": windows}
+                message = f"Current window inventory · {len(windows)} windows · Input actions: 0"
+            elif kind == "window_selection":
+                selected = data["selection"]
+                if (not isinstance(selected, dict) or self._execution_window_selection is not None
+                        or not isinstance(selected.get("inventory_id"), str) or not selected["inventory_id"]
+                        or selected.get("goal") != request["goal"]
+                        or type(selected.get("input_actions")) is not int or selected["input_actions"] != 0
+                        or selected.get("status") not in {"selected", "no_match", "ambiguous", "cancelled", "budget_exhausted"}):
+                    raise ValueError("Invalid execution window selection")
+                inventory = self._execution_inventory
+                if inventory is not None and selected["inventory_id"] != inventory["inventory_id"]:
+                    raise ValueError("Window selection belongs to another inventory")
+                window = selected.get("selected_window")
+                if selected["status"] == "selected":
+                    window = _window_identity(window)
+                    if inventory is not None and window not in inventory["windows"]:
+                        raise ValueError("Selected window was not observed")
+                    self._execution_target = window
+                    label = f"Execution window: {window['title']} · PID {window['pid']} · HWND {window['hwnd']}"
+                    message = f"Jev window choice (prediction): {window['title']} · Input actions: 0"
+                else:
+                    if window is not None:
+                        raise ValueError("Unexpected selected window")
+                    label = "Execution window: none · " + selected["status"].replace("_", " ")
+                    message = label + " · Input actions: 0 · " + str(selected.get("reason", ""))
+                self._execution_window_selection = copy.deepcopy(selected)
+                if self._execution_is_current() and not self._execution_abort_reason:
+                    self.execution_target_label.setText(label)
+            elif kind == "observation":
                 snapshot = data["snapshot"]
-                if not isinstance(snapshot, dict):
+                if (not isinstance(snapshot, dict) or self._execution_target is None
+                        or not isinstance(snapshot.get("target"), dict)
+                        or any(snapshot["target"].get(key) != self._execution_target[key] for key in ("hwnd", "pid"))):
                     raise ValueError("Invalid execution observation")
                 snapshot = data["snapshot"] = _redact_snapshot_values(snapshot)
                 if self._execution_is_current() and not self._execution_abort_reason:
-                    self._show_snapshot(snapshot, request["target"])
+                    self._show_snapshot(snapshot, self._execution_target, execution=True)
                 message = (f"Step {step} · Fresh observation {snapshot.get('snapshot_id', '?')} · "
                            f"{snapshot.get('status', '?')} · {len(snapshot.get('options', []))} options")
             elif kind == "selection":
@@ -1419,7 +1482,7 @@ class UIAViewer(QMainWindow):
                 if "observed_change" in data:
                     message += f" · Observed change: {_text(data['observed_change'])} (not proof of goal completion)"
             elif kind == "result":
-                if (data.get("status") not in {"stopped", "cancelled", "limit_reached", "no_match", "needs_arguments", "stale_target", "failed", "no_progress"}
+                if (data.get("status") not in {"stopped", "cancelled", "limit_reached", "no_match", "no_window", "ambiguous_window", "needs_arguments", "stale_target", "failed", "no_progress"}
                         or data.get("goal_completed") is not False
                         or any(type(data.get(key)) is not int or data[key] < 0 for key in ("input_actions", "attempted_actions"))):
                     raise ValueError("Invalid execution result")
@@ -1431,7 +1494,7 @@ class UIAViewer(QMainWindow):
                 message = f"Step {step} · " + str(data.get("message", data.get("stage", data.get("status", "Progress"))))
             self.execution_events.append(event)
             self.execution_trace.appendPlainText(message[:4000])
-            if kind in {"selection", "action", "result", "error"}:
+            if kind in {"window_selection", "selection", "action", "result", "error"}:
                 self.execution_json.appendPlainText(json.dumps(event, ensure_ascii=False, indent=2))
             if not self._execution_abort_reason:
                 self.execution_status.setText(message[:2000])
